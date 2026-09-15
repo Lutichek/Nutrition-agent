@@ -41,39 +41,45 @@
 
 ```mermaid
 flowchart TD
-    Q([Реплика человека]) --> C{classify<br/>чего хочет?}
+    Q([Реплика человека]) --> C{classify<br/>чего хочет?}:::llm
 
-    C -->|не о питании| OT[off_topic] --> E([Ответ])
-    C -->|нужен врач| RF[red_flag] --> E
+    C -->|не о питании| OT[off_topic<br/>готовый текст]:::code --> E([Ответ])
+    C -->|нужен врач| RF[red_flag<br/>готовый текст]:::code --> E
 
-    C -->|просит рацион| EP[extract_profile<br/>пол, возраст, рост,<br/>вес, активность, цель]
-    EP -->|данных не хватает| AP[ask_profile<br/>спрашивает недостающее] --> E
-    EP -->|профиль полон| MP[make_plan]
-    MP --> XP[explain_plan<br/>объясняет цифры<br/>со ссылками на статьи] --> E
+    C -->|просит рацион| EP[extract_profile<br/>пол, возраст, рост,<br/>вес, активность, цель]:::llm
+    EP -->|данных не хватает| AP[ask_profile<br/>спрашивает недостающее]:::llm --> E
+    EP -->|профиль полон| MP[make_plan<br/>считает формулами]:::code
+    MP --> XP[explain_plan<br/>объясняет цифры<br/>со ссылками на статьи]:::llm --> E
 
-    C -->|вопрос о питании| RW[rewrite<br/>перевод на английский] --> RT[retrieve<br/>вектор + BM25 + RRF]
-    RT --> G{grade<br/>отвечает ли<br/>найденное?}
-    G -->|да| GEN[generate<br/>строго по найденному,<br/>с PMID] --> E
-    G -->|нет, попробуем ещё| RFN[refine] --> RT
-    G -->|нет и хватит| CA[cannot_answer<br/>честное «не знаю»] --> E
+    C -->|вопрос о питании| RW[rewrite<br/>перевод на английский]:::llm --> RT[retrieve<br/>вектор + BM25 + RRF]:::code
+    RT --> G{grade<br/>отвечает ли<br/>найденное?}:::llm
+    G -->|да| GEN[generate<br/>строго по найденному,<br/>с PMID]:::llm --> E
+    G -->|нет, попробуем ещё| RFN[refine]:::llm --> RT
+    G -->|нет и хватит| CA[cannot_answer<br/>честное «не знаю»]:::code --> E
 
-    subgraph DET [Детерминированный слой: LLM не участвует]
-        T[targets.py<br/>норма КБЖУ по Миффлину]
-        S[solver.py<br/>подбор блюд под норму]
-        F[foods.py<br/>каталог USDA]
-        R[restrictions.py<br/>ограничения по еде]
+    subgraph DET [Детерминированный слой]
+        T[targets.py<br/>норма КБЖУ по Миффлину]:::code
+        S[solver.py<br/>подбор блюд под норму]:::code
+        F[foods.py<br/>каталог USDA]:::code
+        R[restrictions.py<br/>ограничения по еде]:::code
     end
 
     MP --> DET
 
-    classDef llm fill:#eef2f7,stroke:#8fa6bf,color:#14181a
-    classDef code fill:#e8f5ee,stroke:#2f6f4e,color:#14181a
-    class C,EP,AP,XP,RW,G,GEN,RFN llm
-    class T,S,F,R code
+    classDef llm fill:#7fb3de,stroke:#2c5f8f,color:#0d1520
+    classDef code fill:#e3f5ea,stroke:#2f6f4e,color:#0d1520
 ```
 
-Голубым — узлы, где работает языковая модель: понять человека, оценить
-найденное, объяснить результат. Зелёным — то, что она не трогает.
+**Тёмно-голубые узлы** — там работает языковая модель: `classify`,
+`extract_profile`, `ask_profile`, `explain_plan`, `rewrite`, `grade`,
+`generate`, `refine`. Она понимает человека, оценивает найденное
+и объясняет результат.
+
+**Бледно-зелёные** — код без модели, включая весь расчёт рациона, поиск
+по индексу и готовые тексты отказов.
+
+Перечень узлов дан словами, а не только цветом: нужный оттенок может
+не пережить смену темы или отрисовщика, а список — переживёт.
 
 Ни одно число в ответе не приходит от модели. Норму считает `targets.py`,
 рацион собирает `solver.py` жадным проходом и локальным поиском, состав
