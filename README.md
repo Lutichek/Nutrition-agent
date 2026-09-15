@@ -48,8 +48,7 @@ flowchart TD
 
     C -->|просит рацион| EP[extract_profile<br/>пол, возраст, рост,<br/>вес, активность, цель]:::llm
     EP -->|данных не хватает| AP[ask_profile<br/>спрашивает недостающее]:::llm --> E
-    EP -->|профиль полон| MP[make_plan<br/>считает формулами]:::code
-    MP --> XP[explain_plan<br/>объясняет цифры<br/>со ссылками на статьи]:::llm --> E
+    EP -->|профиль полон| MP[make_plan]:::code
 
     C -->|вопрос о питании| RW[rewrite<br/>перевод на английский<br/>и в научные термины]:::llm
     RW --> DS[поиск по векторам<br/>top-40]:::code
@@ -67,14 +66,15 @@ flowchart TD
     RFN --> BM
     G -->|нет и хватит| CA[cannot_answer<br/>честное «не знаю»]:::code --> E
 
-    subgraph DET [Детерминированный слой]
-        T[targets.py<br/>норма КБЖУ по Миффлину]:::code
-        S[solver.py<br/>подбор блюд под норму]:::code
-        R[restrictions.py<br/>ограничения по еде]:::code
-        F[(foods.py<br/>каталог USDA<br/>4782 блюда)]:::store
+    subgraph DET [Детерминированный слой: модель не участвует]
+        T[targets.py<br/>норма КБЖУ<br/>по Миффлину]:::code --> S[solver.py<br/>подбор блюд<br/>под норму]:::code
+        R[restrictions.py<br/>ограничения по еде]:::code -.-> S
+        F[(foods.py<br/>каталог USDA<br/>4782 блюда)]:::store -.-> S
+        S --> CH[check_plan<br/>восемь проверок<br/>арифметикой]:::code
     end
 
-    MP --> DET
+    MP --> T
+    CH --> XP[explain_plan<br/>объясняет цифры<br/>со ссылками на статьи]:::llm --> E
 
     classDef llm fill:#7fb3de,stroke:#2c5f8f,color:#0d1520
     classDef code fill:#e3f5ea,stroke:#2f6f4e,color:#0d1520
