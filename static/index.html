@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Агент-нутрициолог</title>
+<style>
+  :root {
+    --bg: #f7f8f7;      --panel: #ffffff;    --ink: #14181a;
+    --muted: #6b7280;   --line: #e4e7e6;     --accent: #2f6f4e;
+    --user: #eef1f4;    --agent: #ffffff;
+    --shadow: 0 1px 2px rgba(20,24,26,.05), 0 4px 16px rgba(20,24,26,.04);
+
+    /* Макронутриенты: один цвет на всю страницу, чтобы полосу
+       не приходилось каждый раз сверять с легендой. */
+    --protein: #2a78d6;
+    --fat:     #eb6834;
+    --carb:    #1baf7a;
+    --fiber:   #8b7cd8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121517;    --panel: #1b1f22;    --ink: #e9ecec;
+      --muted: #98a1a8; --line: #2a3033;     --accent: #6fbf95;
+      --user: #232a30;  --agent: #1b1f22;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.2);
+      --protein: #4a90e8; --fat: #f07d4d; --carb: #35c48f; --fiber: #a394e8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Каркас ─────────────────────────────────────────────── */
+  header {
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: var(--panel); display: flex; align-items: center; gap: 12px;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header .logo {
+    width: 30px; height: 30px; border-radius: 8px; flex: none;
+    background: var(--accent); color: #fff; display: grid; place-items: center;
+    font-size: 15px; font-weight: 650;
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  header .spacer { margin-left: auto; }
+  .icon-btn {
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    padding: 6px 11px; border-radius: 8px; font: inherit; font-size: 12.5px;
+    cursor: pointer;
+  }
+  .icon-btn:hover { color: var(--ink); border-color: var(--muted); }
+
+  .layout { max-width: 780px; margin: 0 auto; padding: 0 16px; }
+
+  #log { padding: 22px 0 8px; min-height: calc(100vh - 190px); }
+
+  /* ── Сообщения ──────────────────────────────────────────── */
+  .msg { margin-bottom: 20px; display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .bubble {
+    background: var(--user); padding: 10px 15px; border-radius: 16px 16px 4px 16px;
+    max-width: 80%; white-space: pre-wrap;
+  }
+  .msg.agent .bubble { max-width: 100%; width: 100%; }
+  .msg.agent .text { white-space: pre-wrap; }
+
+  /* ── Стартовый экран ────────────────────────────────────── */
+  .welcome { text-align: center; padding: 40px 0 28px; }
+  .welcome h2 { margin: 0 0 8px; font-size: 21px; font-weight: 650; letter-spacing: -.02em; }
+  .welcome p { margin: 0 auto 22px; color: var(--muted); max-width: 440px; font-size: 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .chip {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 20px;
+    padding: 9px 15px; font: inherit; font-size: 13px; color: var(--ink);
+    cursor: pointer; text-align: left; box-shadow: var(--shadow);
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Карточка плана ─────────────────────────────────────── */
+  .plan {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: var(--shadow); overflow: hidden; margin-bottom: 14px;
+  }
+  .plan-head {
+    padding: 15px 18px 13px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .plan-kcal { font-size: 25px; font-weight: 680; letter-spacing: -.02em; }
+  .plan-kcal small { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 3px; }
+  .plan-of { color: var(--muted); font-size: 13px; }
+  .plan-badge {
+    margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 20px;
+    border: 1px solid; font-weight: 600;
+  }
+  .plan-badge.ok   { color: var(--carb); border-color: color-mix(in srgb, var(--carb) 40%, transparent); }
+  .plan-badge.warn { color: var(--fat);  border-color: color-mix(in srgb, var(--fat) 40%, transparent); }
+
+  /* Состав дня: из чего набраны калории.
+     Раньше здесь были четыре полосы «факт к норме», и это была ошибка:
+     когда план сходится, все четыре одинаковой длины, и полоса белков
+     на 130 г выглядит как полоса жиров на 75 г. Доли калорий, наоборот,
+     всегда разные — 35 / 28 / 37 — и показывают то, что стоит смотреть. */
+  .split { padding: 15px 18px 0; }
+  .split-bar {
+    display: flex; height: 10px; border-radius: 5px; overflow: hidden; gap: 2px;
+    background: var(--line);
+  }
+  .split-bar div { transition: width .4s ease; }
+  .split-legend {
+    display: flex; gap: 16px; flex-wrap: wrap; margin-top: 9px;
+    font-size: 12px; color: var(--muted);
+  }
+  .split-legend b { color: var(--ink); font-weight: 620; }
+  .split-note { margin-top: 7px; font-size: 11.5px; color: var(--muted); }
+  .split-legend i {
+    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 6px; vertical-align: 0;
+  }
+
+  /* Отклонения — числами, без полос: сравнивать тут нечего,
+     нужно увидеть, попал план в норму или нет. */
+  .checks { padding: 14px 18px 4px; display: grid; gap: 7px; }
+  .check { display: grid; grid-template-columns: 1fr auto auto; gap: 12px;
+           align-items: baseline; font-size: 12.5px; }
+  .check-name { color: var(--muted); }
+  .check-val { font-variant-numeric: tabular-nums; }
+  .check-val b { font-weight: 620; }
+  .check-off { font-variant-numeric: tabular-nums; width: 52px; text-align: right; }
+  .check-off.hit { color: var(--carb); }
+  .check-off.miss { color: var(--fat); }
+
+  /* ── Приёмы пищи ────────────────────────────────────────── */
+  .meals { padding: 8px 18px 16px; }
+  .meal {
+    display: grid; grid-template-columns: 1fr auto; gap: 14px;
+    padding: 11px 0; border-top: 1px solid var(--line); align-items: start;
+  }
+  .meal:first-child { border-top: 0; }
+  .meal-slot { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .meal-name { font-size: 14px; line-height: 1.35; margin: 1px 0 5px; }
+  .meal-bjc { display: flex; gap: 5px; flex-wrap: wrap; font-size: 11.5px;
+              font-variant-numeric: tabular-nums; }
+  .meal-bjc span { padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+  .meal-bjc .b { color: var(--protein); border-color: color-mix(in srgb, var(--protein) 34%, transparent); }
+  .meal-bjc .f { color: var(--fat);     border-color: color-mix(in srgb, var(--fat) 34%, transparent); }
+  .meal-bjc .c { color: var(--carb);    border-color: color-mix(in srgb, var(--carb) 34%, transparent); }
+  .meal-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .meal-g { font-size: 14px; font-weight: 620; }
+  .meal-kcal { font-size: 11.5px; color: var(--muted); }
+
+  /* ── Действия и сноски ──────────────────────────────────── */
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 0; }
+  .dl {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    padding: 9px 15px; border-radius: 9px; background: var(--accent); color: #fff;
+    font-size: 13px; font-weight: 600;
+  }
+  .dl:hover { filter: brightness(1.08); }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .meta a { color: var(--accent); }
+
+  /* ── Источники ──────────────────────────────────────────── */
+  details.sources { margin-top: 12px; }
+  details.sources > summary {
+    list-style: none; cursor: pointer; font-size: 12.5px; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 7px; user-select: none;
+    border: 1px solid var(--line); border-radius: 20px; padding: 5px 12px;
+    background: var(--panel);
+  }
+  details.sources > summary::-webkit-details-marker { display: none; }
+  details.sources > summary:hover { color: var(--ink); border-color: var(--muted); }
+  details.sources > summary::before { content: "\25B8"; transition: transform .15s; }
+  details.sources[open] > summary::before { transform: rotate(90deg); }
+
+  .source {
+    margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line);
+    border-radius: 11px; background: var(--panel);
+  }
+  .source-title { font-size: 13px; line-height: 1.35; font-weight: 600; }
+  .source-where { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .source-where a { color: var(--accent); }
+  /* Цитата — то единственное, что нельзя выдумать: либо это предложение
+     есть в статье, либо его нет. */
+  .source-quote {
+    margin-top: 9px; padding-left: 11px; border-left: 2px solid var(--accent);
+    font-size: 12.5px; line-height: 1.5; color: var(--muted);
+  }
+  .checked { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  /* ── Циклирование по дням ───────────────────────────────── */
+  .cycle { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  @media (max-width: 560px) { .cycle { grid-template-columns: 1fr; } }
+  .cyc {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+    padding: 14px 16px; box-shadow: var(--shadow); border-top: 3px solid;
+  }
+  .cyc.train { border-top-color: var(--fat); }
+  .cyc.rest  { border-top-color: var(--protein); }
+  .cyc-name { font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 7px; }
+  .cyc-days { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .cyc-kcal { font-size: 24px; font-weight: 680; letter-spacing: -.02em; margin: 9px 0 2px; }
+  .cyc-kcal small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 3px; }
+  .cyc-macros { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .cyc-macros b { color: var(--ink); font-weight: 620; }
+  .cyc-diff { font-size: 11.5px; margin-top: 7px; }
+
+  .week { margin-bottom: 14px; }
+  .week-title { font-size: 12px; color: var(--muted); margin-bottom: 7px; }
+  .week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+  .week-day {
+    border-radius: 9px; padding: 9px 3px 7px; text-align: center;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .week-day.train { border-color: color-mix(in srgb, var(--fat) 40%, transparent); }
+  .week-kcal { font-size: 12.5px; font-weight: 620; font-variant-numeric: tabular-nums; }
+  .week-name { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .week-mean { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+
+  /* Подпись под планом: числа посчитаны кодом, а обоснование — из статей.
+     Это и есть весь замысел проекта, и до сих пор он нигде не был виден. */
+  .plan-foot {
+    padding: 11px 18px 14px; border-top: 1px solid var(--line);
+    font-size: 11.5px; color: var(--muted); line-height: 1.5;
+  }
+  .plan-foot a { color: var(--accent); }
+
+  /* ── Профиль ────────────────────────────────────────────── */
+  .profile { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .profile span {
+    font-size: 11.5px; color: var(--muted); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 20px; padding: 2px 9px;
+  }
+
+  /* ── Ожидание ───────────────────────────────────────────── */
+  .thinking { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13.5px; }
+  .dots { display: inline-flex; gap: 3px; }
+  .dots i {
+    width: 5px; height: 5px; border-radius: 50%; background: var(--muted);
+    animation: blink 1.3s infinite;
+  }
+  .dots i:nth-child(2) { animation-delay: .2s; }
+  .dots i:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%,60%,100% { opacity: .25 } 30% { opacity: 1 } }
+
+  /* ── Ввод ───────────────────────────────────────────────── */
+  .composer {
+    position: sticky; bottom: 0; background: linear-gradient(transparent, var(--bg) 22%);
+    padding: 12px 0 16px;
+  }
+  form.ask {
+    display: flex; gap: 8px; align-items: flex-end; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px; padding: 7px 7px 7px 15px;
+    box-shadow: var(--shadow);
+  }
+  form.ask:focus-within { border-color: var(--accent); }
+  form.ask textarea {
+    flex: 1; border: 0; background: transparent; color: var(--ink); font: inherit;
+    resize: none; outline: none; padding: 8px 0; max-height: 150px; line-height: 1.5;
+  }
+  .send {
+    width: 36px; height: 36px; flex: none; border: 0; border-radius: 10px;
+    background: var(--accent); color: #fff; cursor: pointer; font-size: 16px;
+  }
+  .send:disabled { opacity: .4; cursor: default; }
+  .hint { text-align: center; font-size: 11.5px; color: var(--muted); margin-top: 9px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Н</div>
+  <div>
+    <h1>Агент-нутрициолог</h1>
+    <div class="sub">считает код · объясняет модель</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="sub" id="status"></span>
+  <button class="icon-btn" id="reset" title="Забыть профиль и начать заново">Начать заново</button>
+</header>
+
+<div class="layout">
+  <div id="log">
+    <div class="welcome" id="welcome">
+      <h2>Рассчитаю норму и соберу рацион</h2>
+      <p>Расскажите о себе — посчитаю КБЖУ по формуле и подберу блюда под норму.
+         Или спросите что-нибудь о питании: отвечу со ссылками на исследования.</p>
+      <div class="chips">
+        <button class="chip">Мне 31, женщина, 168 см, 74 кг, сидячая работа, хочу похудеть</button>
+        <button class="chip">Составь меню на неделю</button>
+        <button class="chip">Сколько белка нужно при похудении?</button>
+        <button class="chip">Помогает ли интервальное голодание?</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="composer">
+    <form class="ask" id="ask">
+      <textarea id="q" rows="1" placeholder="Напишите сообщение…" autocomplete="off"></textarea>
+      <button class="send" id="send" title="Отправить">↑</button>
+    </form>
+    <div class="hint">Справочный расчёт. При заболеваниях рацион подбирает врач.</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+
+const escape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const round = (n) => Math.round(n || 0);
+
+async function api(path, options = {}) {
+  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail ? JSON.stringify(detail.detail) : `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function dayWord(n) {
+  if (n % 100 >= 11 && n % 100 <= 14) return "дней";
+  return { 1: "день", 2: "дня", 3: "дня", 4: "дня" }[n % 10] || "дней";
+}
+
+// Модель иногда размечает ответ markdown-ом, иногда нет. Просить её этого
+// не делать ненадёжно, поэтому разметку разбираем здесь.
+function renderText(text) {
+  return escape(text)
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/(^|\s)\*(?!\s)(.+?)\*(?=\s|$)/g, "$1<i>$2</i>")
+    .replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>")
+    .replace(/^\s*[-*•]\s+/gm, "• ");
+}
+
+// ── План: карточка вместо абзаца ─────────────────────────────
+// Числа приходят структурой, а не текстом: собрать это из абзаца невозможно.
+
+// Состав дня: сколько граммов каждого макронутриента и какую долю
+// массы рациона он занимает.
+//
+// Полоса делит ГРАММЫ. Так её и читают: 366 г углеводов — самый широкий
+// сегмент, 79 г жира — самый узкий. Калории остаются в подписи, потому
+// что доля энергии — другая величина и иногда расходится с массой:
+// 79 г жира дают 711 ккал, а 131 г белка — только 525.
+//
+// Предыдущие две версии кодировали долю калорий, и обе читались неверно.
+// Сначала полосы «факт к норме» получались одинаковыми, когда план сходился.
+// Потом доли калорий давали «Белки 28%» рядом с «129 г» и «Жиры 28%»
+// рядом с «58 г» — верно по энергии, но глаз сравнивает граммы.
+const KCAL_PER_G = { protein_g: 4, fat_g: 9, carb_g: 4 };
+
+function renderSplit(totals) {
+  const parts = [
+    ["Белки", "protein_g", "protein"],
+    ["Жиры", "fat_g", "fat"],
+    ["Углеводы", "carb_g", "carb"],
+  ].map(([label, key, color]) => ({
+    label, color,
+    grams: totals[key] || 0,
+    kcal: (totals[key] || 0) * KCAL_PER_G[key],
+  }));
+
+  const grams = parts.reduce((sum, p) => sum + p.grams, 0) || 1;
+  const kcal = parts.reduce((sum, p) => sum + p.kcal, 0) || 1;
+
+  return `
+    <div class="split">
+      <div class="split-bar">
+        ${parts.map((p) =>
+          `<div style="width:${(p.grams / grams * 100).toFixed(1)}%;
+                background:var(--${p.color})" title="${p.label}"></div>`).join("")}
+      </div>
+      <div class="split-legend">
+        ${parts.map((p) =>
+          `<span><i style="background:var(--${p.color})"></i>${p.label}
+             <b>${round(p.grams)} г</b> ·
+             ${round(p.kcal)} ккал (${Math.round(p.kcal / kcal * 100)}%)</span>`).join("")}
+      </div>
+      <div class="split-note">
+        Полоса делит граммы. Калорий на грамм разное: у жира 9, у белка
+        и углеводов — 4, поэтому доля энергии отличается от доли массы.
+      </div>
+    </div>`;
+}
+
+// Попадание в норму — числами. Полоса тут не нужна: сравнивать белки
+// с жирами бессмысленно, а «сошлось или нет» читается по отклонению.
+function renderChecks(totals, targets) {
+  const rows = [
+    ["Белки", "protein_g"], ["Жиры", "fat_g"],
+    ["Углеводы", "carb_g"], ["Клетчатка", "fiber_g"],
+  ];
+  return `
+    <div class="checks">
+      ${rows.map(([label, key]) => {
+        const fact = totals[key] || 0, target = targets[key] || 0;
+        if (!target) return "";
+        const off = (fact - target) / target;
+        const hit = Math.abs(off) <= 0.1;
+        const sign = off >= 0 ? "+" : "−";
+        return `
+          <div class="check">
+            <div class="check-name">${label}</div>
+            <div class="check-val"><b>${round(fact)}</b> / ${round(target)} г</div>
+            <div class="check-off ${hit ? "hit" : "miss"}">
+              ${hit ? "в норме" : sign + Math.round(Math.abs(off) * 100) + "%"}
+            </div>
+          </div>`;
+      }).join("")}
+    </div>`;
+}
+
+function renderPlan(data) {
+  // Именно plan_targets: при циклировании показанный день может быть
+  // тренировочным, и базовая норма ему не цель.
+  const plan = data.plan, targets = data.plan_targets || data.targets;
+  if (!plan || !targets) return "";
+
+  const kcalOff = Math.abs(plan.totals.kcal - targets.kcal) / targets.kcal;
+  const ok = kcalOff <= 0.06;
+
+  const meals = plan.items.map((item) => `
+    <div class="meal">
+      <div>
+        <div class="meal-slot">${escape(item.slot)}</div>
+        <div class="meal-name">${escape(item.name_ru || item.name)}</div>
+        <div class="meal-bjc">
+          <span class="b">Б ${round(item.protein_g)}</span>
+          <span class="f">Ж ${round(item.fat_g)}</span>
+          <span class="c">У ${round(item.carb_g)}</span>
+        </div>
+      </div>
+      <div class="meal-num">
+        <div class="meal-g">${round(item.grams)} г</div>
+        <div class="meal-kcal">${round(item.kcal)} ккал</div>
+      </div>
+    </div>`).join("");
+
+  return `
+    <div class="plan">
+      <div class="plan-head">
+        <div class="plan-kcal">${round(plan.totals.kcal)}<small>ккал</small></div>
+        <div class="plan-of">из ${round(targets.kcal)} по норме</div>
+        <div class="plan-badge ${ok ? "ok" : "warn"}">
+          ${ok ? "в норме" : "отклонение " + Math.round(kcalOff * 100) + "%"}
+        </div>
+      </div>
+      ${renderSplit(plan.totals)}
+      ${renderChecks(plan.totals, targets)}
+      <div class="meals">${meals}</div>
+      ${renderPlanFoot(data.sources)}
+    </div>`;
+}
+
+// Норма посчитана формулой, а не выдумана моделью — и подкреплена статьями.
+// Без этой строки карточка выглядит как ответ чат-бота: красивые числа
+// неизвестного происхождения.
+function renderPlanFoot(sources) {
+  const base = "Норма рассчитана по формуле Миффлина–Сан Жеора, "
+             + "рацион подобран из справочника USDA — числа не сгенерированы.";
+  if (!sources || !sources.length) return `<div class="plan-foot">${base}</div>`;
+
+  const links = sources.slice(0, 3).map((s) =>
+    `<a href="https://pubmed.ncbi.nlm.nih.gov/${s.pmid}/" target="_blank"
+        rel="noopener" title="${escape(s.title || "")}">${escape(
+          (s.title || "источник").split(/[.:]/)[0].slice(0, 58))}</a>`).join(" · ");
+  return `<div class="plan-foot">${base}<br>Обоснование норм: ${links}</div>`;
+}
+
+// ── Циклирование ─────────────────────────────────────────────
+// Одна калорийность на все дни — упрощение. Кто тренируется, тому в дни
+// нагрузки нужно больше углеводов, а в выходные меньше. Недельное среднее
+// при этом равно норме: дни перераспределяются, дефицит не удваивается.
+function renderCycle(c) {
+  if (!c) return "";
+
+  const card = (t, kind, name, count) => {
+    const diff = (t.kcal - c.base.kcal) / c.base.kcal;
+    const sign = diff >= 0 ? "+" : "−";
+    const color = diff >= 0 ? "var(--fat)" : "var(--protein)";
+    return `
+      <div class="cyc ${kind}">
+        <div class="cyc-name">${name}</div>
+        <div class="cyc-days">${count} ${count === 1 ? "день" : count < 5 ? "дня" : "дней"} в неделю</div>
+        <div class="cyc-kcal">${round(t.kcal)}<small>ккал</small></div>
+        <div class="cyc-macros">
+          Б <b>${round(t.protein_g)}</b> · Ж <b>${round(t.fat_g)}</b> · У <b>${round(t.carb_g)}</b> г
+        </div>
+        <div class="cyc-diff" style="color:${color}">
+          ${sign}${Math.abs(Math.round(diff * 100))}% к норме
+        </div>
+      </div>`;
+  };
+
+  // Неделя целиком: видно, что дни разные, и что среднее сходится с нормой.
+  const NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+  const days = NAMES.map((name, i) => {
+    const train = i < c.training_days;
+    const t = train ? c.training : c.rest;
+    return `
+      <div class="week-day ${train ? "train" : ""}">
+        <div class="week-kcal">${round(t.kcal)}</div>
+        <div class="week-name">${name}</div>
+      </div>`;
+  }).join("");
+
+  const mean = (c.training.kcal * c.training_days + c.rest.kcal * c.rest_days) / 7;
+
+  return `
+    <div class="cycle">
+      ${card(c.training, "train", "Тренировочный день", c.training_days)}
+      ${card(c.rest, "rest", "День отдыха", c.rest_days)}
+    </div>
+    <div class="week">
+      <div class="week-title">Неделя целиком</div>
+      <div class="week-row">${days}</div>
+      <div class="week-mean">
+        В среднем <b>${round(mean)}</b> ккал в день — это и есть ваша норма.
+        Белок и жиры одинаковы каждый день, разница только в углеводах.
+      </div>
+    </div>`;
+}
+
+function renderProfile(profile) {
+  if (!profile || !Object.keys(profile).length) return "";
+  const SEX = { male: "мужчина", female: "женщина" };
+  const GOAL = { lose: "похудение", maintain: "удержание веса",
+                 gain: "набор массы", recomp: "рекомпозиция" };
+  const ACT = { sedentary: "без тренировок", light: "1 тренировка в неделю",
+                moderate: "2–3 тренировки", high: "4+ тренировки", athlete: "спортсмен" };
+  const parts = [
+    SEX[profile.sex], profile.age && profile.age + " лет",
+    profile.height_cm && round(profile.height_cm) + " см",
+    profile.weight_kg && round(profile.weight_kg) + " кг",
+    ACT[profile.activity], GOAL[profile.goal],
+  ].filter(Boolean);
+  if (!parts.length) return "";
+  return `<div class="profile">${parts.map((p) => `<span>${escape(p)}</span>`).join("")}</div>`;
+}
+
+// ── Источники ────────────────────────────────────────────────
+// Раньше здесь был хвост «Источники: PMID 22139561 · PMID 23107521».
+// Человеку такой номер не говорит ничего, и проверить по нему нельзя
+// ничего — от всего поиска по литературе оставалось два числа.
+//
+// Теперь карточка: название, журнал, год и САМ найденный фрагмент.
+// Цитата — единственное, что нельзя получить генерацией: либо это
+// предложение есть в статье, либо его нет.
+function renderSources(sources) {
+  if (!sources || !sources.length) return "";
+
+  const cards = sources.map((s) => `
+    <div class="source">
+      <div class="source-title">${escape(s.title || "Без названия")}</div>
+      <div class="source-where">
+        ${escape(s.journal || "")}${s.year ? ", " + escape(s.year) : ""} ·
+        <a href="https://pubmed.ncbi.nlm.nih.gov/${s.pmid}/"
+           target="_blank" rel="noopener">PMID ${s.pmid}</a>
+      </div>
+      ${s.quote ? `<div class="source-quote">${escape(s.quote)}</div>` : ""}
+    </div>`).join("");
+
+  const word = sources.length === 1 ? "статья" :
+               sources.length < 5 ? "статьи" : "статей";
+  return `
+    <details class="sources">
+      <summary>На чём основан ответ — ${sources.length} ${word}</summary>
+      ${cards}
+    </details>`;
+}
+
+// Отказ — это работающая проверка, а не пустота.
+//
+// Когда grade забраковал всё найденное, агент честно молчит. Ссылки под
+// таким ответом показывать нельзя — они противоречат самой фразе. Зато
+// можно показать работу: сколько фрагментов было просмотрено.
+function renderChecked(data) {
+  if (data.sources && data.sources.length) return "";
+  if (!data.checked_fragments) return "";
+  const n = data.checked_fragments;
+  const word = n === 1 ? "фрагмент" : n < 5 ? "фрагмента" : "фрагментов";
+  return `<div class="checked">
+    Проверено ${n} ${word} из научных статей — ни один не отвечает
+    на вопрос по существу.
+  </div>`;
+}
+
+function renderDownload(data) {
+  if (!data.menu_url || data.menu_days <= 1) return "";
+  return `<div class="actions">
+    <a class="dl" href="${data.menu_url}" download>
+      Скачать меню на ${data.menu_days} ${dayWord(data.menu_days)} — Excel
+    </a></div>`;
+}
+
+// ── Сообщения ────────────────────────────────────────────────
+function addMessage(role, html) {
+  $("welcome")?.remove();
+  const node = document.createElement("div");
+  node.className = `msg ${role}`;
+  node.innerHTML = `<div class="bubble">${html}</div>`;
+  $("log").appendChild(node);
+  node.scrollIntoView({ behavior: "smooth", block: "end" });
+  return node;
+}
+
+// Ожидание бывает долгим: меню на месяц — это полминуты. Молчаливое «…»
+// в такой паузе выглядит как зависание, поэтому показываем, что происходит,
+// и сколько уже идёт.
+function showThinking() {
+  const node = addMessage("agent",
+    `<div class="thinking"><span class="dots"><i></i><i></i><i></i></span>
+     <span id="think-text">думаю</span></div>`);
+  const started = Date.now();
+  const stages = [[0, "думаю"], [4, "ищу в статьях"], [9, "считаю норму"],
+                  [15, "подбираю блюда"], [30, "собираю меню на все дни"]];
+  const timer = setInterval(() => {
+    const sec = Math.round((Date.now() - started) / 1000);
+    const stage = stages.filter(([t]) => sec >= t).pop()[1];
+    const label = $("think-text");
+    if (label) label.textContent = `${stage}… ${sec} с`;
+  }, 1000);
+  return () => { clearInterval(timer); node.remove(); };
+}
+
+async function send(text) {
+  addMessage("user", escape(text));
+  const done = showThinking();
+  $("send").disabled = true;
+
+  try {
+    const data = await api("/chat", {
+      method: "POST",
+      body: JSON.stringify({ message: text, session_id: sessionId }),
+    });
+    sessionId = data.session_id;
+    done();
+    addMessage("agent",
+      renderCycle(data.cycled) + renderPlan(data) +
+      `<div class="text">${renderText(data.answer)}</div>` +
+      renderDownload(data) + renderSources(data.sources) +
+      renderChecked(data) + renderProfile(data.profile));
+  } catch (error) {
+    done();
+    addMessage("agent", `<div class="text">Ошибка: ${escape(error.message)}</div>`);
+  } finally {
+    $("send").disabled = false;
+    $("q").focus();
+  }
+}
+
+// ── Ввод ─────────────────────────────────────────────────────
+const box = $("q");
+box.addEventListener("input", () => {
+  box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight, 150) + "px";
+});
+box.addEventListener("keydown", (event) => {
+  // Enter отправляет, Shift+Enter переносит строку — как во всех
+  // разговорных продуктах; иначе длинное описание себя не набрать.
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    $("ask").requestSubmit();
+  }
+});
+
+$("ask").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = box.value.trim();
+  if (!text || $("send").disabled) return;
+  box.value = "";
+  box.style.height = "auto";
+  send(text);
+});
+
+document.addEventListener("click", (event) => {
+  const chip = event.target.closest(".chip");
+  if (chip) send(chip.textContent.trim());
+});
+
+$("reset").addEventListener("click", async () => {
+  if (sessionId) await fetch(`/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
+  sessionId = null;
+  location.reload();
+});
+
+api("/health")
+  .then(() => { $("status").textContent = ""; })
+  .catch(() => { $("status").textContent = "сервис недоступен"; });
+</script>
+</body>
+</html>
