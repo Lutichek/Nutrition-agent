@@ -1,0 +1,32 @@
+# Запуск одной командой из папки проекта:
+#
+#     docker compose up --build
+#
+# Интерфейс:    http://localhost:8000
+# Документация: http://localhost:8000/docs
+
+services:
+  nutrition-agent:
+    build:
+      context: .
+    image: nutrition-agent:latest
+    container_name: nutrition-agent
+
+    # Ключи берутся из .env и попадают в контейнер переменными окружения.
+    # В слои образа они не запекаются.
+    env_file:
+      - .env
+
+    ports:
+      - "8000:8000"
+
+    restart: unless-stopped
+
+    # Контейнеру нужно только читать свои артефакты и ходить в сеть
+    # за ответами модели — файловая система остаётся только на чтение.
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true

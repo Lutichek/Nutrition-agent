@@ -1,0 +1,71 @@
+[project]
+name = "nutrition-agent"
+version = "1.0.0"
+description = "Разговорный агент-нутрициолог: расчёт нормы КБЖУ, подбор рациона из справочника USDA и ответы по научной литературе"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Ядро
+    "pydantic>=2.12",
+    "pydantic-settings>=2.12",
+    "pandas>=2.3",
+    "pyarrow>=18.0",           # чтение каталога блюд из parquet
+
+    # Модели и поиск
+    "openai>=1.60",
+    "lancedb<0.20",
+    "langgraph>=1.0",
+    "langchain-text-splitters>=0.3",
+    "langchain-core>=0.3",
+
+    # Выгрузка меню в Excel
+    "openpyxl>=3.1",
+
+    # Сервис
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+# Инструменты оценки качества. Обычному запуску не нужны — ставятся,
+# только если собираетесь прогонять метрики из _research.
+eval = [
+    "ragas>=0.4",
+    "langchain-openai>=0.3",
+    "numpy>=2.0",
+    "tqdm>=4.66",
+    "nest-asyncio>=1.6",
+]
+
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+# Проект — набор модулей, а не устанавливаемая библиотека: у него плоская
+# структура без пакета. Флаг говорит uv ставить только зависимости
+# и не пытаться собрать колесо из корня.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",
+    # Depends(...) в значении по умолчанию — обязательный идиом FastAPI,
+    # а не дефект: именно так фреймворк объявляет зависимости ручки.
+    # Правило B008 об этом не знает и ругается на каждую ручку.
+    "B008",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["--tb=short", "--strict-markers", "-ra"]
+filterwarnings = ["ignore::DeprecationWarning"]
