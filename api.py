@@ -48,6 +48,7 @@ from agent import (
 from export import menu_to_xlsx
 from foods import load_catalog
 from providers import get_clients
+from shopping import ShoppingList, build_shopping_list
 from solver import DayPlan, Menu, PlanNotFeasible, build_day, build_menu, check_plan
 from targets import CycledTargets, Profile, Targets, compute_targets, explain
 
@@ -227,6 +228,11 @@ class MenuResponse(BaseModel):
     checks_passed: bool
     unique_dishes: int
     text: str = Field(description="Меню обычным текстом — для скачивания")
+
+    # Список покупок: то же меню, свёрнутое по блюдам и разложенное
+    # по отделам магазина. В магазине нужен не «что я ем в среду»,
+    # а «сколько всего курицы взять».
+    shopping: ShoppingList
 
 
 class FoodOut(BaseModel):
@@ -417,6 +423,7 @@ def post_menu(request: MenuRequest, catalog=Depends(get_catalog)) -> MenuRespons
         checks_passed=all(all(day.values()) for day in per_day),
         unique_dishes=menu.unique_dishes,
         text=menu.render(),
+        shopping=build_shopping_list(menu, catalog),
     )
 
 
