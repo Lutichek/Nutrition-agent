@@ -25,6 +25,11 @@
 шума: на выключении BM25 таких было 15 из 74, и оценка шума выходила
 вдвое больше настоящей (+0.014 против +0.008).
 
+⚠️ Пары надо брать ОДНОРОДНЫЕ — отличающиеся ровно одним приёмом.
+Сохранённый прогон реранкинга делался поверх гибрида, поэтому его база —
+``hybrid``, а не нынешняя продовая ``base``: иначе замер посчитает сразу
+две правки (добавили реранкинг И убрали BM25) и назовёт это одной.
+
 ⚠️ Чего этот приём НЕ умеет: чистить метрики ПОИСКА. Контрольная группа
 определена через совпадение выдачи, поэтому дельта поиска в ней равна
 нулю по построению. Если перед поиском стоит вызов модели (здесь — узел
@@ -33,13 +38,19 @@
 только детерминированными замерами, где запрос берётся из кэша один
 на все конфигурации (образец — ``experiments/bm25_weight.py``).
 
+⚠️ И приём НЕ работает между разными индексами. Он опознаёт контекст
+по ``chunk_id``, а при другой нарезке идентификаторы означают другое.
+Контрольная группа выйдет пустой — скрипт это ловит и отказывается
+считать, вместо того чтобы напечатать правдоподобную ерунду.
+
 Замер бесплатный: ни одного вызова модели, всё считается по сохранённым
 ответам и таблицам метрик.
 
 Запуск::
 
-    python -m experiments.run_noise                       # база против --hybrid
-    python -m experiments.run_noise --rerank              # база против --rerank
+    python -m experiments.run_noise                    # base против hybrid
+    python -m experiments.run_noise hybrid rerank      # реранкинг поверх гибрида
+    python -m experiments.run_noise --list             # какие прогоны есть
 """
 
 from __future__ import annotations
@@ -49,18 +60,28 @@ import sys
 import numpy as np
 import pandas as pd
 
-from measurement import BOOTSTRAP_SAMPLES, paired_bootstrap
-from run_eval import (
-    ANSWERS_HYBRID_PATH,
-    ANSWERS_PATH,
-    ANSWERS_RERANK_PATH,
-    METRICS_HYBRID_PATH,
-    METRICS_PATH,
-    METRICS_RERANK_PATH,
-    load_answers,
-)
+from measurement import BOOTSTRAP_SAMPLES, RESEARCH_DIR, paired_bootstrap
+from run_eval import load_answers
 
 GENERATION_METRICS = ["faithfulness", "correctness", "relevancy"]
+
+# Реестр сохранённых прогонов: имя → (ответы, метрики, чем отличается).
+#
+# Заводится явно, а не выводится из флагов run_eval, потому что смысл
+# прогона не всегда совпадает со смыслом флага: `rerank` здесь исторический,
+# он делался поверх гибрида, когда гибрид ещё был продовой конфигурацией.
+RUNS: dict[str, tuple[str, str, str]] = {
+    "base": ("agent_answers.json", "metrics.csv", "плотный поиск (продовая)"),
+    "hybrid": ("agent_answers_hybrid.json", "metrics_hybrid.csv", "плотный + BM25/RRF"),
+    "rerank": (
+        "agent_answers_rerank_over_hybrid.json",
+        "metrics_rerank_over_hybrid.csv",
+        "гибрид + LLM-реранкинг",
+    ),
+}
+
+# С чем осмысленно сравнивать каждый прогон, если пара не задана руками.
+DEFAULT_BASE = {"hybrid": "base", "rerank": "hybrid", "base": "hybrid"}
 
 
 def contexts(answers) -> dict[str, tuple[int, ...]]:
@@ -76,8 +97,8 @@ def contexts(answers) -> dict[str, tuple[int, ...]]:
     }
 
 
-def _load(metrics_path) -> pd.DataFrame:
-    frame = pd.read_csv(metrics_path)
+def _load_metrics(name: str) -> pd.DataFrame:
+    frame = pd.read_csv(RESEARCH_DIR / RUNS[name][1])
     return frame.assign(id=frame["id"].astype(str)).set_index("id")
 
 
@@ -108,40 +129,45 @@ def between_groups(
     return float(b.mean() - a.mean()), float(low), float(high)
 
 
-def main() -> None:
-    rerank = "--rerank" in sys.argv[1:]
-    variant_answers = ANSWERS_RERANK_PATH if rerank else ANSWERS_HYBRID_PATH
-    variant_metrics = METRICS_RERANK_PATH if rerank else METRICS_HYBRID_PATH
-    variant_name = "реранкинг" if rerank else "гибрид (BM25+RRF)"
+def compare(base_name: str, variant_name: str) -> None:
+    missing = [
+        path
+        for name in (base_name, variant_name)
+        for path in (RESEARCH_DIR / RUNS[name][0], RESEARCH_DIR / RUNS[name][1])
+        if not path.exists()
+    ]
+    if missing:
+        print("Нет файлов: " + ", ".join(p.name for p in missing))
+        return
 
-    for path in (ANSWERS_PATH, variant_answers, METRICS_PATH, variant_metrics):
-        if not path.exists():
-            print(f"Нет файла {path.name}. Сначала прогоните run_eval.py.")
-            return
-
-    base_ctx = contexts(load_answers(ANSWERS_PATH))
-    var_ctx = contexts(load_answers(variant_answers))
-    base = _load(METRICS_PATH)
-    var = _load(variant_metrics)
+    base_ctx = contexts(load_answers(RESEARCH_DIR / RUNS[base_name][0]))
+    var_ctx = contexts(load_answers(RESEARCH_DIR / RUNS[variant_name][0]))
+    base = _load_metrics(base_name)
+    var = _load_metrics(variant_name)
 
     common = sorted(set(base.index) & set(var.index) & set(base_ctx) & set(var_ctx))
     control = [i for i in common if base_ctx[i] == var_ctx[i]]
     treated = [i for i in common if base_ctx[i] != var_ctx[i]]
-
-    # Сколько вопросов различаются ТОЛЬКО порядком: если их много, значит
-    # приём в основном переставляет, а не находит другое.
     reordered = [i for i in treated if set(base_ctx[i]) == set(var_ctx[i])]
 
-    print("=" * 74)
-    print(f"БАЗА против «{variant_name}»")
-    print("=" * 74)
+    print("=" * 78)
+    print(f"«{RUNS[base_name][2]}»  ПРОТИВ  «{RUNS[variant_name][2]}»")
+    print("=" * 78)
     print(f"вопросов: {len(common)}")
     print(f"  контекст совпал (состав и порядок): {len(control):>3}  — КОНТРОЛЬ")
     print(f"  контекст различается:               {len(treated):>3}")
     print(f"     из них только перестановкой:     {len(reordered):>3}")
     print()
 
-    header = f"{'метрика':<14}{'контроль':>22}{'изменился':>22}{'разность':>26}"
+    if len(control) < 10:
+        print("Контрольная группа пуста или почти пуста — приём неприменим.")
+        print("Обычно это значит, что прогоны сделаны на РАЗНЫХ индексах:")
+        print("chunk_id там означают разное, и совпасть не могут в принципе.")
+        print("Шум прогона в этом случае надо оценивать повторным прогоном")
+        print("той же конфигурации, а не контрольной группой.")
+        return
+
+    header = f"{'метрика':<14}{'контроль':>20}{'изменился':>20}{'разность':>28}"
     print(header)
     print("-" * len(header))
 
@@ -156,14 +182,14 @@ def main() -> None:
         )
         treated_delta = deltas.reindex(treated).dropna()
         mean, low, high = between_groups(deltas, control, treated)
-
         verdict = "ЗНАЧИМО" if (low > 0 or high < 0) else "шум"
         n_control = len(deltas.reindex(control).dropna())
+
         print(
             f"{metric:<14}"
-            f"{f'{control_mean:+.3f} (n={n_control})':>22}"
-            f"{f'{treated_delta.mean():+.3f} (n={len(treated_delta)})':>22}"
-            f"{f'{mean:+.3f} [{low:+.3f}, {high:+.3f}] {verdict}':>26}"
+            f"{f'{control_mean:+.3f} (n={n_control})':>20}"
+            f"{f'{treated_delta.mean():+.3f} (n={len(treated_delta)})':>20}"
+            f"{f'{mean:+.3f} [{low:+.3f}, {high:+.3f}] {verdict}':>28}"
         )
 
     print()
@@ -173,6 +199,32 @@ def main() -> None:
     print("бы убедительным ни выглядело сырое сравнение средних.")
     print()
     print("По метрикам ПОИСКА этот приём вывода не даёт — см. докстроку модуля.")
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if "--list" in sys.argv[1:]:
+        print("Доступные прогоны:")
+        for name, (answers, metrics, what) in RUNS.items():
+            mark = "" if (RESEARCH_DIR / metrics).exists() else "   (файла нет)"
+            print(f"  {name:<10} {what:<28} {metrics}{mark}")
+        return
+
+    if len(args) == 2:
+        base_name, variant_name = args
+    elif len(args) == 1:
+        variant_name = args[0]
+        base_name = DEFAULT_BASE.get(variant_name, "base")
+    else:
+        base_name, variant_name = "base", "hybrid"
+
+    unknown = [n for n in (base_name, variant_name) if n not in RUNS]
+    if unknown:
+        print(f"Неизвестный прогон: {', '.join(unknown)}. См. --list")
+        return
+
+    compare(base_name, variant_name)
 
 
 if __name__ == "__main__":

@@ -58,7 +58,14 @@ from experiments.chunking import SCRATCH_DB, build_index
 from make_eval_dataset import DATASET_PATH
 from measurement import RESEARCH_DIR, paired_bootstrap
 from providers import get_clients
-from run_eval import load_answers, run_agent_on_dataset, save_answers, strip_boilerplate
+from run_eval import (
+    ANSWERS_HYBRID_PATH,
+    ANSWERS_PATH,
+    load_answers,
+    run_agent_on_dataset,
+    save_answers,
+    strip_boilerplate,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -93,12 +100,24 @@ def main() -> None:
     print(f"Сравниваем: 900/150 k=5 (текущая) против {NEW_SIZE}/{NEW_OVERLAP} k={NEW_TOP_K}")
     print(f"Бюджет контекста: 4500 против {NEW_SIZE * NEW_TOP_K} символов\n")
 
-    # ── ответы на текущей нарезке ────────────────────────────
-    base_answers = load_answers()
-    print(f"Базовые ответы взяты из сохранённых: {len(base_answers)}")
+    # ── ответы на обеих нарезках ─────────────────────────────
+    #
+    # ⚠️ База обязана совпадать по конфигурации с тем, на чём снята новая
+    # нарезка, иначе замер посчитает сразу две правки. Сохранённые ответы
+    # на 1200/200 сняты, когда продовой конфигурацией был ГИБРИД, — им
+    # в пару идёт гибридная база, а не нынешняя плотная. Прогон заново
+    # снимает обе стороны на текущей конфигурации, и база берётся обычная.
+    #
+    # Ловушка не теоретическая: базовый путь однажды уже переназначили
+    # на другую конфигурацию, и замер молча начал бы сравнивать нарезку
+    # вместе с выключением BM25.
+    from_cache = "--metrics" in sys.argv and ANSWERS_NEW_PATH.exists()
+    base_path = ANSWERS_HYBRID_PATH if from_cache else ANSWERS_PATH
 
-    # ── ответы на новой нарезке ──────────────────────────────
-    if "--metrics" in sys.argv and ANSWERS_NEW_PATH.exists():
+    base_answers = load_answers(base_path)
+    print(f"Базовые ответы: {base_path.name} ({len(base_answers)})")
+
+    if from_cache:
         new_answers = load_answers(ANSWERS_NEW_PATH)
         print(f"Ответы на новой нарезке из кэша: {len(new_answers)}\n")
     else:
