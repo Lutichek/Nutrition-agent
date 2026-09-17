@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import random
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -389,6 +390,71 @@ def _slot_penalty(items: list[MealItem], template: list[tuple[str, str, float]],
     return penalty * SLOT_BALANCE_WEIGHT
 
 
+# Доля приёмов пищи, которую предпочтения занимают «досыта». Дальше
+# штраф не растёт: набить предпочтениями весь день — значит превратить
+# неделю в три блюда, а разнообразие человеку нужно не меньше вкуса.
+#
+# 0.4 — это примерно три слота из семи: завтрак и два любимых блюда
+# в день. Значение подобрано замером, см. EVOLUTION.md.
+PREFERENCE_SATURATION = 0.4
+
+# Вес предпочтений в общей невязке.
+#
+# Сознательно ниже веса любого нутриента: «хочу видеть гречку» не должно
+# перевешивать попадание в норму по белку. Предпочтение — это тай-брейк
+# между блюдами, одинаково подходящими по составу, а не цель сама по себе.
+PREFERENCE_WEIGHT = 0.9
+
+
+def preferred_ids(catalog: pd.DataFrame, include: list[str] | None) -> set[int]:
+    """Какие блюда каталога человек хотел бы видеть.
+
+    Сопоставление — той же машинкой, что и у исключений: категории
+    раскрываются («овощи» → полсотни слов), совпадение ищется по границам
+    слова. Разница только в знаке: там выбрасываем, здесь предпочитаем.
+
+    Ищем и по английскому названию, и по русскому. У исключений хватало
+    английского, потому что модель обязана возвращать английские слова.
+    Здесь человек может назвать блюдо и по-русски («хочу творог»),
+    а цена промаха разная: пропущенное исключение кладёт в план запрещённое,
+    пропущенное предпочтение всего лишь не сработает.
+    """
+    if not include:
+        return set()
+
+    pattern = to_pattern(include)
+    if not pattern:
+        return set()
+
+    matched = catalog["name"].str.lower().str.contains(pattern, regex=True, na=False)
+    if "name_ru" in catalog.columns:
+        matched |= catalog["name_ru"].str.lower().str.contains(pattern, regex=True, na=False)
+
+    by_category = to_category_pattern(include)
+    if by_category and "category" in catalog.columns:
+        matched |= catalog["category"].str.lower().str.contains(by_category, regex=True, na=False)
+
+    return set(catalog.loc[matched, "fdc_id"].astype(int))
+
+
+def _preference_penalty(items: list[MealItem], preferred: set[int]) -> float:
+    """Штраф за то, что любимых блюд в дне меньше, чем хотелось бы.
+
+    Ноль, когда предпочтений не задано вовсе, — тогда слагаемое не влияет
+    ни на что и старые планы не меняются.
+
+    Штраф насыщается на ``PREFERENCE_SATURATION``: дальше солверу незачем
+    вытеснять остальные блюда, и день не схлопывается в одно и то же.
+    """
+    if not preferred or not items:
+        return 0.0
+
+    hits = sum(1 for item in items if item.fdc_id in preferred)
+    share = hits / len(items)
+    shortfall = max(0.0, PREFERENCE_SATURATION - share) / PREFERENCE_SATURATION
+    return shortfall * PREFERENCE_WEIGHT
+
+
 def _loss(totals: dict[str, float], targets: dict[str, float]) -> float:
     """Насколько план не попал в норму. Меньше — лучше, ноль — идеально.
 
@@ -481,13 +547,17 @@ def _local_search(
     iterations: int,
     sample_size: int = 40,
     tolerance: float = SLOT_TOLERANCE,
+    preferred: set[int] | None = None,
 ) -> list[MealItem]:
     """Улучшать план по одной замене, пока невязка падает."""
     target_kcal = targets.get("kcal", 0.0)
+    preferred = preferred or set()
 
     best = list(items)
     best_totals = _totals(best)
-    best_loss = _loss(best_totals, targets) + _slot_penalty(best, template, target_kcal)
+    best_loss = (_loss(best_totals, targets)
+                 + _slot_penalty(best, template, target_kcal)
+                 + _preference_penalty(best, preferred))
     best_feasible = _is_feasible(best_totals)
 
     for _ in range(iterations):
@@ -533,6 +603,7 @@ def _local_search(
                 trial_loss = (
                     _loss(trial_totals, targets)
                     + _slot_penalty(trial, template, target_kcal)
+                    + _preference_penalty(trial, preferred)
                 )
                 trial_feasible = _is_feasible(trial_totals)
 
@@ -575,6 +646,7 @@ def _build_day_once(
     allow_exotic: bool = False,
     template: list[tuple[str, str, float]] | None = None,
     tolerance: float = SLOT_TOLERANCE,
+    include: list[str] | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -592,6 +664,12 @@ def _build_day_once(
 
     usable = _filter_catalog(catalog, exclude, allow_exotic=allow_exotic)
     candidates = _candidates_by_role(usable)
+
+    # Предпочтения ищем УЖЕ в отфильтрованном каталоге: если человек
+    # одновременно просит молоко и исключает лактозу, побеждает исключение.
+    # Так безопаснее — нарушенное ограничение может быть аллергией,
+    # а несработавшее предпочтение всего лишь огорчает.
+    preferred = preferred_ids(usable, include)
 
     # Проверяем не только наличие роли, но и запас по количеству: в шаблоне
     # роль «main» встречается дважды, а блюда в дне не повторяются, поэтому
@@ -629,7 +707,7 @@ def _build_day_once(
 
     # 2. Локальный поиск.
     items = _local_search(items, template, candidates, target_values, rng,
-                          iterations, tolerance=tolerance)
+                          iterations, tolerance=tolerance, preferred=preferred)
 
     totals = _totals(items)
     deviation = {
@@ -643,7 +721,9 @@ def _build_day_once(
         totals={name: round(value, 1) for name, value in totals.items()},
         targets=target_values,
         deviation=deviation,
-        loss=round(_loss(totals, target_values) + _slot_penalty(items, template, targets.kcal), 4),
+        loss=round(_loss(totals, target_values)
+                   + _slot_penalty(items, template, targets.kcal)
+                   + _preference_penalty(items, preferred), 4),
     )
 
 
@@ -655,6 +735,7 @@ def build_day(
     iterations: int = 150,
     allow_exotic: bool = False,
     template: list[tuple[str, str, float]] | None = None,
+    include: list[str] | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -674,13 +755,13 @@ def build_day(
         allow_exotic: разрешить дичь и субпродукты (по умолчанию нет).
     """
     plan = _build_day_once(catalog, targets, exclude, seed, iterations,
-                           allow_exotic, template, SLOT_TOLERANCE)
+                           allow_exotic, template, SLOT_TOLERANCE, include)
 
     if check_plan(plan)["kcal_in_range"]:
         return plan
 
     relaxed = _build_day_once(catalog, targets, exclude, seed, iterations,
-                              allow_exotic, template, SLOT_TOLERANCE_RELAXED)
+                              allow_exotic, template, SLOT_TOLERANCE_RELAXED, include)
 
     # Возвращаем ослабленный только если он и правда лучше: иначе человек
     # получил бы менее сбалансированный день без выигрыша по калориям.
@@ -748,6 +829,7 @@ def build_menu(
     seed: int = 0,
     iterations: int | None = None,
     variety_window: int = 2,
+    include: list[str] | None = None,
 ) -> Menu:
     """Собрать меню на несколько дней.
 
@@ -790,6 +872,18 @@ def build_menu(
         for used in recent[-variety_window:] if variety_window else []:
             recent_names.extend(used)
 
+        # Любимые блюда окно разнообразия не трогает, иначе предпочтение
+        # отменяло бы само себя: блюдо появлялось один раз и на следующие
+        # два дня выпадало из подбора. Человек, попросивший овсянку
+        # на завтрак, хочет её именно каждый день.
+        if include and recent_names:
+            liked = to_pattern(include)
+            if liked:
+                recent_names = [
+                    name for name in recent_names
+                    if not re.search(liked, name.lower())
+                ]
+
         day_exclude = list(exclude or []) + [_escape(name) for name in recent_names]
 
         day_targets = per_day[day_number]
@@ -801,6 +895,7 @@ def build_menu(
                 exclude=day_exclude,
                 seed=seed + day_number,
                 iterations=iterations if iterations is not None else 300,
+                include=include,
             )
         except PlanNotFeasible:
             # Окно разнообразия сузило каталог слишком сильно — собираем день
@@ -811,6 +906,7 @@ def build_menu(
                 exclude=list(exclude or []),
                 seed=seed + day_number,
                 iterations=iterations if iterations is not None else 300,
+                include=include,
             )
 
         plans.append(plan)

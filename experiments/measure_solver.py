@@ -72,7 +72,11 @@ PROFILES: dict[str, Profile] = {
         exclude=["pork", "sweets", "flour", "lactose"]),
 }
 
-BASELINE_DIR = Path(__file__).parent / "_research" / "baselines"
+# Корень проекта, а не папка пакета: файл лежит в experiments/, и
+# Path(__file__).parent после переезда стал указывать на неё. Точки
+# отсчёта тогда сохраняются в experiments/_research/, рядом с прежними
+# в _research/ — и сравнение «до и после» молча идёт не с тем файлом.
+BASELINE_DIR = Path(__file__).resolve().parent.parent / "_research" / "baselines"
 
 
 def measure(seeds: int) -> dict:

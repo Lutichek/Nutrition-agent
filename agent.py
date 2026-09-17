@@ -64,7 +64,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from data_preporation import load_corpus_index
 from foods import load_catalog
-from solver import DayPlan, PlanNotFeasible, build_menu, check_plan, day_word
+from restrictions import expand, to_pattern
+from solver import DayPlan, PlanNotFeasible, preferred_ids, build_menu, check_plan, day_word
 from targets import (
     ACTIVITY_FACTORS,
     ACTIVITY_LABELS,
@@ -302,7 +303,8 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   "goal": "lose"|"maintain"|"gain",
   "rate_kg_per_week": число,
   "days": на сколько дней просят меню (1, 7, 30 и т.п.),
-  "exclude": ["английские названия продуктов, которые человек не ест"]}}
+  "exclude": ["английские названия продуктов, которые человек НЕ ест"],
+  "include": ["английские названия продуктов, которые человек ХОЧЕТ видеть"]}}
 
 Правила:
 - НЕ придумывай значения. Не названо — не включай поле.
@@ -337,6 +339,14 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   «без грибов» → ["mushroom"].
   «Не ем свинину, сладости, мучное и аллергия на лактозу» →
   ["pork","sweets","flour","lactose"].
+- include — то же самое, но с ОБРАТНЫМ знаком: продукты, которые человек
+  хочет видеть в рационе. Те же английские слова и те же категории.
+  «Люблю гречку и творог» → ["buckwheat","cottage cheese"].
+  «Хочу побольше овощей» → ["vegetables"].
+  Не путай знак: «без грибов» это exclude, «хочу грибы» это include.
+  Оборот «ем всё, кроме рыбы» — это exclude ["fish"], а НЕ include.
+  Просьба «добавь больше белка» — это НЕ include: речь о нутриенте,
+  а не о продукте, норму белка считает программа. Поле не включай.
 - days: «на неделю» = 7, «на месяц» = 30, «на две недели» = 14. Не сказано —
   не включай поле.
 - Уже известные значения переписывай только если человек их явно поправил."""
@@ -551,6 +561,18 @@ RED_FLAG_TEMPLATE = (
     "высока. Могу вместо этого рассказать, что об этом пишут исследования."
 )
 
+# Предложение назвать любимые продукты. Показывается ОДИН раз и только
+# после того, как человек увидел собранный рацион.
+#
+# Текст фиксирован намеренно: по нему же проверяется, не предлагали ли
+# уже в этом разговоре (см. _preferences_offer). Перепишете формулировку —
+# предложение начнёт повторяться на каждый пересчёт плана, и молча:
+# ошибка выглядит как назойливость, а не как поломка.
+PREFERENCES_OFFER = (
+    "Если есть продукты, которые вы хотели бы видеть в рационе, — скажите, "
+    "и я пересоберу меню с ними. Например: «люблю гречку и творог»."
+)
+
 # Поля профиля, без которых расчёт невозможен.
 #
 # activity здесь не случайно. У Profile есть значение по умолчанию
@@ -647,6 +669,46 @@ def _activity_from_text(text: str) -> str | None:
         if re.search(pattern, lowered):
             return level
     return None
+
+
+def _resolve_preferences(profile: Profile) -> list[str]:
+    """Убрать из пожеланий то, что противоречит ограничениям.
+
+    Человек способен попросить и то и другое: «хочу молочку» вместе
+    с «аллергия на лактозу» — это не выдумка, а обычный разговор,
+    где пожелание названо раньше ограничения или в другой реплике.
+
+    Побеждает ОГРАНИЧЕНИЕ, и всегда. Нарушенное исключение — аллерген
+    в тарелке, несработавшее пожелание — только огорчение. Цена ошибки
+    несопоставима, поэтому выбор не обсуждается.
+
+    Сравниваем ПОСЛЕ раскрытия категорий, иначе конфликт не виден:
+    «lactose» и «milk» — разные слова, но первое раскрывается во второе.
+    Проверка идёт по тому же шаблону с границами слова, что и фильтр
+    каталога, — чтобы «хочу ham» не выживало при исключении «graham».
+
+    Сам солвер этот конфликт тоже переживёт (предпочтения он ищет
+    в УЖЕ отфильтрованном каталоге), но тогда пожелание просто молча
+    не сработает. Здесь оно снимается явно — и это видно в профиле.
+    """
+    if not profile.include or not profile.exclude:
+        return list(profile.include)
+
+    forbidden = to_pattern(profile.exclude)
+    if not forbidden:
+        return list(profile.include)
+
+    kept: list[str] = []
+    for term in profile.include:
+        # Раскрываем пожелание и смотрим, не попало ли хоть одно слово
+        # под запрет. Достаточно одного: «молочка» без молока — уже
+        # не то, о чём просили.
+        words = expand([term]) or [term]
+        if any(re.search(forbidden, word.lower()) for word in words):
+            continue
+        kept.append(term)
+
+    return kept
 
 
 def _days_from_text(text: str) -> int | None:
@@ -1059,6 +1121,7 @@ class NutritionAgent:
                 per_day,
                 days=days,
                 exclude=profile.exclude,
+                include=_resolve_preferences(profile),
                 seed=self.seed,
             )
         except PlanNotFeasible as error:
@@ -1135,7 +1198,90 @@ class NutritionAgent:
             temperature=0.3,
         )
 
-        return {"answer": answer.strip(), "chunks": chunks, "search_query": query}
+        text = answer.strip()
+
+        # Сначала — о непонятых пожеланиях, потом предложение назвать новые.
+        # Обратный порядок выглядел бы издевательством: «назовите любимые
+        # продукты» сразу после «ваш любимый продукт я не нашёл».
+        note = self._unmatched_note(profile)
+        if note:
+            text += note
+
+        offer = self._preferences_offer(profile, state.get("history") or [])
+        if offer:
+            text += offer
+
+        return {"answer": text, "chunks": chunks, "search_query": query}
+
+    def _unmatched_note(self, profile: Profile) -> str:
+        """Сказать вслух, какие пожелания не удалось выполнить.
+
+        Иначе отказ получается молчаливым, а он здесь вероятен: каталог
+        построен на USDA и русские привычные продукты покрывает неровно.
+        Гречка в нём — ОДНО блюдо, творог — четыре, тогда как курица —
+        четыреста. Человек, попросивший гречку, план без неё прочтёт
+        как «меня проигнорировали», и будет прав.
+
+        Две разные причины молчания и оба случая названы своими словами:
+
+        * пожелание снято ограничением — человек сам просил и то и другое;
+        * в справочнике такого блюда нет — вина каталога, не человека.
+
+        Про «нашлось, но не попало в день» не пишем: пожелание мягкое
+        и в конкретный день попасть не обязано, а извинение за каждый
+        такой случай превратит ответ в отчёт солвера.
+        """
+        if not profile.include:
+            return ""
+
+        allowed = _resolve_preferences(profile)
+        blocked = [term for term in profile.include if term not in allowed]
+
+        missing = [
+            term for term in allowed
+            if not preferred_ids(self.catalog, [term])
+        ]
+
+        parts: list[str] = []
+        if blocked:
+            parts.append(
+                f"Не добавил в рацион {', '.join(blocked)} — это противоречит "
+                f"вашим ограничениям ({', '.join(profile.exclude)})."
+            )
+        if missing:
+            parts.append(
+                f"В справочнике не нашлось подходящих блюд: {', '.join(missing)}. "
+                f"Каталог собран на базе USDA, и часть привычных продуктов "
+                f"в нём представлена скудно."
+            )
+
+        return "\n\n" + " ".join(parts) if parts else ""
+
+    @staticmethod
+    def _preferences_offer(profile: Profile, history: list[dict]) -> str:
+        """Предложить назвать любимые продукты — один раз и ПОСЛЕ плана.
+
+        Почему после, а не в опроснике. Пока человек не увидел рацион,
+        вопрос «какие продукты хотите видеть» отвечать не на что: набор
+        блюд неизвестен, и в ответ приходит либо молчание, либо «ну,
+        обычные». Увидев конкретный список, человек сразу знает, чего
+        в нём не хватает.
+
+        Почему текст фиксированный, а не от модели. Предложение должно
+        быть дословно одним и тем же, иначе проверка «не предлагали ли
+        уже» по истории перестанет срабатывать. Это ровно тот случай,
+        когда формулировка — часть контракта, а не украшение.
+        """
+        if profile.include:
+            return ""
+
+        # Предлагали в этом разговоре — не повторяем. Иначе на каждый
+        # пересчёт плана человек получал бы одно и то же предложение.
+        if any(PREFERENCES_OFFER in (turn.get("content") or "")
+               for turn in history if turn.get("role") == "assistant"):
+            return ""
+
+        return "\n\n" + PREFERENCES_OFFER
 
     def _describe_profile(self, profile: Profile) -> str:
         text = (
@@ -1146,6 +1292,13 @@ class NutritionAgent:
         )
         if profile.exclude:
             text += f", не ест: {', '.join(profile.exclude)}"
+
+        # Показываем пожелания ПОСЛЕ снятия конфликтов, а не как пришли
+        # от модели: иначе в карточке окажется «хочет молоко, не ест
+        # лактозу», и человек будет искать молоко в плане, где его нет.
+        wanted = _resolve_preferences(profile)
+        if wanted:
+            text += f", хочет видеть: {', '.join(wanted)}"
         return text
 
     def _norms_query(self, profile: Profile) -> str:
