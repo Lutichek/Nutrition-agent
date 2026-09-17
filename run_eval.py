@@ -12,6 +12,7 @@
     python run_eval.py --refusals      # проверка отказов на негативных вопросах
     python run_eval.py --single-gt     # по старой разметке (один эталон на вопрос)
     python run_eval.py --rerank        # то же, но с LLM-реранкингом в ретривере
+    python run_eval.py --hybrid        # добавить BM25 + RRF (отклонённый вариант)
     python run_eval.py --no-relevancy  # без насыщенной relevancy (дешевле)
 
 Что меряется:
@@ -63,8 +64,15 @@ ANSWERS_PATH = DATASET_DIR / "agent_answers.json"
 # Отдельный файл для прогона с реранкингом: базовые ответы не затираются,
 # иначе сравнить две конфигурации будет уже не с чем.
 ANSWERS_RERANK_PATH = DATASET_DIR / "agent_answers_rerank.json"
+# Прогон с гибридным поиском. BM25 выключен в продовой конфигурации
+# (обоснование — у `use_hybrid` в `agent.build_agent`), поэтому базовые
+# файлы держат ПЛОТНЫЙ поиск, а гибрид уехал в отдельные, как реранкинг.
+# Флаг именно `--hybrid`, а не `--no-hybrid`: иначе прогон отклонённого
+# варианта молча перезаписал бы базовый.
+ANSWERS_HYBRID_PATH = DATASET_DIR / "agent_answers_hybrid.json"
 METRICS_PATH = DATASET_DIR / "metrics.csv"
 METRICS_RERANK_PATH = DATASET_DIR / "metrics_rerank.csv"
+METRICS_HYBRID_PATH = DATASET_DIR / "metrics_hybrid.csv"
 REFUSALS_PATH = DATASET_DIR / "refusals.csv"
 
 # Формулировки, по которым видно, что агент отказался отвечать.
@@ -94,6 +102,7 @@ def run_agent_on_dataset(
     dataset: pd.DataFrame,
     max_workers: int = 4,
     use_rerank: bool = False,
+    use_hybrid: bool = False,
     db_path: str = "lance_db/vectorstore",
     table_name: str = "chunks",
     top_k: int = 5,
@@ -114,6 +123,7 @@ def run_agent_on_dataset(
         model=model,
         embed_client=embed_client,
         use_rerank=use_rerank,
+        use_hybrid=use_hybrid,
         # Индекс и k вынесены в параметры ради замера нарезки: чтобы сравнить
         # 900/150 с 1200/200 честно, второй конфигурации нужен свой индекс
         # и меньшее k — при вчетверо более длинных чанках тот же объём
@@ -338,16 +348,22 @@ def main() -> None:
     # Прогон с реранкингом пишется в свой файл и свою таблицу метрик,
     # чтобы базовый прогон остался на месте для сравнения.
     rerank = "--rerank" in flags
-    answers_path = ANSWERS_RERANK_PATH if rerank else ANSWERS_PATH
-    metrics_path = METRICS_RERANK_PATH if rerank else METRICS_PATH
+    hybrid = "--hybrid" in flags
+    answers_path = (ANSWERS_HYBRID_PATH if hybrid
+                    else ANSWERS_RERANK_PATH if rerank else ANSWERS_PATH)
+    metrics_path = (METRICS_HYBRID_PATH if hybrid
+                    else METRICS_RERANK_PATH if rerank else METRICS_PATH)
     if rerank:
-        print("Конфигурация: гибрид + LLM-реранкинг")
+        print("Конфигурация: плотный поиск + LLM-реранкинг")
+    if hybrid:
+        print("Конфигурация: плотный поиск + BM25/RRF (отклонённый вариант)")
 
     if "--metrics" in flags:
         answers = load_answers(answers_path)
         print(f"Загружено сохранённых ответов: {len(answers)}")
     else:
-        answers = run_agent_on_dataset(dataset, use_rerank=rerank)
+        answers = run_agent_on_dataset(dataset, use_rerank=rerank,
+                                       use_hybrid=hybrid)
         save_answers(answers, answers_path)
         print(f"Ответы сохранены → {answers_path}")
 

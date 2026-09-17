@@ -8,7 +8,13 @@ Retrieve: поиск релевантных чанков. Здесь сконц�
    Включён всегда.
 2. **BM25 (лексический поиск)** — классический поиск по словам. Ловит то,
    что «плывёт» у эмбеддингов: точные термины, названия препаратов, цифры.
-   Включён: на запросе бесплатен, прироста по метрикам не даёт.
+   **Выключен по умолчанию.** Держался как ставка на расширение корпуса,
+   пока замер не показал, что он не нейтрален, а вреден: с равным голосом
+   он выигрывает на 30% вопросов (+0.133 NDCG) и проигрывает на 42%
+   (−0.198). Признака, по которому отличить выигрышные заранее, найти
+   не удалось, а сетка весов не дала точки, где польза остаётся без вреда.
+   Цифры — в комментарии к ``use_hybrid`` в ``agent.build_agent``,
+   замеры — ``experiments/tokenizer.py`` и ``experiments/bm25_weight.py``.
 3. **Hybrid (RRF)** — объединение двух списков через Reciprocal Rank Fusion.
 4. **LLM-реранкинг** — модель переупорядочивает кандидатов по релевантности.
    **Выключен по умолчанию.** Поиск он улучшает значимо (precision@5
@@ -28,6 +34,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 from lance_db import read_all, vector_search
@@ -76,9 +83,14 @@ STOPWORDS = RU_STOPWORDS | EN_STOPWORDS
 def tokenize(text: str) -> list[str]:
     """Разбить текст на слова: нижний регистр, только буквы/цифры, без стоп-слов.
 
-    Дополнительно обрезаем длинные слова до 6 символов — это грубая замена
-    стеммингу: в русском языке «гипертензия / гипертензии / гипертензией»
-    после обрезки превращаются в одну основу «гиперт».
+    Дополнительно обрезаем длинные слова до 6 символов — грубая замена
+    стеммингу: «hypertension / hypertensive» дают одну основу «hypert».
+
+    Обрезка выглядит подозрительно: она склеивает и разные вещества
+    («palmitic» с «palmitate»), то есть бьёт по редким терминам, ради
+    которых BM25 и добавляли. Проверено замером — версия без обрезки
+    работает ХУЖЕ: потери на разных формах одного слова перевешивают.
+    Замер и разбор — ``experiments/tokenizer.py``.
     """
     words = re.findall(r"[\w]+", text.lower())
     return [w[:6] for w in words if w not in STOPWORDS and len(w) > 2]
@@ -92,11 +104,17 @@ class BM25:
     получают штраф, чтобы не выигрывать просто за счёт объёма.
     """
 
-    def __init__(self, corpus_texts: list[str], k1: float = 1.5, b: float = 0.75) -> None:
+    def __init__(self, corpus_texts: list[str], k1: float = 1.5, b: float = 0.75,
+                 tokenizer: Callable[[str], list[str]] | None = None) -> None:
         self.k1 = k1  # насколько сильно растёт вес при повторах слова
         self.b = b  # насколько сильно штрафуем длинные документы
 
-        self.docs_tokens = [tokenize(text) for text in corpus_texts]
+        # Токенизатор внедряется, чтобы его можно было сравнить замером.
+        # Он обязан быть ОДИН и тот же при индексации и при запросе: разные
+        # дадут непересекающиеся словари и нулевую выдачу — молча.
+        self.tokenize = tokenizer or tokenize
+
+        self.docs_tokens = [self.tokenize(text) for text in corpus_texts]
         self.doc_lengths = [len(tokens) for tokens in self.docs_tokens]
         self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths) if self.doc_lengths else 0.0
         self.doc_count = len(self.docs_tokens)
@@ -117,7 +135,7 @@ class BM25:
 
     def score(self, query: str, doc_index: int) -> float:
         """Насколько документ doc_index соответствует запросу."""
-        query_tokens = tokenize(query)
+        query_tokens = self.tokenize(query)
         term_freq = self.term_freqs[doc_index]
         doc_length = self.doc_lengths[doc_index]
 
@@ -149,19 +167,29 @@ class BM25:
 def reciprocal_rank_fusion(
     ranked_lists: list[list[int]],
     k: int = 60,
+    weights: list[float] | None = None,
 ) -> list[tuple[int, float]]:
     """Объединить несколько ранжированных списков в один (RRF).
 
-    Каждый список голосует за документ весом 1 / (k + позиция).
+    Каждый список голосует за документ весом ``вес / (k + позиция)``.
     Документ, который стоит высоко сразу в нескольких списках, получает больше
     суммарных «голосов». Метод не требует приводить к общей шкале разные
     по природе оценки (косинусная близость и BM25) — сравниваются только позиции.
+
+    ``weights`` позволяет дать спискам разный голос. Это понадобилось, когда
+    замер показал, что BM25 при равном весе тянет выдачу вниз: он выигрывает
+    на 30% вопросов (+0.133 NDCG), но проигрывает на 42% (−0.198), и с равным
+    голосом перебивает более сильный плотный поиск там, где сам ошибается.
+    По умолчанию веса равны — поведение не меняется.
     """
+    if weights is None:
+        weights = [1.0] * len(ranked_lists)
+
     scores: dict[int, float] = {}
 
-    for ranked in ranked_lists:
+    for ranked, weight in zip(ranked_lists, weights, strict=True):
         for position, doc_index in enumerate(ranked):
-            scores[doc_index] = scores.get(doc_index, 0.0) + 1.0 / (k + position + 1)
+            scores[doc_index] = scores.get(doc_index, 0.0) + weight / (k + position + 1)
 
     fused = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
     return fused
@@ -256,6 +284,7 @@ class Retriever:
         top_k: сколько чанков вернуть в итоге.
         candidate_k: сколько кандидатов набрать до реранкинга/слияния.
         use_hybrid: включить BM25 + RRF в дополнение к векторному поиску.
+            По умолчанию выключен — см. причину в докстроке модуля.
         use_rerank: включить LLM-реранкинг.
     """
 
@@ -267,8 +296,10 @@ class Retriever:
         model: str = "openai/gpt-4o-mini",
         top_k: int = 5,
         candidate_k: int = 40,
-        use_hybrid: bool = True,
+        use_hybrid: bool = False,
         use_rerank: bool = False,
+        tokenizer: Callable[[str], list[str]] | None = None,
+        bm25_weight: float = 1.0,
     ) -> None:
         self.table = table
         self.embedder = embedder
@@ -279,10 +310,18 @@ class Retriever:
         self.use_hybrid = use_hybrid
         self.use_rerank = use_rerank
 
+        # Вес голоса BM25 при слиянии. Единица — равный голос с плотным
+        # поиском, ноль — BM25 не влияет вовсе. Значение осталось равным
+        # единице намеренно: сетка весов (experiments/bm25_weight.py) не
+        # нашла промежуточной точки, где BM25 помогает и не вредит, —
+        # выбор оказался между «как есть» и «выключить», и выключили целиком.
+        self.bm25_weight = bm25_weight
+
         # Для BM25 нужен весь корпус в памяти — читаем один раз при создании.
         self._corpus_df = read_all(table)
         self._corpus_records = self._corpus_df.to_dict("records")
-        self._bm25 = BM25([r["text"] for r in self._corpus_records]) if use_hybrid else None
+        self._bm25 = (BM25([r["text"] for r in self._corpus_records], tokenizer=tokenizer)
+                      if use_hybrid else None)
 
     # ------------------------------------------------------------------
     def _dense_search(self, query: str, k: int, doc_id: int | None = None) -> list[dict]:
@@ -345,11 +384,15 @@ class Retriever:
 
         Порядок работы:
         1. Векторный поиск (всегда).
-        2. BM25-поиск и слияние через RRF — если use_hybrid.
-        3. LLM-реранкинг — если use_rerank.
+        2. BM25-поиск и слияние через RRF — если use_hybrid (по умолчанию нет).
+        3. LLM-реранкинг — если use_rerank (по умолчанию нет).
         """
         k = k or self.top_k
 
+        # Берём candidate_k, а не k, хотя при выключенных слиянии и реранкинге
+        # лишние кандидаты тут же отбрасываются. Это намеренно: оба приёма
+        # включаются флагом для перемеров, и глубина выборки не должна
+        # меняться вместе с флагом — иначе сравнивали бы разные замеры.
         dense_hits = self._dense_search(query, k=self.candidate_k, doc_id=doc_id)
 
         if not self.use_hybrid:
@@ -365,7 +408,10 @@ class Retriever:
             dense_ranking = [hit["chunk_id"] for hit in dense_hits]
             lexical_ranking = [hit["chunk_id"] for hit in lexical_hits]
 
-            fused = reciprocal_rank_fusion([dense_ranking, lexical_ranking])
+            fused = reciprocal_rank_fusion(
+                [dense_ranking, lexical_ranking],
+                weights=[1.0, self.bm25_weight],
+            )
             candidates = [by_chunk_id[chunk_id] for chunk_id, _ in fused if chunk_id in by_chunk_id]
 
             if verbose:
