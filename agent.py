@@ -65,6 +65,7 @@ from pydantic import BaseModel, Field, ValidationError
 from data_preporation import load_corpus_index
 from foods import load_catalog
 from restrictions import expand, to_pattern
+from shopping import build_shopping_list
 from solver import DayPlan, PlanNotFeasible, preferred_ids, build_menu, check_plan, day_word
 from targets import (
     ACTIVITY_FACTORS,
@@ -1225,6 +1226,10 @@ class NutritionAgent:
 
         text = answer.strip()
 
+        cost = self._cost_note(state.get("menu") or plan)
+        if cost:
+            text += cost
+
         # Сначала — о непонятых пожеланиях, потом предложение назвать новые.
         # Обратный порядок выглядел бы издевательством: «назовите любимые
         # продукты» сразу после «ваш любимый продукт я не нашёл».
@@ -1237,6 +1242,26 @@ class NutritionAgent:
             text += offer
 
         return {"answer": text, "chunks": chunks, "search_query": query}
+
+    def _cost_note(self, menu_or_plan: Any) -> str:
+        """Во что примерно обойдётся рацион.
+
+        Текст собирает `ShoppingList.cost_estimate` — код, а не модель.
+        Просить модель назвать сумму нельзя по главному правилу проекта:
+        ни одно число в ответе не приходит от LLM. К тому же она охотно
+        округлит «около 4 300» до «4 297 ₽» и тем соврёт точностью.
+
+        Провал оценки не должен ронять выдачу плана: план посчитан
+        детерминированно и верен сам по себе, а цена — довесок.
+        """
+        try:
+            shopping = build_shopping_list(menu_or_plan, self.catalog)
+            estimate = shopping.cost_estimate()
+        except Exception:
+            logger.warning("Не удалось оценить стоимость рациона", exc_info=True)
+            return ""
+
+        return "\n\n" + estimate if estimate else ""
 
     def _unmatched_note(self, profile: Profile) -> str:
         """Сказать вслух, какие пожелания не удалось выполнить.

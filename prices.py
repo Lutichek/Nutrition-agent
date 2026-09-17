@@ -1,0 +1,459 @@
+"""
+Цены продуктов: сколько примерно стоит собранный рацион.
+
+Зачем. Меню без цены — половина ответа. «Рацион на неделю» превращается
+в решение, только когда видно, во что он обойдётся.
+
+## Почему не цены конкретных магазинов
+
+Первая мысль — взять цены «Пятёрочки», «Магнита», «Ленты». Она не проходит,
+и не по технической причине:
+
+* публичных API цен эти сети не дают, а парсинг витрины запрещён их же
+  пользовательским соглашением;
+* цена зависит от города и конкретной точки, а адреса у нас нет;
+* разметка витрин меняется без предупреждения, и замер, собранный на
+  парсере, начинает врать молча — худший вид поломки в этом проекте.
+
+Поэтому источник — **средние потребительские цены Росстата**. Они
+публичные, покрывают всю страну, обновляются еженедельно и не зависят
+от того, работает ли сегодня чей-то парсер.
+
+## Чего эти цифры НЕ значат
+
+Это **оценка порядка величины, а не чек**. Три источника расхождения,
+и все три неустранимы в этой схеме:
+
+1. **Среднее по стране.** В Москве дороже, в райцентре дешевле; разброс
+   по регионам достигает трети.
+2. **Сезон.** Сверка двух источников на одну дату дала по мясу и крупам
+   расхождение 2-4%, а по огурцам — 125 против 217 ₽/кг. Овощи и фрукты
+   ходят в разы, и для них цифра здесь особенно грубая.
+3. **Блюдо ≠ продукт.** В справочнике USDA единица — готовое блюдо, и
+   цену мы берём по ОДНОМУ главному ингредиенту. Масло, специи и
+   гарнирная мелочь в цену не входят.
+
+   У составных блюд отсюда ошибка в обе стороны, и она неустранима
+   без рецептур: «Жареный рис с креветками» считается по рису и цену
+   занижает, «Креветки с овощами» — по креветкам и завышает. На корзине
+   из полусотни позиций эти промахи частично гасят друг друга, на одном
+   блюде — нет. Поэтому осмысленная единица здесь список покупок
+   целиком, а не строка в нём.
+
+Отсюда правило вывода: сумма показывается **с оговоркой и округлением
+до десятков рублей**. Печатать «1 847 ₽» здесь — значит врать точностью,
+которой нет.
+
+## Отсутствие цены — не ноль
+
+Главное правило, общее с измерительным слоем. Блюдо, для которого не
+нашлось правила, стоит **None**, а не нулевых рублей. Иначе рацион
+из неопознанных блюд выглядел бы бесплатным.
+
+Поэтому вместе с суммой всегда возвращается **покрытие** — какая доля
+веса корзины действительно оценена. Решать по сумме, под которой
+покрыто 40% веса, нельзя, и это должно быть видно.
+
+## Как обновить цены
+
+Таблица ``PRICES`` — единственное место правки. Рядом с каждым числом
+стоит ключ, а источник и дата — в ``PRICES_SOURCE``. Обновляя, меняйте
+и дату: цифра без даты через полгода становится дезинформацией.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+# Источник и дата. Обновляются ВМЕСТЕ с таблицей — цена без даты
+# через полгода вводит в заблуждение сильнее, чем её отсутствие.
+PRICES_SOURCE = "средние потребительские цены Росстата, сентябрь 2026"
+PRICES_DATE = "2026-09"
+
+
+@dataclass(frozen=True)
+class Price:
+    """Цена категории продуктов.
+
+    ``rub_per_kg`` — за килограмм ПРОДУКТА, как он лежит в магазине.
+
+    ``cooking_yield`` — во сколько раз меняется вес при готовке:
+    готовый вес / вес продукта. Крупа набирает воду (рис из 100 г сухого
+    даёт около 300 г каши, отсюда 3.0), мясо воду теряет (0.7).
+
+    Без этого множителя ошибка не косметическая, а кратная: 100 г варёного
+    риса, посчитанные по цене сухого, дают втрое больше правды.
+    """
+
+    rub_per_kg: float
+    cooking_yield: float = 1.0
+
+    # False — цена взята из источника напрямую.
+    # True  — выведена из соседних позиций, потому что в источнике такой
+    #         строки нет («прочие фрукты», «суп»). Это по-прежнему не
+    #         выдумка, но и не данные: помечено, чтобы при обновлении
+    #         таблицы было видно, что проверять, а что пересчитывать.
+    derived: bool = False
+
+
+# Цены по категориям. Ключ — короткое русское имя, оно же печатается
+# человеку, если он попросит показать таблицу.
+PRICES: dict[str, Price] = {
+    # ── мясо и птица ─────────────────────────────────────────
+    # Вес готового мяса меньше сырого примерно на треть — отсюда 0.7.
+    "курица": Price(232.30, 0.70),
+    "куриные окорочка": Price(277.98, 0.70),
+    "индейка": Price(650.75, 0.70),
+    "говядина": Price(765.65, 0.70),
+    "свинина": Price(391.44, 0.70),
+    "баранина": Price(1028.89, 0.70),
+    "фарш": Price(527.38, 0.75),
+    "печень": Price(391.80, 0.70),
+    "колбаса варёная": Price(597.79),
+    "сосиски": Price(567.92),
+    "копчёности": Price(955.72),
+    "мясные консервы": Price(707.25),
+    # ── рыба и морепродукты ──────────────────────────────────
+    "рыба мороженая": Price(420.34, 0.80),
+    "рыбное филе": Price(701.49, 0.80),
+    "лосось": Price(1493.61, 0.80),
+    "рыба солёная и копчёная": Price(913.78),
+    "сельдь солёная": Price(395.70),
+    "рыбные консервы": Price(713.89),
+    "креветки": Price(996.35),
+    "кальмары": Price(705.51),
+    "икра": Price(9636.81),
+    # ── молочное и яйца ──────────────────────────────────────
+    "молоко": Price(95.37),
+    "кисломолочное": Price(120.47),
+    "йогурт": Price(323.89),
+    "сметана": Price(359.89),
+    "сливки": Price(364.32),
+    "творог": Price(482.06),
+    "сыр": Price(982.44),
+    "плавленый сыр": Price(739.77),
+    "сливочное масло": Price(1098.32),
+    "сгущённое молоко": Price(416.81),
+    "яйца": Price(94.17 / 0.6),  # 10 яиц ≈ 600 г, приводим к килограмму
+    # ── крупы, хлеб, макароны ────────────────────────────────
+    # Крупа и макароны набирают воду: отсюда множители больше единицы.
+    "рис": Price(128.41, 3.00),
+    "гречка": Price(85.12, 3.00),
+    "пшено": Price(60.71, 3.00),
+    "манная крупа": Price(75.79, 4.00),
+    "овсяные хлопья": Price(132.78, 4.50),
+    "крупа овсяная": Price(54.62, 4.00),
+    "злаковые хлопья": Price(482.52),
+    "макароны": Price(121.02, 2.40),
+    "вермишель": Price(119.63, 2.40),
+    "мука": Price(56.40),
+    "хлеб": Price(125.07),
+    "пельмени": Price(412.61),
+    # ── овощи, фрукты, бобовые ───────────────────────────────
+    # Самая грубая часть таблицы: сезонный ход достигает двух раз.
+    "картофель": Price(38.31),
+    "морковь": Price(38.90),
+    "лук": Price(40.72),
+    "капуста": Price(30.78),
+    "свёкла": Price(35.02),
+    "помидоры": Price(218.56),
+    "огурцы": Price(216.63),
+    "чеснок": Price(369.11),
+    "грибы": Price(419.47),
+    "зелень": Price(1033.11),
+    "замороженные овощи": Price(373.10),
+    "консервированные овощи": Price(292.85),
+    "томатные консервы": Price(444.10),
+    "горох и фасоль": Price(115.64, 2.50),
+    "яблоки": Price(147.61),
+    "бананы": Price(140.07),
+    "апельсины": Price(153.72),
+    "лимоны": Price(243.02),
+    "груши": Price(249.12),
+    "виноград": Price(242.69),
+    "замороженные ягоды": Price(650.29),
+    "сухофрукты": Price(680.09),
+    # ── орехи, масла, соусы ──────────────────────────────────
+    "орехи": Price(1360.51),
+    "растительное масло": Price(157.86),
+    "маргарин": Price(282.45),
+    "майонез": Price(323.84),
+    "кетчуп": Price(305.35),
+    "специи": Price(2405.27),
+    "соль": Price(21.64),
+    "сахар": Price(62.53),
+    "мёд": Price(609.07),
+    "варенье": Price(505.51),
+    # ── сладкое ──────────────────────────────────────────────
+    "шоколад": Price(1566.36),
+    "конфеты": Price(1106.10),
+    "печенье": Price(322.33),
+    "пряники": Price(279.76),
+    "зефир": Price(550.89),
+    "торты": Price(950.00),
+    "мороженое": Price(934.87),
+    "какао": Price(1195.83),
+    # ── напитки ──────────────────────────────────────────────
+    # В справочнике это НАПИТКИ, а не сырьё: 100 г кофе — почти вода.
+    # Множитель приводит к завариванию: 60 г зерна на литр, 10 г чая.
+    # Без него чашка кофе стоит дороже стейка.
+    "кофе": Price(2056.04, 16.0),
+    "чай": Price(1414.48, 100.0),
+    "сок": Price(138.23),
+    "газированные напитки": Price(74.88),
+    "вода": Price(60.70),
+    # ── выведенные позиции ───────────────────────────────────
+    # В источнике таких строк нет, и цена посчитана из соседних.
+    # Каждая помечена derived=True — при обновлении таблицы их надо
+    # пересчитывать, а не сверять.
+    #
+    # «Прочие фрукты» — среднее по пяти позициям источника: яблоки 148,
+    # бананы 140, апельсины 154, груши 249, виноград 243.
+    "прочие фрукты": Price(186.0, derived=True),
+    # Суп на 85-90% вода. Считать его по цене мяса — завысить в разы,
+    # поэтому берём долю от мясной цены по типичной закладке.
+    "суп": Price(90.0, derived=True),
+    # Пудинги, кремы, желе — молочная основа с сахаром: между творогом
+    # и мороженым.
+    "молочный десерт": Price(450.0, derived=True),
+    # Солёные снеки: рядом с печеньем, но обычно дороже.
+    "снеки": Price(420.0, derived=True),
+    # Батончики и питание «для спорта» — разброс огромный, цифра самая
+    # грубая во всей таблице.
+    "батончики": Price(1200.0, derived=True),
+}
+
+
+# Правила сопоставления: блюдо справочника → категория цены.
+#
+# Тот же приём и те же ловушки, что в shopping.DEPARTMENTS — порядок
+# от узкого к широкому, первое совпадение выигрывает. Дважды существен:
+#
+#   «cottage cheese» обязан проверяться раньше «cheese»;
+#   «chicken liver»  — раньше «chicken»;
+#   «peanut butter»  — раньше «butter», иначе арахисовая паста
+#                      посчитается по цене сливочного масла (1098 ₽/кг).
+#
+# Сопоставление идёт по АНГЛИЙСКОМУ названию: оно из USDA, стабильно
+# и не зависит от качества перевода.
+#
+# Правил два списка, и разделение существенное.
+#
+# PRIORITY_RULES — устойчивые словосочетания, где главное слово стоит
+# ВТОРЫМ: «chicken liver» это печень, а не курица; «peanut butter» —
+# паста, а не сливочное масло. Позиция в названии тут обманывает,
+# поэтому такие правила выигрывают всегда.
+#
+# PRICE_RULES — всё остальное, и здесь побеждает совпадение, стоящее
+# в названии РАНЬШЕ. Это не эвристика на глаз: в описаниях USDA главный
+# продукт называется первым, а уточнения идут после запятой или «with».
+# «Macaroni or pasta salad with tuna» — это макароны с тунцом, и цену
+# надо брать по макаронам. Порядок правил в списке остаётся тай-брейком
+# при равной позиции.
+PRIORITY_RULES: list[tuple[str, str]] = [
+    ("орехи", r"peanut butter|almond butter|nut butter"),
+    ("творог", r"cottage cheese|ricotta"),
+    ("печень", r"liver|giblet"),
+    ("икра", r"caviar|roe\b"),
+    ("плавленый сыр", r"processed cheese|cheese spread|american cheese"),
+    ("сметана", r"sour cream"),
+    ("сгущённое молоко", r"condensed milk|evaporated milk"),
+    ("мороженое", r"ice cream|frozen yogurt"),
+    ("рыбные консервы", r"canned (?:fish|tuna|sardine)|tuna, canned"),
+    # Котлеты из рыбы и краба — строго перед выпечкой, иначе слово «cake»
+    # уносит их в торты.
+    ("рыбное филе", r"(?:fish|crab|salmon|tuna)\s+(?:cake|patty|patties)"),
+    # Выпечка с названием начинки: «Apple pie» — это пирог, а не яблоки.
+    # Главное слово снова стоит вторым, и позиция обманывает.
+    # «cheesecake» пишется слитно, границы слова внутри нет — отдельной
+    # веткой, иначе чизкейк считается по цене сыра (982 ₽/кг).
+    ("торты", r"\b(?:pie|cake|tart|cobbler|crisp|strudel|turnover|pastry)\b|cheesecake"),
+    # «Mustard greens» — листовая зелень, а не горчица. Та же ловушка, что
+    # в переводах каталога: одно английское слово, два разных продукта,
+    # и цена отличается в семь раз (1033 против 2405 ₽/кг).
+    ("зелень", r"mustard greens|collard|chard|turnip greens|beet greens|dandelion greens"),
+    # Какао и горячий шоколад — напитки на молоке, а не плитка.
+    ("молоко", r"hot chocolate|chocolate milk|cocoa,? (?:hot|with)"),
+    # Жареная выпечка, чьё название не содержит ни pie, ни cake.
+    ("торты", r"sopaipilla|churro|beignet|fritter|funnel cake"),
+]
+
+PRICE_RULES: list[tuple[str, str]] = [
+    # Рыба и морепродукты — раньше мяса: «tuna salad» иначе уедет в овощи.
+    ("лосось", r"salmon|trout"),
+    ("креветки", r"shrimp|prawn"),
+    ("кальмары", r"squid|calamari|octopus"),
+    ("рыбные консервы", r"canned (?:fish|tuna|sardine)|tuna, canned"),
+    ("сельдь солёная", r"herring"),
+    ("рыба солёная и копчёная", r"smoked fish|lox\b|salted fish"),
+    ("рыбное филе", r"fillet|flounder|cod\b|haddock|halibut|tilapia|pollock|perch|bass\b"),
+    ("рыба мороженая", r"\bfish\b|tuna|sardine|anchov|mackerel|seafood|shellfish|"
+                       r"clam|oyster|mussel|scallop|crab|lobster|abalone"),
+    # Мясо и птица.
+    ("колбаса варёная", r"bologna|luncheon meat|salami|pepperoni"),
+    ("сосиски", r"frankfurter|hot dog|sausage|bratwurst"),
+    ("копчёности", r"bacon|\bham\b|prosciutto|pastrami"),
+    ("мясные консервы", r"canned meat|spam\b"),
+    ("фарш", r"ground beef|ground pork|ground turkey|ground meat|meatball|meatloaf|burger|patty"),
+    ("индейка", r"turkey"),
+    ("куриные окорочка", r"drumstick|chicken thigh|chicken leg"),
+    ("курица", r"chicken|poultry|cornish|duck\b|goose"),
+    ("говядина", r"beef|steak|veal|brisket"),
+    ("свинина", r"pork|chop\b"),
+    ("баранина", r"lamb|mutton|goat|venison|deer\b|rabbit|game\b|elk\b|bison"),
+    # Молочное и яйца.
+    ("яйца", r"\begg"),
+    ("плавленый сыр", r"processed cheese|cheese spread|american cheese"),
+    ("сыр", r"cheese|mozzarella|cheddar|parmesan|feta|brie"),
+    ("йогурт", r"yogurt|yoghurt"),
+    ("сметана", r"sour cream"),
+    ("сливки", r"\bcream\b|half and half"),
+    ("сгущённое молоко", r"condensed milk|evaporated milk"),
+    ("кисломолочное", r"kefir|buttermilk"),
+    ("молоко", r"\bmilk\b"),
+    ("сливочное масло", r"\bbutter\b"),
+    # Сладкое — раньше круп и фруктов: «fruit pie» иначе уедет во фрукты.
+    ("мороженое", r"ice cream|sorbet|gelato|frozen yogurt"),
+    ("шоколад", r"chocolate bar|\bchocolate\b"),
+    ("конфеты", r"candy|candies|caramel|marshmallow|fudge"),
+    ("печенье", r"cookie|biscuit|cracker|wafer"),
+    ("торты", r"cake|pie\b|pastry|doughnut|donut|brownie|muffin|croissant|danish"),
+    ("какао", r"cocoa"),
+    # Крупы, хлеб, макароны.
+    ("овсяные хлопья", r"oatmeal|oats|granola"),
+    ("злаковые хлопья", r"cereal|cornflake|muesli"),
+    ("рис", r"\brice\b|risotto|pilaf"),
+    ("гречка", r"buckwheat|kasha"),
+    ("пшено", r"millet|quinoa|bulgur|barley|couscous"),
+    ("манная крупа", r"semolina|cream of wheat|farina"),
+    ("макароны", r"pasta|macaroni|spaghetti|lasagna|penne|ravioli|noodle|tortellini|"
+                 r"gnocchi|fettuccine|linguine|rigatoni|ziti\b|orzo|vermicelli"),
+    ("пельмени", r"dumpling|pierogi|wonton"),
+    ("хлеб", r"bread|bagel|roll\b|bun\b|tortilla|pita|toast|sandwich|burrito|taco|wrap|pizza"),
+    ("мука", r"\bflour\b|batter"),
+    # Овощи и фрукты — после сладкого, чтобы не ловить пироги.
+    ("картофель", r"potato|french fries|hash brown"),
+    ("морковь", r"carrot"),
+    ("лук", r"onion|leek|shallot"),
+    ("капуста", r"cabbage|coleslaw|sauerkraut|brussels sprout"),
+    ("свёкла", r"beet\b|beets\b"),
+    ("помидоры", r"tomato"),
+    ("огурцы", r"cucumber|pickle"),
+    ("чеснок", r"garlic"),
+    ("грибы", r"mushroom"),
+    ("зелень", r"lettuce|spinach|kale|arugula|herb|parsley|cilantro|dill\b|basil"),
+    ("замороженные ягоды", r"berr|strawberr|blueberr|raspberr|cranberr"),
+    ("сухофрукты", r"raisin|dried fruit|prune|dried apricot|date\b"),
+    ("яблоки", r"apple"),
+    ("бананы", r"banana|plantain"),
+    ("апельсины", r"orange|tangerine|mandarin|grapefruit"),
+    ("лимоны", r"lemon|lime\b"),
+    ("груши", r"pear\b"),
+    ("виноград", r"grape\b|grapes\b"),
+    ("горох и фасоль", r"bean|lentil|\bpea\b|\bpeas\b|chickpea|hummus|legume|soy|tofu"),
+    ("замороженные овощи", r"broccoli|cauliflower|asparagus|zucchini|squash|eggplant|"
+                           r"pepper|celery|corn\b|okra|artichoke|avocado|vegetable"),
+    ("консервированные овощи", r"canned vegetable|olives?\b"),
+    # Масла, соусы, напитки.
+    ("майонез", r"mayonnaise|mayo\b"),
+    ("кетчуп", r"ketchup|tomato sauce|salsa"),
+    ("растительное масло", r"\boil\b|margarine|shortening|dressing|vinaigrette"),
+    # Сироп ушёл из специй в сахар: по цене приправ (2405 ₽/кг) политая
+    # сиропом выпечка становилась дороже мяса.
+    ("специи", r"\bspice|seasoning|salt and pepper|mustard|\bsauce\b|gravy"),
+    ("сахар", r"syrup|molasses"),
+    ("мёд", r"honey"),
+    ("варенье", r"\bjam\b|jelly|preserve|marmalade"),
+    ("сахар", r"\bsugar\b"),
+    ("соль", r"\bsalt\b"),
+    ("кофе", r"coffee|espresso|latte|cappuccino"),
+    ("чай", r"\btea\b"),
+    ("сок", r"juice|smoothie|nectar"),
+    ("газированные напитки", r"soda|cola|soft drink|energy drink"),
+    ("вода", r"\bwater\b"),
+    ("орехи", r"nuts?\b|almond|walnut|cashew|pistachio|pecan|seeds?\b|sunflower seed"),
+    # ── широкие правила-заглушки, строго последними ──────────
+    # Ловят то, что не опознано выше: смешанные блюда и общие названия.
+    # Стоят в самом конце намеренно — иначе «meat» перехватило бы
+    # говядину и свинину, а «fruit» — яблоки и бананы.
+    ("батончики", r"nutrition bar|protein bar|meal replacement|nutritional (?:beverage|drink)"),
+    ("снеки", r"pretzel|snack mix|popcorn|chips?\b|puffs?\b"),
+    ("молочный десерт", r"pudding|custard|flan\b|creme|mousse|gelatin|jello"),
+    ("суп", r"soup|broth|bouillon|chowder|bisque|stew\b|chili\b"),
+    ("фарш", r"\bmeat\b"),
+    ("прочие фрукты", r"fruit|apricot|cherr|melon|cantaloupe|peach|plum\b|nectarine|"
+                      r"mango|papaya|pineapple|kiwi|clementine|pomegranate|fig\b|persimmon"),
+    ("замороженные овощи", r"vegetable|greens\b"),
+    ("хлеб", r"crepe|turnover|empanada|quesadilla|chimichanga|chilaquiles|enchilada|"
+             r"tamale|arepa|pancake|waffle|biscuit"),
+]
+
+# Хвосты-исключения в названиях USDA: «..., excludes macaroni and cheese».
+# Слова после них означают, чего в блюде НЕТ, и сопоставлять по ним —
+# прямая ошибка. Та же ловушка, что в shopping.py.
+_EXCLUSION_TAIL = re.compile(r",\s*(excludes|excluding|not)\b.*$", re.IGNORECASE)
+
+# Признаки того, что блюдо НЕ готовили, и множитель веса применять нельзя.
+_RAW = re.compile(r"\b(raw|uncooked|dry|dried|fresh)\b", re.IGNORECASE)
+
+_COMPILED_PRIORITY: list[tuple[str, re.Pattern[str]]] = [
+    (key, re.compile(pattern, re.IGNORECASE)) for key, pattern in PRIORITY_RULES
+]
+_COMPILED: list[tuple[str, re.Pattern[str]]] = [
+    (key, re.compile(pattern, re.IGNORECASE)) for key, pattern in PRICE_RULES
+]
+
+
+def _match(text: str) -> str | None:
+    """Ценовая категория для одной строки описания."""
+    cleaned = _EXCLUSION_TAIL.sub("", text)
+
+    for key, pattern in _COMPILED_PRIORITY:
+        if pattern.search(cleaned):
+            return key
+
+    # Побеждает совпадение, стоящее в названии раньше: в описаниях USDA
+    # главный продукт называется первым. При равной позиции — порядок
+    # правил в списке, поэтому храним и его.
+    best: tuple[int, int, str] | None = None
+    for order, (key, pattern) in enumerate(_COMPILED):
+        found = pattern.search(cleaned)
+        if found is None:
+            continue
+        candidate = (found.start(), order, key)
+        if best is None or candidate < best:
+            best = candidate
+
+    return best[2] if best else None
+
+
+def price_key_for(name: str, category: str = "") -> str | None:
+    """К какой ценовой категории отнести блюдо. None — правила не нашлось.
+
+    Сначала пробуем название блюда (оно точнее), потом раздел справочника.
+    """
+    for source in (name, category):
+        if source and (key := _match(source)):
+            return key
+    return None
+
+
+def cost_of(grams: float, name: str, category: str = "") -> float | None:
+    """Во что обойдётся столько граммов этого блюда. None — цены нет.
+
+    Возвращается именно None, а не ноль: неопознанное блюдо не бесплатное,
+    оно неизвестной стоимости, и разница между этими случаями решающая.
+    """
+    key = price_key_for(name, category)
+    if key is None:
+        return None
+
+    price = PRICES[key]
+
+    # Множитель применяем только к приготовленному: «Rice, white, raw»
+    # уже лежит в магазине в этом весе.
+    yield_factor = 1.0 if _RAW.search(name) else price.cooking_yield
+
+    raw_grams = grams / yield_factor
+    return raw_grams / 1000.0 * price.rub_per_kg

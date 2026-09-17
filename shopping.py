@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
+
+from prices import cost_of
 
 # Отделы магазина в порядке обхода: сначала то, что берут в глубине зала,
 # бакалея последней. Порядок влияет только на вид списка.
@@ -106,6 +108,16 @@ class ShoppingItem(BaseModel):
     times: int          # в скольких приёмах пищи встречается за период
     kcal: float         # суммарная калорийность — видно, на что уходит бюджет дня
 
+    # Примерная стоимость позиции, рубли. None — цены нет, и это НЕ ноль:
+    # неопознанный продукт не бесплатный, он неизвестной стоимости.
+    # Из-за этого различия сумма всегда идёт вместе с покрытием.
+    cost: float | None = None
+
+    @property
+    def display_cost(self) -> str:
+        """Цена строки. Прочерк, если оценить не удалось."""
+        return "—" if self.cost is None else f"{self.cost:.0f} ₽"
+
     @property
     def display_amount(self) -> str:
         """Вес в том виде, в каком его читают в магазине."""
@@ -128,6 +140,61 @@ class ShoppingList(BaseModel):
     def total_kcal(self) -> float:
         return sum(item.kcal for item in self.items)
 
+    # computed_field, а не голое property: иначе стоимость не попадёт
+    # в JSON, и интерфейс получит список покупок без единственного числа,
+    # ради которого он затевался.
+    @computed_field
+    @property
+    def total_cost(self) -> float:
+        """Сумма по тем позициям, которые удалось оценить.
+
+        Смотреть на неё в отрыве от ``priced_share`` нельзя: при покрытии
+        в половину веса это сумма за половину корзины, а выглядит как
+        за всю.
+        """
+        return sum(item.cost for item in self.items if item.cost is not None)
+
+    @computed_field
+    @property
+    def priced_share(self) -> float:
+        """Какая доля ВЕСА корзины оценена. Доля веса, а не позиций.
+
+        Позиции считать здесь бессмысленно: неоценёнными чаще остаются
+        мелочи вроде специй, и «оценено 90% позиций» скрывало бы, что
+        без цены осталось килограмм мяса.
+        """
+        total = self.total_grams
+        if not total:
+            return 0.0
+        priced = sum(item.grams for item in self.items if item.cost is not None)
+        return priced / total
+
+    def cost_estimate(self) -> str:
+        """Стоимость словами — с округлением и оговоркой.
+
+        Округление до десятков рублей намеренное. Источник — средние цены
+        по стране, разброс по регионам достигает трети, а овощи ходят
+        в разы. Печатать «1 847 ₽» значит обещать точность, которой нет.
+        """
+        from prices import PRICES_SOURCE
+
+        if self.priced_share < 0.5:
+            return "Стоимость оценить не удалось: слишком мало позиций с известной ценой."
+
+        rounded = round(self.total_cost / 10) * 10
+        text = f"Примерная стоимость: около {rounded:,.0f} ₽".replace(",", " ")
+
+        if self.days > 1:
+            per_day = round(self.total_cost / self.days / 10) * 10
+            text += f" (≈{per_day:,.0f} ₽ в день)".replace(",", " ")
+
+        text += f".\nИсточник — {PRICES_SOURCE}; это оценка, а не чек."
+
+        if self.priced_share < 0.95:
+            text += f" Оценено {self.priced_share:.0%} веса корзины."
+
+        return text
+
     def by_department(self) -> list[tuple[str, list[ShoppingItem]]]:
         """Сгруппировать по отделам в порядке обхода магазина."""
         order = [name for name, _ in DEPARTMENTS] + [DEFAULT_DEPARTMENT]
@@ -144,11 +211,14 @@ class ShoppingList(BaseModel):
         for department, items in self.by_department():
             lines.append(department.upper())
             for item in items:
-                mark = f"  ×{item.times}" if item.times > 1 else ""
-                lines.append(f"  {item.name:<52} {item.display_amount:>8}{mark}")
+                mark = f" ×{item.times}" if item.times > 1 else "  "
+                lines.append(f"  {item.name:<48} {item.display_amount:>8}{mark:<4}"
+                             f"{item.display_cost:>9}")
             lines.append("")
         lines.append(f"Всего позиций: {len(self.items)}, "
                      f"общий вес {self.total_grams / 1000:.1f} кг")
+        lines.append("")
+        lines.append(self.cost_estimate())
         return "\n".join(lines)
 
 
@@ -181,10 +251,21 @@ def build_shopping_list(menu, catalog=None) -> ShoppingList:
                 "grams": 0.0,
                 "times": 0,
                 "kcal": 0.0,
+                # Английское название храним отдельно: в строку списка идёт
+                # русское, а цены сопоставляются по английскому — оно из USDA
+                # и не зависит от качества перевода.
+                "_en": item.name,
             })
             entry["grams"] += item.grams
             entry["kcal"] += item.kcal
             entry["times"] += 1
+
+    # Цену считаем после свёртки, по суммарному весу: округление на каждом
+    # дне копило бы ошибку.
+    for entry in merged.values():
+        entry["cost"] = cost_of(
+            entry["grams"], entry.pop("_en"), categories.get(entry["fdc_id"], "")
+        )
 
     # Внутри отдела — от тяжёлого к лёгкому: крупные позиции ищут первыми,
     # а мелочь вроде специй набирают заодно.
