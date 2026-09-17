@@ -74,6 +74,40 @@ class TestConflictWithRestrictions:
         assert _resolve_preferences(_profile(exclude=["pork"])) == []
 
 
+class TestNutrientsAreNotFoods:
+    """«Добавь больше белка» — это не пожелание по продуктам.
+
+    Наблюдавшийся случай на живой модели: «добавь больше белка» дало
+    include=["protein"] в 2 прогонах из 3, хотя промпт это запрещает
+    прямым текстом.
+
+    Отказ был бы тихим и вредным: "protein" находит в каталоге
+    протеиновые батончики и порошки, и человек, попросивший больше
+    белка, получил бы в меню спортпит. Норму белка считает targets.py.
+    """
+
+    @pytest.mark.parametrize("word", ["protein", "fat", "carbs", "calories", "fiber"])
+    def test_nutrient_is_dropped(self, word: str) -> None:
+        assert _resolve_preferences(_profile(include=[word])) == []
+
+    def test_real_food_survives_alongside_nutrient(self) -> None:
+        profile = _profile(include=["protein", "chicken"])
+        assert _resolve_preferences(profile) == ["chicken"]
+
+    def test_nutrient_is_not_reported_as_conflict(self, catalog: pd.DataFrame) -> None:
+        """Про отброшенный нутриент агент молчит.
+
+        Фраза «не добавил в рацион protein — это противоречит вашим
+        ограничениям» запутала бы человека: он просил не продукт,
+        и никакого ограничения тут нет.
+        """
+        from types import SimpleNamespace
+
+        stub = SimpleNamespace(catalog=catalog)
+        profile = _profile(include=["protein"])
+        assert NutritionAgent._unmatched_note(stub, profile) == ""
+
+
 class TestPreferencePenalty:
     """Штраф за нехватку любимых блюд."""
 

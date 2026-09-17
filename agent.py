@@ -671,6 +671,27 @@ def _activity_from_text(text: str) -> str | None:
     return None
 
 
+# Нутриенты, которые модель принимает за продукты.
+#
+# Наблюдавшийся случай: «добавь больше белка» → include=["protein"],
+# 2 прогона из 3, при том что промпт это запрещает прямым текстом
+# («речь о нутриенте, а не о продукте, поле не включай»).
+#
+# Отказ был бы тихим и вредным: "protein" находит в каталоге протеиновые
+# батончики и порошки, и человек, попросивший больше белка, получил бы
+# в меню спортпит. Норму белка считает targets.py, и просьба «побольше
+# белка» — это разговор о цели, а не о продукте.
+#
+# Тот же приём, что у _goal_from_text и _activity_from_text: там, где
+# модель устойчиво ошибается, решает код.
+_NUTRIENT_WORDS = {
+    "protein", "proteins", "fat", "fats", "carb", "carbs", "carbohydrate",
+    "carbohydrates", "calorie", "calories", "kcal", "energy",
+    "fiber", "fibre", "vitamin", "vitamins", "mineral", "minerals",
+    "macros", "micronutrients", "nutrients",
+}
+
+
 def _resolve_preferences(profile: Profile) -> list[str]:
     """Убрать из пожеланий то, что противоречит ограничениям.
 
@@ -691,15 +712,19 @@ def _resolve_preferences(profile: Profile) -> list[str]:
     в УЖЕ отфильтрованном каталоге), но тогда пожелание просто молча
     не сработает. Здесь оно снимается явно — и это видно в профиле.
     """
-    if not profile.include or not profile.exclude:
-        return list(profile.include)
+    # Нутриенты отсеиваем ДО всего остального: они не продукты, и вопрос
+    # конфликта с ограничениями к ним не относится.
+    wanted = [t for t in profile.include if t.strip().lower() not in _NUTRIENT_WORDS]
+
+    if not wanted or not profile.exclude:
+        return wanted
 
     forbidden = to_pattern(profile.exclude)
     if not forbidden:
-        return list(profile.include)
+        return wanted
 
     kept: list[str] = []
-    for term in profile.include:
+    for term in wanted:
         # Раскрываем пожелание и смотрим, не попало ли хоть одно слово
         # под запрет. Достаточно одного: «молочка» без молока — уже
         # не то, о чём просили.
@@ -1235,7 +1260,14 @@ class NutritionAgent:
             return ""
 
         allowed = _resolve_preferences(profile)
-        blocked = [term for term in profile.include if term not in allowed]
+
+        # Нутриенты («побольше белка») из отчёта исключаем молча: норму
+        # по ним считает targets.py, и фраза «не добавил в рацион protein»
+        # человека только запутает — он просил не продукт.
+        blocked = [
+            term for term in profile.include
+            if term not in allowed and term.strip().lower() not in _NUTRIENT_WORDS
+        ]
 
         missing = [
             term for term in allowed
