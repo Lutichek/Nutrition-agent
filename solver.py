@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from restrictions import to_category_pattern, to_pattern
 from targets import Targets
@@ -205,6 +205,23 @@ class MealItem(BaseModel):
         """Как называть блюдо в тексте для человека."""
         return self.name_ru or self.name
 
+    # computed_field, а не голое property: состав должен уезжать в API
+    # вместе с блюдом, иначе интерфейсу пришлось бы ходить за ним отдельно.
+    @computed_field
+    @property
+    def composition(self) -> str:
+        """Из чего состоит порция: «курица 69 г, рис 46 г».
+
+        Считается по рецептуре FNDDS — по той же, по которой считается
+        и цена. Человек видит ровно то, из чего сложилась сумма.
+
+        Пусто, если артефакт состава не собран: без него план остаётся
+        полностью рабочим, просто без этой строчки.
+        """
+        from ingredients import describe, load_composition
+
+        return describe(load_composition().get(self.fdc_id, []), self.grams)
+
     def describe(self) -> str:
         """Строка для человека.
 
@@ -234,8 +251,15 @@ class DayPlan(BaseModel):
     deviation: dict[str, float] = Field(default_factory=dict)
     loss: float = 0.0
 
-    def render(self) -> str:
-        """Человекочитаемый план — то, что агент показывает пользователю."""
+    def render(self, with_composition: bool = False) -> str:
+        """Человекочитаемый план — то, что агент показывает пользователю.
+
+        Args:
+            with_composition: печатать под каждым блюдом его состав.
+                По умолчанию нет: в переписке состав удлиняет план втрое,
+                а нужен он не всегда. Включается там, где место есть —
+                в выгрузке и в списке покупок.
+        """
         lines: list[str] = []
         current_slot = None
 
@@ -244,6 +268,8 @@ class DayPlan(BaseModel):
                 lines.append(f"\n{item.slot}:")
                 current_slot = item.slot
             lines.append(f"  • {item.describe()}")
+            if with_composition and (composition := item.composition):
+                lines.append(f"      состав: {composition}")
 
         lines.append("")
         lines.append(
@@ -785,8 +811,13 @@ class Menu(BaseModel):
     def unique_dishes(self) -> int:
         return len({item.fdc_id for day in self.days for item in day.items})
 
-    def render(self) -> str:
-        """Человекочитаемое меню — для скачивания и для терминала."""
+    def render(self, with_composition: bool = True) -> str:
+        """Человекочитаемое меню — для скачивания и для терминала.
+
+        Состав здесь печатается ПО УМОЛЧАНИЮ, в отличие от плана на день:
+        меню скачивают файлом, место в нём есть, а «из чего это блюдо» —
+        первый вопрос, который возникает у плиты.
+        """
         lines = [f"МЕНЮ НА {len(self.days)} " + day_word(len(self.days)).upper(), ""]
         lines.append(
             f"Норма на день: {self.targets['kcal']:.0f} ккал · "
@@ -800,7 +831,7 @@ class Menu(BaseModel):
             lines.append("=" * 60)
             lines.append(f"ДЕНЬ {number}")
             lines.append("=" * 60)
-            lines.append(day.render())
+            lines.append(day.render(with_composition=with_composition))
             lines.append("")
 
         return "\n".join(lines)

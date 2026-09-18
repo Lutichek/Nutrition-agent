@@ -142,7 +142,13 @@
   }
   .meal:first-child { border-top: 0; }
   .meal-slot { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-  .meal-name { font-size: 14px; line-height: 1.35; margin: 1px 0 5px; }
+  .meal-name { font-size: 14px; line-height: 1.35; margin: 1px 0 3px; }
+  /* Состав — вспомогательная строка: приглушена и мельче названия, чтобы
+     не спорить с ним за внимание. Длинные рецептуры переносятся, а не
+     обрезаются: обрезанный состав хуже отсутствующего — непонятно,
+     закончился он или спрятан. */
+  .meal-comp { font-size: 11.5px; line-height: 1.35; color: var(--muted);
+               margin: 0 0 5px; }
   .meal-bjc { display: flex; gap: 5px; flex-wrap: wrap; font-size: 11.5px;
               font-variant-numeric: tabular-nums; }
   .meal-bjc span { padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
@@ -430,6 +436,7 @@ function renderPlan(data) {
       <div>
         <div class="meal-slot">${escape(item.slot)}</div>
         <div class="meal-name">${escape(item.name_ru || item.name)}</div>
+        ${item.composition ? `<div class="meal-comp">${escape(item.composition)}</div>` : ""}
         <div class="meal-bjc">
           <span class="b">Б ${round(item.protein_g)}</span>
           <span class="f">Ж ${round(item.fat_g)}</span>

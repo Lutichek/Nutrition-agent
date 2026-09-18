@@ -76,12 +76,22 @@ class TestNumbers:
         assert book["Сводка"].cell(row=5, column=3).value == round(expected)
 
     def test_meal_rows_sum_to_daily_totals(self, book, menu):
-        """Лист «Меню» и лист «По дням» не должны разъезжаться."""
+        """Лист «Меню» и лист «По дням» не должны разъезжаться.
+
+        Колонка ищется ПО ЗАГОЛОВКУ, а не по номеру. Номер уже подводил:
+        добавили колонку «Состав» четвёртой, и проверка стала складывать
+        граммы вместо калорий — сумма сошлась на вид, а смысл потерялся.
+        """
         sheet = book["Меню"]
+        headers = {sheet.cell(row=1, column=c).value: c
+                   for c in range(1, sheet.max_column + 1)}
+        kcal_column = headers["Калории"]
+        day_column = headers["День"]
+
         first_day = [
-            sheet.cell(row=r, column=5).value
+            sheet.cell(row=r, column=kcal_column).value
             for r in range(2, sheet.max_row + 1)
-            if sheet.cell(row=r, column=1).value == 1
+            if sheet.cell(row=r, column=day_column).value == 1
         ]
         # Округление до целых по каждой строке даёт погрешность в пару ккал.
         assert abs(sum(first_day) - menu.days[0].totals["kcal"]) < len(first_day)

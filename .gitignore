@@ -36,6 +36,7 @@ lance_db/*
 !data/
 !data/processed/
 !data/processed/foods.parquet
+!data/processed/ingredients.parquet
 !data/processed/corpus_index.json
 
 # Сырьё остаётся снаружи: 28 МБ выгрузки USDA и абстрактов PubMed,

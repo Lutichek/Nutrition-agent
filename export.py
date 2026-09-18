@@ -154,7 +154,9 @@ def _sheet_by_day(book: Workbook, menu: Menu) -> Worksheet:
 def _sheet_menu(book: Workbook, menu: Menu) -> Worksheet:
     sheet = book.create_sheet("Меню")
 
-    _header_row(sheet, 1, ["День", "Приём пищи", "Блюдо", "Граммы", "Калории",
+    # Состав идёт сразу за блюдом: у плиты это второй вопрос после «что это».
+    _header_row(sheet, 1, ["День", "Приём пищи", "Блюдо", "Состав",
+                           "Граммы", "Калории",
                            "Белки, г", "Жиры, г", "Углеводы, г",
                            "Клетчатка, г", "Натрий, мг"])
 
@@ -162,7 +164,7 @@ def _sheet_menu(book: Workbook, menu: Menu) -> Worksheet:
     for number, day in enumerate(menu.days, start=1):
         for item in day.items:
             values = [
-                number, item.slot, item.title,
+                number, item.slot, item.title, item.composition,
                 round(item.grams), round(item.kcal),
                 round(item.protein_g), round(item.fat_g), round(item.carb_g),
                 round(item.fiber_g), round(item.sodium_mg),
@@ -170,17 +172,17 @@ def _sheet_menu(book: Workbook, menu: Menu) -> Worksheet:
             for column, value in enumerate(values, start=1):
                 cell = sheet.cell(row=row, column=column, value=value)
                 cell.border = BOX
-                if column >= 4:
+                if column >= 5:
                     cell.number_format = "0"
             row += 1
 
     # Автофильтр и закреплённая шапка: на 30 днях это 210 строк, и без них
     # таблица бесполезна — до конца не долистать, а шапка уезжает.
-    sheet.auto_filter.ref = f"A1:J{row - 1}"
+    sheet.auto_filter.ref = f"A1:K{row - 1}"
     sheet.freeze_panes = "A2"
 
-    _fit_columns(sheet, {"A": 7, "B": 18, "C": 52, "D": 9, "E": 10,
-                         "F": 11, "G": 10, "H": 13, "I": 14, "J": 12})
+    _fit_columns(sheet, {"A": 7, "B": 18, "C": 52, "D": 60, "E": 9,
+                         "F": 10, "G": 11, "H": 10, "I": 13, "J": 14, "K": 12})
     return sheet
 
 

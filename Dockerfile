@@ -48,6 +48,8 @@ RUN test -d lance_db/vectorstore \
       || (echo "НЕТ ИНДЕКСА: выполните python build_index.py до сборки образа" && exit 1)
 RUN test -f data/processed/foods.parquet \
       || (echo "НЕТ КАТАЛОГА: выполните python foods.py --rebuild до сборки образа" && exit 1)
+RUN test -f data/processed/ingredients.parquet \
+      || (echo "НЕТ СОСТАВА: выполните python ingredients.py --rebuild до сборки образа" && exit 1)
 
 # ── Права ─────────────────────────────────────────────────────
 # Сервис смотрит наружу портом, поэтому работает не от root. Вместе
