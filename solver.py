@@ -44,6 +44,7 @@ from typing import Any
 import pandas as pd
 from pydantic import BaseModel, Field, computed_field
 
+from prices import cost_per_gram, fallback_cost_per_gram
 from restrictions import to_category_pattern, to_pattern
 from targets import Targets
 
@@ -250,6 +251,25 @@ class DayPlan(BaseModel):
     targets: dict[str, float]
     deviation: dict[str, float] = Field(default_factory=dict)
     loss: float = 0.0
+
+    # Бюджет, под который день собирался. None — про деньги не говорили.
+    # Хранится в плане, чтобы было с чем сравнить стоимость: без него
+    # «510 ₽» это просто число, а не «уложились» или «не уложились».
+    budget: float | None = None
+
+    @computed_field
+    @property
+    def cost(self) -> float:
+        """Во что обходится день, рубли."""
+        return round(day_cost(self.items), 1)
+
+    @computed_field
+    @property
+    def within_budget(self) -> bool | None:
+        """Уложились ли в бюджет. None — бюджета не задавали."""
+        if not self.budget:
+            return None
+        return self.cost <= self.budget
 
     def render(self, with_composition: bool = False) -> str:
         """Человекочитаемый план — то, что агент показывает пользователю.
@@ -481,6 +501,51 @@ def _preference_penalty(items: list[MealItem], preferred: set[int]) -> float:
     return shortfall * PREFERENCE_WEIGHT
 
 
+# Вес перерасхода бюджета в общей невязке.
+#
+# Ниже калорий (3.0) и белка (2.0) намеренно и по той же причине, что
+# у предпочтений: уложиться в деньги ценой провала по белку — это не
+# исполнение просьбы, а её извращение. Человек, попросивший 500 ₽ в день,
+# не просил рацион из макарон.
+#
+# Значение подобрано замером, см. EVOLUTION.md.
+BUDGET_WEIGHT = 2.2
+
+
+def _budget_penalty(items: list[MealItem], budget: float | None,
+                    costs: dict[int, float]) -> float:
+    """Штраф за выход за дневной бюджет.
+
+    Это ОГРАНИЧЕНИЕ, а не минимизация: пока план укладывается в сумму,
+    штраф ровно ноль, и солверу незачем экономить дальше.
+
+    Разница принципиальная. Минимизация цены схлопнула бы неделю
+    в одно и то же самое дешёвое блюдо — а дешевле всего повторять.
+    Ограничение же не трогает ничего, пока просьба выполняется.
+
+    Ноль и при отсутствии бюджета: планы тех, кто про деньги не говорил,
+    обязаны остаться прежними до последнего грамма.
+    """
+    if not budget or budget <= 0 or not items:
+        return 0.0
+
+    # Неопознанное блюдо берём по медиане, а НЕ за ноль: иначе солвер
+    # набивает день тем, чему не нашлось цены. См. fallback_cost_per_gram.
+    default = fallback_cost_per_gram()
+    total = sum(costs.get(item.fdc_id, default) * item.grams for item in items)
+    if total <= budget:
+        return 0.0
+
+    return (total - budget) / budget * BUDGET_WEIGHT
+
+
+def day_cost(items: list[MealItem], costs: dict[int, float] | None = None) -> float:
+    """Во что обходится день. Ноль там, где цену узнать не удалось."""
+    costs = costs if costs is not None else cost_per_gram()
+    default = fallback_cost_per_gram()
+    return sum(costs.get(item.fdc_id, default) * item.grams for item in items)
+
+
 def _loss(totals: dict[str, float], targets: dict[str, float]) -> float:
     """Насколько план не попал в норму. Меньше — лучше, ноль — идеально.
 
@@ -574,16 +639,20 @@ def _local_search(
     sample_size: int = 40,
     tolerance: float = SLOT_TOLERANCE,
     preferred: set[int] | None = None,
+    budget: float | None = None,
+    costs: dict[int, float] | None = None,
 ) -> list[MealItem]:
     """Улучшать план по одной замене, пока невязка падает."""
     target_kcal = targets.get("kcal", 0.0)
     preferred = preferred or set()
+    costs = costs if costs is not None else {}
 
     best = list(items)
     best_totals = _totals(best)
     best_loss = (_loss(best_totals, targets)
                  + _slot_penalty(best, template, target_kcal)
-                 + _preference_penalty(best, preferred))
+                 + _preference_penalty(best, preferred)
+                 + _budget_penalty(best, budget, costs))
     best_feasible = _is_feasible(best_totals)
 
     for _ in range(iterations):
@@ -630,6 +699,7 @@ def _local_search(
                     _loss(trial_totals, targets)
                     + _slot_penalty(trial, template, target_kcal)
                     + _preference_penalty(trial, preferred)
+                    + _budget_penalty(trial, budget, costs)
                 )
                 trial_feasible = _is_feasible(trial_totals)
 
@@ -673,6 +743,7 @@ def _build_day_once(
     template: list[tuple[str, str, float]] | None = None,
     tolerance: float = SLOT_TOLERANCE,
     include: list[str] | None = None,
+    budget: float | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -696,6 +767,11 @@ def _build_day_once(
     # Так безопаснее — нарушенное ограничение может быть аллергией,
     # а несработавшее предпочтение всего лишь огорчает.
     preferred = preferred_ids(usable, include)
+
+    # Карта цен строится один раз на день и передаётся в локальный поиск:
+    # он обращается к ней на каждой из сотен проб. Сама она кэширована
+    # глобально, так что второй день берёт её даром.
+    costs = cost_per_gram() if budget else {}
 
     # Проверяем не только наличие роли, но и запас по количеству: в шаблоне
     # роль «main» встречается дважды, а блюда в дне не повторяются, поэтому
@@ -733,7 +809,8 @@ def _build_day_once(
 
     # 2. Локальный поиск.
     items = _local_search(items, template, candidates, target_values, rng,
-                          iterations, tolerance=tolerance, preferred=preferred)
+                          iterations, tolerance=tolerance, preferred=preferred,
+                          budget=budget, costs=costs)
 
     totals = _totals(items)
     deviation = {
@@ -747,9 +824,11 @@ def _build_day_once(
         totals={name: round(value, 1) for name, value in totals.items()},
         targets=target_values,
         deviation=deviation,
+        budget=budget,
         loss=round(_loss(totals, target_values)
                    + _slot_penalty(items, template, targets.kcal)
-                   + _preference_penalty(items, preferred), 4),
+                   + _preference_penalty(items, preferred)
+                   + _budget_penalty(items, budget, costs), 4),
     )
 
 
@@ -762,6 +841,7 @@ def build_day(
     allow_exotic: bool = False,
     template: list[tuple[str, str, float]] | None = None,
     include: list[str] | None = None,
+    budget: float | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -781,19 +861,73 @@ def build_day(
         allow_exotic: разрешить дичь и субпродукты (по умолчанию нет).
     """
     plan = _build_day_once(catalog, targets, exclude, seed, iterations,
-                           allow_exotic, template, SLOT_TOLERANCE, include)
+                           allow_exotic, template, SLOT_TOLERANCE, include, budget)
 
     if check_plan(plan)["kcal_in_range"]:
-        return plan
+        # Через эту ветку тоже надо проверить бюджет против нормы: калории
+        # могут сойтись, а белок — нет. Ранний выход однажды уже пропустил
+        # такой день мимо проверки (seed 4: 2023 ккал в допуске, белок
+        # 92 г против 112 — и план уехал человеку).
+        return _nutrition_wins_over_budget(plan, catalog, targets, exclude, seed,
+                                           iterations, allow_exotic, template, include)
 
     relaxed = _build_day_once(catalog, targets, exclude, seed, iterations,
-                              allow_exotic, template, SLOT_TOLERANCE_RELAXED, include)
+                              allow_exotic, template, SLOT_TOLERANCE_RELAXED,
+                              include, budget)
 
     # Возвращаем ослабленный только если он и правда лучше: иначе человек
     # получил бы менее сбалансированный день без выигрыша по калориям.
     strict_gap = abs(plan.totals["kcal"] - targets.kcal)
     relaxed_gap = abs(relaxed.totals["kcal"] - targets.kcal)
-    return relaxed if relaxed_gap < strict_gap else plan
+    best = relaxed if relaxed_gap < strict_gap else plan
+
+    return _nutrition_wins_over_budget(best, catalog, targets, exclude, seed,
+                                       iterations, allow_exotic, template, include)
+
+
+def _nutrition_wins_over_budget(
+    plan: DayPlan,
+    catalog: pd.DataFrame,
+    targets: Targets,
+    exclude: Sequence[str] | None,
+    seed: int,
+    iterations: int,
+    allow_exotic: bool,
+    template: list[tuple[str, str, float]] | None,
+    include: list[str] | None,
+) -> DayPlan:
+    """Если ради бюджета сломалась норма — вернуть план без бюджета.
+
+    Наблюдавшийся случай, и он опасный. На норме 3755 ккал с бюджетом
+    60 ₽ в день солвер честно уложился в деньги и выдал план, проваливший
+    проверки И по калориям, И по белку. Формально просьба выполнена,
+    по существу человек получил недоедание.
+
+    Деньги — это пожелание, норма — то, ради чего он пришёл. Поэтому
+    при конфликте побеждает норма, а про невыполненный бюджет человеку
+    говорится прямо (``_budget_note`` в agent.py).
+
+    Тот же приём, что этажом выше у SLOT_TOLERANCE: сначала строгий
+    вариант, при неудаче — откат, и возвращается лучший из двух.
+    """
+    if not plan.budget:
+        return plan
+
+    checks = check_plan(plan)
+    if checks["kcal_in_range"] and checks["protein_g_in_range"]:
+        return plan
+
+    # Тот же день без денежного ограничения.
+    unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
+                                allow_exotic, template, SLOT_TOLERANCE, include, None)
+    if not check_plan(unlimited)["kcal_in_range"]:
+        unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
+                                    allow_exotic, template, SLOT_TOLERANCE_RELAXED,
+                                    include, None)
+
+    # Бюджет сохраняем в плане: он не выполнен, но назван — и агент
+    # обязан сказать об этом, а не промолчать.
+    return unlimited.model_copy(update={"budget": plan.budget})
 
 
 # ────────────────────────────────────────────────────────────
@@ -861,6 +995,7 @@ def build_menu(
     iterations: int | None = None,
     variety_window: int = 2,
     include: list[str] | None = None,
+    budget: float | None = None,
 ) -> Menu:
     """Собрать меню на несколько дней.
 
@@ -927,6 +1062,7 @@ def build_menu(
                 seed=seed + day_number,
                 iterations=iterations if iterations is not None else 300,
                 include=include,
+                budget=budget,
             )
         except PlanNotFeasible:
             # Окно разнообразия сузило каталог слишком сильно — собираем день
@@ -938,6 +1074,7 @@ def build_menu(
                 seed=seed + day_number,
                 iterations=iterations if iterations is not None else 300,
                 include=include,
+                budget=budget,
             )
 
         plans.append(plan)

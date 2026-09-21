@@ -737,6 +737,90 @@ def _resolve_preferences(profile: Profile) -> list[str]:
     return kept
 
 
+# Во сколько дней пересчитывать сумму, названную за период.
+#
+# Месяц здесь 30 дней, а не 30.44: человек, говорящий «20 тысяч в месяц»,
+# имеет в виду круглое число, и точность календаря тут ложная.
+_BUDGET_PERIODS: list[tuple[str, float]] = [
+    (r"в\s*день|в\s*сутки|ежедневн|/\s*день|в\s*дн", 1.0),
+    (r"в\s*недел|за\s*недел|/\s*недел|еженедельн", 7.0),
+    (r"в\s*месяц|за\s*месяц|/\s*месяц|ежемесячн", 30.0),
+]
+
+# Число с пробелами-разделителями («15 000») и необязательным «тысяч».
+_BUDGET_AMOUNT = re.compile(
+    r"(\d[\d\s  ]*(?:[.,]\d+)?)\s*(тыс\.?|тысяч[аи]?)?\s*"
+    r"(?:руб\w*|₽|р\.)?",
+    re.IGNORECASE,
+)
+
+# Признаки того, что речь вообще о деньгах. Без них «500 в день» можно
+# принять за калории или граммы.
+_BUDGET_TRIGGER = re.compile(
+    r"руб|₽|деньг|бюджет|потрат|тратить|уложит|стоим|цен[аеу]|дорог|дешёв|дешев",
+    re.IGNORECASE,
+)
+
+
+def _budget_from_text(text: str) -> float | None:
+    """Дневной бюджет из реплики: «20 тысяч в месяц» → 666.7 ₽ в день.
+
+    Разбор детерминированный, а не моделью, и причина та же, что
+    у ``_activity_from_text``: здесь нужен ПЕРЕСЧЁТ, а на арифметике
+    модель врёт молча. «15 000 в месяц» она возвращала то как 15000,
+    то как 500 — и оба раза уверенно.
+
+    Требуется признак денег («рублей», «бюджет», «потратить»): голое
+    «500 в день» — это с тем же успехом калории.
+
+    Возвращает сумму НА ДЕНЬ. Пересчёт делается ровно здесь и один раз,
+    дальше по коду ходит только дневная величина.
+    """
+    if not _BUDGET_TRIGGER.search(text):
+        return None
+
+    lowered = text.lower()
+
+    # Ищем период: он задаёт делитель. Без периода считаем, что назван
+    # день — «готов тратить 600 рублей» почти всегда про день.
+    per_days = 1.0
+    period_at = len(lowered)
+    for pattern, days in _BUDGET_PERIODS:
+        found = re.search(pattern, lowered)
+        if found and found.start() < period_at:
+            per_days, period_at = days, found.start()
+
+    # Из всех чисел берём то, что стоит ближе всего ПЕРЕД периодом:
+    # в «рацион на 7 дней, бюджет 5000 в неделю» чисел два.
+    best: float | None = None
+    for match in _BUDGET_AMOUNT.finditer(lowered):
+        raw = match.group(1).strip()
+        if not raw or not raw[0].isdigit():
+            continue
+        digits = re.sub(r"[\s  ]", "", raw).replace(",", ".")
+        try:
+            amount = float(digits)
+        except ValueError:
+            continue
+        if match.group(2):  # «тысяч»
+            amount *= 1000
+        if match.start() <= period_at:
+            best = amount
+
+    if best is None or best <= 0:
+        return None
+
+    per_day = best / per_days
+
+    # Отсев бессмыслицы: меньше полусотни рублей в день не бывает даже
+    # на хлебе, больше двадцати тысяч — это уже не про продукты.
+    # Такие числа обычно означают, что разбор зацепил чужую цифру.
+    if not 50 <= per_day <= 20_000:
+        return None
+
+    return round(per_day, 2)
+
+
 def _days_from_text(text: str) -> int | None:
     """На сколько дней просят меню — разбором фразы, а не моделью.
 
@@ -1058,6 +1142,13 @@ class NutritionAgent:
         if activity:
             extracted["activity"] = activity
 
+        # Бюджет модели не доверяем вовсе: тут нужен ПЕРЕСЧЁТ периода,
+        # а на арифметике она врёт молча — «15 000 в месяц» возвращались
+        # то как 15000, то как 500, и оба раза уверенно.
+        budget = _budget_from_text(state["question"])
+        if budget:
+            extracted["budget_rub_per_day"] = budget
+
         # Модель возвращает только явно названное, поэтому просто накладываем
         # новое поверх старого.
         for field, value in extracted.items():
@@ -1148,6 +1239,7 @@ class NutritionAgent:
                 days=days,
                 exclude=profile.exclude,
                 include=_resolve_preferences(profile),
+                budget=profile.budget_rub_per_day,
                 seed=self.seed,
             )
         except PlanNotFeasible as error:
@@ -1226,6 +1318,12 @@ class NutritionAgent:
 
         text = answer.strip()
 
+        # Бюджет — раньше общей стоимости: человек спрашивал «уложился ли»,
+        # а не «сколько вышло». Сумма идёт следом как обоснование.
+        budget = self._budget_note(plan, days)
+        if budget:
+            text += "\n\n" + budget
+
         cost = self._cost_note(state.get("menu") or plan)
         if cost:
             text += cost
@@ -1242,6 +1340,45 @@ class NutritionAgent:
             text += offer
 
         return {"answer": text, "chunks": chunks, "search_query": query}
+
+    @staticmethod
+    def _budget_note(plan: DayPlan, days: int) -> str:
+        """Уложились ли в названный бюджет — прямым текстом.
+
+        Молчать нельзя. Человек назвал сумму, и если рацион в неё не влез,
+        он обязан узнать это от агента, а не сложив цены сам. Это ровно
+        тот класс тихих отказов, который в проекте запрещён.
+
+        Перерасход называется в рублях и в процентах: «на 40 ₽» и «на 16%»
+        отвечают на разные вопросы, а вместе показывают, стоит ли вообще
+        что-то менять.
+        """
+        budget = plan.budget
+        if not budget:
+            return ""
+
+        if plan.within_budget:
+            left = budget - plan.cost
+            text = f"В ваш бюджет уложился: {plan.cost:.0f} ₽ из {budget:.0f} ₽ в день"
+            if left >= budget * 0.1:
+                text += f" — остаётся ещё около {left:.0f} ₽"
+            return text + "."
+
+        over = plan.cost - budget
+        text = (f"⚠️ В бюджет уложиться не удалось: {plan.cost:.0f} ₽ в день "
+                f"против ваших {budget:.0f} ₽ — перерасход {over:.0f} ₽ "
+                f"({over / budget:.0%}).")
+
+        # Называем причину, а не только факт: при такой норме дешевле
+        # уже не собрать из того, что есть в справочнике.
+        text += (" Это минимум, который получился при вашей норме калорий "
+                 "и ограничениях. Снизить можно, если убрать ограничения "
+                 "или пересмотреть цель по весу.")
+
+        if days > 1:
+            text += f" За {days} {day_word(days)} выйдет около {plan.cost * days:.0f} ₽."
+
+        return text
 
     def _cost_note(self, menu_or_plan: Any) -> str:
         """Во что примерно обойдётся рацион.

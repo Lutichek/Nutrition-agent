@@ -167,8 +167,20 @@ class Profile(BaseModel):
     # в пользу первого нельзя.
     #
     # При конфликте (просит молоко и исключает лактозу) побеждает
-    # exclude — см. _preferred_ids в solver.py.
+    # exclude — см. preferred_ids в solver.py.
     include: list[str] = Field(default_factory=list)
+
+    # Сколько человек готов тратить на еду в ДЕНЬ, рубли.
+    #
+    # Хранится всегда в дневном виде, даже если сказали «15 000 в месяц»:
+    # солвер собирает день, и пересчёт должен случиться один раз при
+    # разборе реплики, а не расползтись по коду. Разбор — в
+    # ``_budget_from_text`` в agent.py.
+    #
+    # Это ОГРАНИЧЕНИЕ, а не цель: пока план укладывается, солвер про
+    # деньги не думает вовсе. Минимизировать цену нельзя — дешевле всего
+    # каждый день одно и то же.
+    budget_rub_per_day: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_rate_matches_goal(self) -> Profile:

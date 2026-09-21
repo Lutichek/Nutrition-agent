@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 # Источник и дата. Обновляются ВМЕСТЕ с таблицей — цена без даты
 # через полгода вводит в заблуждение сильнее, чем её отсутствие.
@@ -232,6 +233,23 @@ PRICES: dict[str, Price] = {
     # мяса, а паста с соусом — 592 ₽ за порцию вместо 60. Ориентир —
     # кетчуп из источника (305 ₽/кг) и майонез (324).
     "соус": Price(320.0, derived=True),
+    # ── позиции, найденные оптимизатором бюджета ─────────────
+    # Все три лежали в чужих категориях и оказались СИЛЬНО дешевле правды.
+    # Пока цена была отчётом, ошибка гасилась соседями; как только солвер
+    # начал искать дешёвое, он пошёл ровно за этими блюдами.
+    #
+    # Киноа считалась пшеном — 20 ₽/кг готовой вместо примерно ста
+    # пятидесяти. Это премиальная крупа, а не просо.
+    "киноа": Price(450.0, 3.0, derived=True),
+    # Кускус и булгур — тоже не просо, хотя и не киноа.
+    "кускус и булгур": Price(180.0, 3.0, derived=True),
+    # Утка считалась курицей (232 ₽/кг). В магазине она втрое дороже,
+    # и именно её солвер ставил в дешёвый рацион как источник белка.
+    "утка": Price(700.0, 0.70, derived=True),
+    # Тофу и соевые продукты считались сухим горохом (46 ₽/кг): солвер
+    # с бюджетом ставил полкило тофу в день как дешёвый белок. Готовый
+    # тофу в рознице — около трёхсот пятидесяти.
+    "тофу": Price(350.0, derived=True),
 }
 
 
@@ -305,7 +323,8 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("рыба солёная и копчёная", r"smoked fish|lox\b|salted fish"),
     ("рыбное филе", r"fillet|flounder|cod\b|haddock|halibut|tilapia|pollock|perch|bass\b"),
     ("рыба мороженая", r"\bfish\b|tuna|sardine|anchov|mackerel|seafood|shellfish|"
-                       r"clam|oyster|mussel|scallop|crab|lobster|abalone"),
+                       r"clam|oyster|mussel|scallop|crab|lobster|abalone|"
+                       r"crayfish|crawfish|snail|escargot|eel\b|catfish|carp\b"),
     # Мясо и птица.
     ("колбаса варёная", r"bologna|luncheon meat|salami|pepperoni"),
     ("сосиски", r"frankfurter|hot dog|sausage|bratwurst"),
@@ -314,7 +333,8 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("фарш", r"ground beef|ground pork|ground turkey|ground meat|meatball|meatloaf|burger|patty"),
     ("индейка", r"turkey"),
     ("куриные окорочка", r"drumstick|chicken thigh|chicken leg"),
-    ("курица", r"chicken|poultry|cornish|duck\b|goose"),
+    ("утка", r"duck\b|goose|quail"),
+    ("курица", r"chicken|poultry|cornish"),
     ("говядина", r"beef|steak|veal|brisket"),
     ("свинина", r"pork|chop\b"),
     ("баранина", r"lamb|mutton|goat|venison|deer\b|rabbit|game\b|elk\b|bison"),
@@ -337,11 +357,16 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("торты", r"cake|pie\b|pastry|doughnut|donut|brownie|muffin|croissant|danish"),
     ("какао", r"cocoa"),
     # Крупы, хлеб, макароны.
+    # Батончик мюсли — раньше овсянки: иначе слово granola уводит его
+    # в кашу вместе с её множителем воды.
+    ("батончики", r"granola bar|cereal bar|energy bar"),
     ("овсяные хлопья", r"oatmeal|oats|granola"),
     ("злаковые хлопья", r"cereal|cornflake|muesli"),
     ("рис", r"\brice\b|risotto|pilaf"),
     ("гречка", r"buckwheat|kasha"),
-    ("пшено", r"millet|quinoa|bulgur|barley|couscous"),
+    ("киноа", r"quinoa|amaranth|teff\b"),
+    ("кускус и булгур", r"couscous|bulgur|freekeh"),
+    ("пшено", r"millet|barley|\bgrits\b"),
     ("манная крупа", r"semolina|cream of wheat|farina"),
     ("макароны", r"pasta|macaroni|spaghetti|lasagna|penne|ravioli|noodle|tortellini|"
                  r"gnocchi|fettuccine|linguine|rigatoni|ziti\b|orzo|vermicelli"),
@@ -367,7 +392,11 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("лимоны", r"lemon|lime\b"),
     ("груши", r"pear\b"),
     ("виноград", r"grape\b|grapes\b"),
-    ("горох и фасоль", r"bean|lentil|\bpea\b|\bpeas\b|chickpea|hummus|legume|soy|tofu"),
+    # Соя и тофу — раньше бобовых: сухой горох втрое дешевле готового тофу,
+    # и на этой разнице бюджетный солвер строил рацион из полкило тофу.
+    ("тофу", r"tofu|soybean curd|soy nuts|soy cheese|tempeh|edamame|"
+             r"meat-?alternative|veggie burger"),
+    ("горох и фасоль", r"bean|lentil|\bpea\b|\bpeas\b|chickpea|hummus|legume|soy"),
     ("замороженные овощи", r"broccoli|cauliflower|asparagus|zucchini|squash|eggplant|"
                            r"pepper|celery|corn\b|okra|artichoke|avocado|vegetable"),
     ("консервированные овощи", r"canned vegetable|olives?\b"),
@@ -406,7 +435,19 @@ PRICE_RULES: list[tuple[str, str]] = [
                       r"mango|papaya|pineapple|kiwi|clementine|pomegranate|fig\b|persimmon"),
     ("замороженные овощи", r"vegetable|greens\b"),
     ("хлеб", r"crepe|turnover|empanada|quesadilla|chimichanga|chilaquiles|enchilada|"
-             r"tamale|arepa|pancake|waffle|biscuit"),
+             r"tamale|arepa|pancake|waffle|biscuit|\brolls?\b"),
+    # Пробелы, найденные уже на ингредиентах: на блюдах этих слов не было.
+    #
+    # Кукурузная мука — самый массовый из них, и молчала она дорого:
+    # «Cornmeal mush» состоит из неё и воды, и без правила блюдо выходило
+    # по цене воды, то есть практически бесплатным.
+    ("мука", r"cornmeal|corn flour|masa\b"),
+    ("замороженные овощи", r"mirepoix|cassava|taro\b|nopales|plantain|yuca\b|jicama"),
+    ("зелень", r"watercress|endive|radicchio|sprouts?\b"),
+    ("сахар", r"frosting|icing|glaze\b|jell(?:y|ies)\b"),
+    ("растительное масло", r"table fat|\bfat, NFS\b"),
+    ("мороженое", r"frozen novelt|popsicle|\bice pop\b|milkshake|\bshake,"),
+    ("газированные напитки", r"root beer|ginger ale|carbonated"),
 ]
 
 # Хвосты-исключения в названиях USDA: «..., excludes macaroni and cheese».
@@ -415,7 +456,17 @@ PRICE_RULES: list[tuple[str, str]] = [
 _EXCLUSION_TAIL = re.compile(r",\s*(excludes|excluding|not)\b.*$", re.IGNORECASE)
 
 # Признаки того, что блюдо НЕ готовили, и множитель веса применять нельзя.
-_RAW = re.compile(r"\b(raw|uncooked|dry|dried|fresh)\b", re.IGNORECASE)
+#
+# «bar» здесь не случайно и не для красоты: батончик мюсли попадал
+# в «овсяные хлопья» с множителем 4.5 — тем, что задан для каши на воде, —
+# и стоил 30 ₽/кг вместо примерно семисот. Сухой продукт воды не набирает.
+# Слову «barley» это не мешает: граница слова не даёт совпасть.
+_RAW = re.compile(r"\b(raw|uncooked|dry|dried|fresh|bars?|crisps?)\b", re.IGNORECASE)
+
+# Ниже этой цены продукт считается почти бесплатным. Сюда попадает только
+# водопроводная вода. Такие ингредиенты дают свою стоимость, но не дают
+# права достраивать по себе остальное — см. cost_by_composition.
+NEAR_FREE_RUB_PER_KG = 1.0
 
 _COMPILED_PRIORITY: list[tuple[str, re.Pattern[str]]] = [
     (key, re.compile(pattern, re.IGNORECASE)) for key, pattern in PRIORITY_RULES
@@ -425,8 +476,14 @@ _COMPILED: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+@lru_cache(maxsize=8192)
 def _match(text: str) -> str | None:
-    """Ценовая категория для одной строки описания."""
+    """Ценовая категория для одной строки описания.
+
+    Кэшируется: функция чистая, а зовут её в цикле подбора рациона —
+    там одни и те же две тысячи названий прогоняются тысячи раз.
+    Без кэша каждое обращение прогоняет под сотню регулярок.
+    """
     cleaned = _EXCLUSION_TAIL.sub("", text)
 
     for key, pattern in _COMPILED_PRIORITY:
@@ -507,24 +564,102 @@ def cost_by_composition(grams: float, ingredients) -> tuple[float | None, float]
     if not ingredients:
         return None, 0.0
 
-    total = 0.0
-    priced_share = 0.0
+    # Почти-бесплатное считаем отдельно от остального, и это не педантизм.
+    #
+    # Наблюдавшийся случай: «Cornmeal mush» — 85% воды из-под крана и 13%
+    # кукурузной муки, которая правилами не опознавалась. Вода попадала
+    # в «известную» долю, та выходила 85%, и цена воды растягивалась
+    # на всё блюдо: 0.04 ₽/кг вместо примерно 8. Формула делала вид,
+    # что знает цену, зная только то, что блюдо мокрое.
+    #
+    # Поэтому вода даёт свою стоимость, но НЕ даёт права достраивать
+    # остальное: экстраполировать можно лишь по настоящей еде.
+    free_cost = free_share = 0.0
+    paid_cost = paid_share = 0.0
 
     for item in ingredients:
         part = cost_of(item.share * grams, item.name)
         if part is None:
             continue
-        total += part
-        priced_share += item.share
+        key = price_key_for(item.name)
+        if key is not None and PRICES[key].rub_per_kg < NEAR_FREE_RUB_PER_KG:
+            free_cost += part
+            free_share += item.share
+        else:
+            paid_cost += part
+            paid_share += item.share
 
-    # Ниже половины состава экстраполировать нельзя: растягивать цену
-    # известной трети на всё блюдо — это уже не оценка, а домысел.
-    # Лучше честное «не знаю» и откат к расчёту по названию.
-    if priced_share < 0.5:
-        return None, priced_share
+    # Настоящей еды в блюде столько:
+    food_share = 1.0 - free_share
 
-    # Досчитываем по опознанной части: если пятая часть состава без цены,
-    # честнее растянуть известную стоимость на весь вес, чем молча отдать
-    # сумму за четыре пятых блюда. Допущение здесь одно и названное:
-    # неопознанное стоит столько же за грамм, сколько опознанное.
-    return total / priced_share, priced_share
+    # Блюдо целиком из почти-бесплатного (вода из-под крана) — цена
+    # известна ТОЧНО, достраивать нечего. Отдельная ветка нужна потому,
+    # что общая формула делит на долю еды, а её здесь ноль.
+    if food_share <= 0:
+        return free_cost, free_share
+
+    if paid_share <= 0:
+        return None, paid_share
+
+    # Опознать надо больше половины НЕ-воды. Растягивать цену известной
+    # трети на всё блюдо — это уже не оценка, а домысел; лучше честное
+    # «не знаю» и откат к расчёту по названию.
+    if paid_share < 0.5 * food_share:
+        return None, paid_share
+
+    # Неопознанная еда достраивается по цене опознанной. Допущение здесь
+    # одно и названное: неизвестный продукт стоит столько же за грамм,
+    # сколько известные в том же блюде.
+    estimate = free_cost + paid_cost * food_share / paid_share
+    return estimate, free_share + paid_share
+
+
+@lru_cache(maxsize=1)
+def cost_per_gram() -> dict[int, float]:
+    """Цена грамма каждого блюда справочника: fdc_id → рубли за грамм.
+
+    Нужна солверу: тот зовёт цену внутри цикла подбора, и считать её там
+    заново нельзя — на каждое блюдо приходится разбор рецептуры.
+
+    Строится по составу и только по нему. Каталог сюда не передаётся
+    намеренно: рецептуры покрывают его целиком, а лишний аргумент
+    сделал бы кэш бессмысленным.
+
+    Импорт ``ingredients`` внутри функции, а не наверху: модуль цен
+    обязан оставаться самостоятельным, иначе два модуля замкнутся
+    друг на друга при первом же обратном обращении.
+    """
+    from ingredients import load_composition
+
+    result: dict[int, float] = {}
+    for fdc_id, items in load_composition().items():
+        cost, _ = cost_by_composition(1000.0, items)
+        if cost is not None:
+            result[fdc_id] = cost / 1000.0
+    return result
+
+
+@lru_cache(maxsize=1)
+def fallback_cost_per_gram() -> float:
+    """Чем считать блюдо, для которого цены нет.
+
+    Медиана по справочнику, и это НЕ произвол, а единственный безопасный
+    вариант для оптимизатора.
+
+    Наблюдавшийся случай: в подборе под бюджет неопознанное блюдо брали
+    как ``costs.get(fdc_id, 0.0)`` — то есть бесплатное. Солвер немедленно
+    нашёл «Раки, жареные» (цены нет, белка 24 г) и поставил 169 г за ноль
+    рублей. Отсутствие оценки превратилось в оценку, причём в самую
+    выгодную — ровно то, что в этом проекте запрещено правилом
+    «отсутствие оценки — не ноль».
+
+    Медиана не даёт неопознанному ни преимущества, ни штрафа: оптимизатору
+    незачет его искать и незачем избегать.
+    """
+    values = sorted(cost_per_gram().values())
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
