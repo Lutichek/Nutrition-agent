@@ -250,6 +250,14 @@ PRICES: dict[str, Price] = {
     # с бюджетом ставил полкило тофу в день как дешёвый белок. Готовый
     # тофу в рознице — около трёхсот пятидесяти.
     "тофу": Price(350.0, derived=True),
+    # Корнеплоды и прочие простые овощи: репа, брюква, кольраби, тыква,
+    # редис, фенхель. Дешевле помидоров (219) и дороже картофеля (38).
+    "прочие овощи": Price(90.0, derived=True),
+    # Водоросли — не овощ по цене: нори и вакаме продаются граммами.
+    "морская капуста": Price(700.0, derived=True),
+    # Изотоники и регидратационные растворы: дороже газировки, дешевле сока
+    # в пересчёте на литр.
+    "спортивные напитки": Price(200.0, derived=True),
 }
 
 
@@ -330,7 +338,11 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("сосиски", r"frankfurter|hot dog|sausage|bratwurst"),
     ("копчёности", r"bacon|\bham\b|prosciutto|pastrami"),
     ("мясные консервы", r"canned meat|spam\b"),
-    ("фарш", r"ground beef|ground pork|ground turkey|ground meat|meatball|meatloaf|burger|patty"),
+    # Оба порядка слов: в USDA встречается и «Ground beef», и «Beef, ground».
+    # Без второго варианта фарш считался целым куском — 766 ₽/кг вместо 527.
+    ("фарш", r"ground (?:beef|pork|turkey|chicken|meat|lamb)|"
+             r"(?:beef|pork|turkey|chicken|lamb),? ground|"
+             r"meatball|meatloaf|burger|patty|mince"),
     ("индейка", r"turkey"),
     ("куриные окорочка", r"drumstick|chicken thigh|chicken leg"),
     ("утка", r"duck\b|goose|quail"),
@@ -435,7 +447,42 @@ PRICE_RULES: list[tuple[str, str]] = [
                       r"mango|papaya|pineapple|kiwi|clementine|pomegranate|fig\b|persimmon"),
     ("замороженные овощи", r"vegetable|greens\b"),
     ("хлеб", r"crepe|turnover|empanada|quesadilla|chimichanga|chilaquiles|enchilada|"
-             r"tamale|arepa|pancake|waffle|biscuit|\brolls?\b"),
+             r"tamale|arepa|pancake|waffle|biscuit|\brolls?\b|crouton|dosa\b|congee"),
+    # Последний рубеж: то, что не опознали правила выше.
+    #
+    # ⚠️ Почти все эти шаблоны — с «s?» на конце, и это не педантизм.
+    # Прежние писались в единственном числе («fig\b», «plum\b»), а в USDA
+    # продукты названы во множественном («Figs, raw», «Plums, raw»), и
+    # граница слова после «m» с «ms» не совпадает. Из-за одной буквы
+    # семьдесят семь блюд остались без цены и выпадали из подбора.
+    ("морская капуста", r"seaweed|\bkelp\b|\bnori\b|wakame|laver\b|\bkombu\b"),
+    ("спортивные напитки", r"gatorade|pedialyte|electrolyte|sports drink|"
+                           r"fluid replacement|malt beverage"),
+    ("батончики", r"clif bar|zone perfect|formulated bar|power bar"),
+    ("сухофрукты", r"dates?\b|currants?\b|tamarinds?\b|\bprunes?\b"),
+    ("прочие фрукты", r"figs?\b|plums?\b|guavas?\b|lychees?\b|starfruits?\b"),
+    ("прочие овощи", r"turnips?\b|rutabagas?\b|kohlrabi|fennel|pumpkins?\b|"
+                     r"radish|burdock|bamboo shoots?|salsify|parsnips?\b|"
+                     r"leeks?\b|chayote|\bcress\b"),
+    ("снеки", r"chewing gum|\bgum\b"),
+    # Те же множественные числа в оставшихся фруктах и овощах.
+    ("лимоны", r"limes?\b"),
+    ("груши", r"pears?\b"),
+    ("прочие фрукты", r"kumquats?\b|litchis?\b|lychees?\b|rhubarb|persimmons?\b"),
+    ("прочие овощи", r"hearts? of palm|snowpeas?\b|snow peas?\b|hominy|okra"),
+    # Дичь и птица, которой нет в прайсе Росстата: считаем по утке —
+    # ближайшая по цене строка, и это честнее, чем курица.
+    ("утка", r"dove\b|squab|pheasant|ostrich|partridge|grouse"),
+    ("рыбное филе", r"frog legs?"),
+    ("колбаса варёная", r"kielbasa|kolbasa|chorizo"),
+    ("торты", r"scone|hush pupp"),
+    ("хлеб", r"papad|gordita|sope shell|\bnaan\b|\broti\b|chapati"),
+    ("макароны", r"ramen"),
+    ("овсяные хлопья", r"oat bran"),
+    ("сгущённое молоко", r"dulce de leche"),
+    ("батончики", r"\bensure\b|nutritional supplement|balance,? original|clif"),
+    ("сок", r"tropical punch|sour mix|fruit punch"),
+    ("тофу", r"meatless|vegetarian"),
     # Пробелы, найденные уже на ингредиентах: на блюдах этих слов не было.
     #
     # Кукурузная мука — самый массовый из них, и молчала она дорого:

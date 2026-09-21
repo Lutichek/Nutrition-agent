@@ -97,6 +97,42 @@ class TestNutritionAlwaysWins:
         assert plan.within_budget is False
 
 
+class TestUnpricedDishesNeverReachThePlan:
+    """Блюдо без цены в план не идёт — иначе сумма занижена молча.
+
+    Человек видит «около 400 ₽» и не знает, что часть корзины в эту сумму
+    не вошла. Подставлять медиану мало: она честна в среднем и произвольна
+    в конкретном дне.
+    """
+
+    def test_every_generated_dish_has_a_price(self, catalog, targets) -> None:
+        priced = cost_per_gram()
+        for seed in range(4):
+            menu = build_menu(catalog, targets, days=7, seed=seed)
+            unpriced = [item.name for day in menu.days for item in day.items
+                        if item.fdc_id not in priced]
+            assert not unpriced, f"seed {seed}: без цены {unpriced[:3]}"
+
+    def test_basket_is_fully_priced(self, catalog, targets) -> None:
+        """Покрытие корзины обязано быть полным, а не «почти полным»."""
+        from shopping import build_shopping_list
+
+        for seed in range(3):
+            menu = build_menu(catalog, targets, days=7, seed=seed)
+            assert build_shopping_list(menu, catalog).priced_share == pytest.approx(1.0)
+
+    def test_the_gap_stays_small(self, catalog) -> None:
+        """Отсев не должен разъедать каталог.
+
+        Закрытие ценовых дыр свело непокрытое с 77 блюд до четырёх, и
+        регрессия качества на тяжёлом профиле исчезла ровно тогда же.
+        Порог сторожит обратное сползание: если непокрытых снова станет
+        много, подбор начнёт беднеть молча.
+        """
+        unpriced = len(catalog) - len(cost_per_gram())
+        assert unpriced <= 30, f"без цены {unpriced} блюд — отсев обедняет каталог"
+
+
 class TestUnpricedIsNotFree:
     """Отсутствие цены — не ноль. Главное правило измерительного слоя."""
 
