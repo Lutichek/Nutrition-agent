@@ -305,7 +305,8 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   "rate_kg_per_week": число,
   "days": на сколько дней просят меню (1, 7, 30 и т.п.),
   "exclude": ["английские названия продуктов, которые человек НЕ ест"],
-  "include": ["английские названия продуктов, которые человек ХОЧЕТ видеть"]}}
+  "include": ["английские названия продуктов, которые человек ХОЧЕТ видеть"],
+  "include_ru": {{"слово из include": "оно же по-русски"}}}}
 
 Правила:
 - НЕ придумывай значения. Не названо — не включай поле.
@@ -344,6 +345,9 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   хочет видеть в рационе. Те же английские слова и те же категории.
   «Люблю гречку и творог» → ["buckwheat","cottage cheese"].
   «Хочу побольше овощей» → ["vegetables"].
+  include_ru — словарь: ключ — слово из include, значение — тот же продукт
+  по-русски в именительном падеже: «хочу гречку и свёклу» →
+  include ["buckwheat","beet"], include_ru {{"buckwheat":"гречка","beet":"свёкла"}}.
   Не путай знак: «без грибов» это exclude, «хочу грибы» это include.
   Оборот «ем всё, кроме рыбы» — это exclude ["fish"], а НЕ include.
   Просьба «добавь больше белка» — это НЕ include: речь о нутриенте,
@@ -735,6 +739,32 @@ def _resolve_preferences(profile: Profile) -> list[str]:
         kept.append(term)
 
     return kept
+
+
+def _with_russian_fallback(terms: list[str], profile: Profile, catalog: Any) -> list[str]:
+    """Заменить английское пожелание русским, если английское не нашло ничего.
+
+    Модель переводит пожелание словом, которого в USDA нет: «semolina»
+    вместо «farina», «millet porridge» вместо «millet». Блюдо в каталоге
+    есть, а человек слышит «не нашлось». Русские названия есть у всех
+    блюд, и на наборе из 48 пожеланий запасной путь закрыл все такие
+    промахи (132/132 против 124/132 без него), не дав ни одного ложного
+    совпадения там, где продукта в каталоге нет.
+
+    Только ЗАПАСНОЙ путь: поиск по основе русского слова шире английского,
+    и там, где английское слово сработало, ему и верим.
+
+    Работает на уже разрешённых пожеланиях: снятое ограничением слово сюда
+    не доходит, и его русская пара не воскрешает его.
+    """
+    result: list[str] = []
+    for term in terms:
+        russian = profile.include_ru.get(term)
+        if russian and not preferred_ids(catalog, [term]):
+            result.append(russian)
+        else:
+            result.append(term)
+    return result
 
 
 # Во сколько дней пересчитывать сумму, названную за период.
@@ -1149,6 +1179,14 @@ class NutritionAgent:
         if budget:
             extracted["budget_rub_per_day"] = budget
 
+        # Русские пары пожеланий — вспомогательное поле, и ронять из-за него
+        # весь расчёт нельзя: не словарь строк — просто отбрасываем.
+        pairs = extracted.pop("include_ru", None)
+        if isinstance(pairs, dict):
+            pairs = {str(k): v for k, v in pairs.items() if isinstance(v, str) and v.strip()}
+            if pairs:
+                extracted["include_ru"] = {**known.get("include_ru", {}), **pairs}
+
         # Модель возвращает только явно названное, поэтому просто накладываем
         # новое поверх старого.
         for field, value in extracted.items():
@@ -1238,7 +1276,8 @@ class NutritionAgent:
                 per_day,
                 days=days,
                 exclude=profile.exclude,
-                include=_resolve_preferences(profile),
+                include=_with_russian_fallback(
+                    _resolve_preferences(profile), profile, self.catalog),
                 budget=profile.budget_rub_per_day,
                 seed=self.seed,
             )
@@ -1431,8 +1470,11 @@ class NutritionAgent:
             if term not in allowed and term.strip().lower() not in _NUTRIENT_WORDS
         ]
 
+        # Не нашлось ни по-английски, ни запасным путём по-русски. Слово
+        # после запасного пути уже русское, если пара была, — так человеку
+        # и показываем: он просил «ряженку», а не «ryazhenka».
         missing = [
-            term for term in allowed
+            term for term in _with_russian_fallback(allowed, profile, self.catalog)
             if not preferred_ids(self.catalog, [term])
         ]
 

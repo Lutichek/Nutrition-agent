@@ -228,20 +228,95 @@ def to_pattern(terms: list[str] | None) -> str:
     число). Без этого «oil» находится внутри «broiled» и выбрасывает
     запечённую курицу, а «ham» — внутри «graham cracker».
 
+    Число слова не важно в обе стороны: модель пишет то «plums», то «plum»,
+    а USDA — «Plums, raw» и «Plum, canned». Прежний шаблон умел только
+    ДОПИСАТЬ окончание, и «cucumbers», «raspberry», «tomatoes» не находили
+    ничего — 9 промахов из 132 пожеланий, при том что блюда в каталоге есть.
+
+    Русское слово ищется по основе (см. ``_russian_forms``): оно приходит
+    запасным путём для пожеланий, у которых не нашлось английского слова.
+
     Пустая строка означает «ничего не исключаем».
     """
     words = expand(terms)
     if not words:
         return ""
 
+    alternatives = "|".join(_word_forms(word) for word in words)
+    return rf"\b(?:{alternatives})\b"
+
+
+_CYRILLIC = re.compile(r"[а-яё]")
+_PLAIN_ENGLISH = re.compile(r"[a-z]+(?:[ '-][a-z]+)*")
+_RUSSIAN_ENDING = re.compile(r"[аяоеиыуюйь]+$")
+
+
+def _word_forms(word: str) -> str:
+    """Выражение для одного слова: все формы числа, без границ слова."""
+    if _CYRILLIC.search(word):
+        return _russian_forms(word)
+
     # re.escape обязателен: слова приходят из ответа модели, а через неё —
     # от пользователя. Скобка или звёздочка в ограничении не должна
-    # уронить подбор рациона.
-    alternatives = "|".join(re.escape(word) for word in words)
-    return rf"\b(?:{alternatives})(?:s|es)?\b"
+    # уронить подбор рациона. Всё, что не похоже на обычное слово,
+    # ищется буквально, как и раньше.
+    if not _PLAIN_ENGLISH.fullmatch(word):
+        return re.escape(word) + "(?:s|es)?"
+
+    # Склоняется только последнее слово: «dried apricots» → «dried apricot».
+    head, _, last = word.rpartition(" ")
+    prefix = re.escape(head) + r"\s+" if head else ""
+    return prefix + _english_forms(last)
 
 
-def matches_words(names: pd.Series, pattern: str) -> pd.Series:
+def _english_forms(word: str) -> str:
+    """Единственное и множественное число английского слова.
+
+    «-ies» даёт и «-y», и «-ie»: berries → berry, но cookies → cookie.
+    """
+    if re.search(r"[^aeiou]ies$", word):
+        return re.escape(word[:-3]) + "(?:y|ies?)"
+    if re.search(r"[^aeiou]y$", word):
+        return re.escape(word[:-1]) + "(?:y|ies?)"
+    if re.search(r"(?:oes|ches|shes|xes|sses)$", word):
+        return re.escape(word[:-2]) + "(?:es)?"
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        return re.escape(word[:-1]) + "(?:s|es)?"
+    return re.escape(word) + "(?:s|es)?"
+
+
+def _russian_forms(word: str) -> str:
+    """Русское слово по основе: «свёкла» находит «Свекла, вареная».
+
+    Чередование основы приём не ловит: «свекольный» не найдётся.
+
+    Отрезается окончание из гласных, ё приравнивается к е (в каталоге
+    пишут по-разному, сравнение в ``matches_words`` тоже без ё). Из фразы
+    берётся первое слово: в русских названиях продуктов отличает его
+    прилагательное — «МАННАЯ каша», «ГРЕЦКИЕ орехи». Основа короче трёх
+    букв ищется целым словом, иначе «щи» нашли бы всё на «щ».
+    """
+    first = word.replace("ё", "е").split()[0]
+    stem = _RUSSIAN_ENDING.sub("", first)
+    if len(stem) < 3:
+        return re.escape(first)
+    return re.escape(stem) + r"\w*"
+
+
+# Хвосты названий, где перечислено то, чего в блюде НЕТ.
+#
+# Наблюдавшийся случай: пожелание «брокколи» засчитывало «Beef and vegetables
+# excluding carrots, broccoli, and dark-green leafy» — блюдо, в котором
+# брокколи нет по определению.
+#
+# Два вида хвоста, и путать их нельзя. «excluding»/«кроме» открывает ПЕРЕЧЕНЬ
+# до точки с запятой. «no»/«without»/«без» отрицает ОДНУ позицию до запятой:
+# в «…; no potatoes, gravy» картошки нет, а подлива есть.
+_ABSENT_LIST = re.compile(r"\b(?:excluding|excludes?|исключая|кроме)\b[^;]*")
+_ABSENT_ITEM = re.compile(r"\b(?:no|without|без)\s+[^,;]*")
+
+
+def matches_words(names: pd.Series, pattern: str, skip_absent: bool = False) -> pd.Series:
     """Какие названия совпали с выражением из ``to_pattern``.
 
     Только через эту функцию, а не через ``names.str.contains`` напрямую.
@@ -251,8 +326,16 @@ def matches_words(names: pd.Series, pattern: str) -> pd.Series:
     по-русски молча не срабатывало, и агент объяснял человеку, что гречки
     в справочнике нет. В ``object`` поиск идёт через ``re`` из стандартной
     библиотеки, где граница слова юникодная.
+
+    ``skip_absent`` — не искать в хвостах «excluding …», «без …». Только
+    для ПОЖЕЛАНИЙ. Исключения ищут по всему названию: хвост может спрятать
+    продукт, который в блюде есть, а цена такой ошибки — аллерген в тарелке.
     """
-    return names.astype(object).str.lower().str.contains(pattern, regex=True, na=False)
+    lowered = names.astype(object).str.lower().str.replace("ё", "е", regex=False)
+    if skip_absent:
+        lowered = (lowered.str.replace(_ABSENT_LIST, "", regex=True)
+                          .str.replace(_ABSENT_ITEM, "", regex=True))
+    return lowered.str.contains(pattern, regex=True, na=False)
 
 
 def to_category_pattern(terms: list[str] | None) -> str:

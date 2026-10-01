@@ -140,6 +140,26 @@ class TestProfileCollection:
         assert answer.answer
         assert agent.profile["weight_kg"] == 74
 
+    def test_malformed_russian_pairs_do_not_break_the_plan(self, catalog):
+        """include_ru — вспомогательное поле, ронять из-за него расчёт нельзя.
+
+        Модель могла вернуть его списком (так выглядел один из вариантов
+        промпта при замере), и Profile не прошёл бы валидацию.
+        """
+        agent = make_agent(
+            catalog,
+            script={
+                "маршрутизатор": classify_as("plan"),
+                "Извлеки параметры": json.dumps(
+                    {**FULL_PROFILE, "include": ["buckwheat"], "include_ru": ["гречка"]}
+                ),
+                "Объясни человеку": "Ваша норма посчитана, вот план.",
+            },
+        )
+        agent.run("Мне 31, женщина, 168 см, 74 кг, сидячая работа, хочу похудеть, люблю гречку")
+        assert agent.profile["include"] == ["buckwheat"]
+        assert agent.profile.get("include_ru", {}) == {}
+
     def test_profile_accumulates_across_turns(self, catalog):
         """Человек редко называет всё сразу — переспрашивать дважды нельзя."""
         agent = make_agent(

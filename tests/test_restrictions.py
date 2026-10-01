@@ -123,6 +123,35 @@ class TestAgainstTheCatalog:
         assert left["name"].str.lower().str.contains("broiled", na=False).any()
 
 
+class TestPluralExclusionsDoNotLeak:
+    """Исключение во множественном числе отсекает и единственное.
+
+    Наблюдавшийся случай: «не ем арахис» → exclude ["peanuts"], а шаблон
+    умел только ДОПИСАТЬ окончание. «Candy, peanut brittle» и ещё 40 блюд
+    с арахисом оставались в подборе — аллерген в тарелке. Так же протекали
+    «tomatoes» (163 блюда), «potatoes» (200), «cookies» (95).
+    """
+
+    @pytest.mark.parametrize("term, dish", [
+        ("peanuts", "Candy, peanut brittle"),
+        ("cookies", "Cookie, NFS"),
+        ("strawberries", "Pie, strawberry"),
+    ])
+    def test_singular_dish_is_excluded(self, catalog, term, dish):
+        left = _filter_catalog(catalog, [term])
+        assert dish in set(catalog["name"])
+        assert dish not in set(left["name"])
+
+    def test_absent_tail_still_counts_for_exclusion(self, catalog):
+        """Хвост «excluding …» пропускают только ПОЖЕЛАНИЯ.
+
+        В «…; no potatoes, gravy» подлива в блюде есть, и исключение
+        обязано видеть всё название: цена промаха — аллерген.
+        """
+        left = _filter_catalog(catalog, ["gravy"])
+        assert not left["name"].str.contains("no potatoes, gravy", regex=False).any()
+
+
 class TestFilteringByCatalogSection:
     """Раздел справочника знает то, чего не знает название.
 

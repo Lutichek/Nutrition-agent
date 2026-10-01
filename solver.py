@@ -482,6 +482,9 @@ def preferred_ids(catalog: pd.DataFrame, include: list[str] | None) -> set[int]:
     Здесь человек может назвать блюдо и по-русски («хочу творог»),
     а цена промаха разная: пропущенное исключение кладёт в план запрещённое,
     пропущенное предпочтение всего лишь не сработает.
+
+    Хвосты «excluding …», «без …» пропускаются: блюдо «…excluding broccoli»
+    не может засчитываться за пожелание «брокколи».
     """
     if not include:
         return set()
@@ -490,9 +493,9 @@ def preferred_ids(catalog: pd.DataFrame, include: list[str] | None) -> set[int]:
     if not pattern:
         return set()
 
-    matched = matches_words(catalog["name"], pattern)
+    matched = matches_words(catalog["name"], pattern, skip_absent=True)
     if "name_ru" in catalog.columns:
-        matched |= matches_words(catalog["name_ru"], pattern)
+        matched |= matches_words(catalog["name_ru"], pattern, skip_absent=True)
 
     by_category = to_category_pattern(include)
     if by_category and "category" in catalog.columns:

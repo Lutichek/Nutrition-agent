@@ -18,7 +18,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from agent import PREFERENCES_OFFER, NutritionAgent, _resolve_preferences
+from agent import (
+    PREFERENCES_OFFER,
+    NutritionAgent,
+    _resolve_preferences,
+    _with_russian_fallback,
+)
 from solver import (
     PREFERENCE_SATURATION,
     _preference_penalty,
@@ -191,6 +196,83 @@ class TestPreferredIds:
     def test_no_preferences_matches_nothing(self, catalog: pd.DataFrame) -> None:
         assert preferred_ids(catalog, None) == set()
         assert preferred_ids(catalog, []) == set()
+
+
+class TestPreferenceWordForms:
+    """Пожелание находит блюдо, в каком бы числе модель ни назвала продукт.
+
+    Замер на 48 русских пожеланиях: модель отвечала «cucumbers», «plums»,
+    «raspberry», «tomatoes», а USDA пишет «Cucumber salad», «Raspberries,
+    raw». Шаблон умел только дописать окончание, и 9 из 132 пожеланий
+    не находили ничего, хотя блюда в каталоге есть.
+    """
+
+    @pytest.mark.parametrize("term, dish", [
+        ("cucumbers", "Cucumber salad made with cucumber and vinegar"),
+        ("raspberry", "Raspberries, raw"),
+        ("plums", "Plum, raw"),
+        ("tomatoes", "Bacon, lettuce, tomato sandwich on wheat"),
+        ("cookies", "Cookie, NFS"),
+    ])
+    def test_finds_dish_in_other_number(self, catalog: pd.DataFrame, term: str, dish: str) -> None:
+        found = catalog.loc[catalog["fdc_id"].isin(preferred_ids(catalog, [term])), "name"]
+        assert dish in set(found)
+
+
+class TestAbsentTailIsNotAMatch:
+    """«…excluding broccoli» — блюдо БЕЗ брокколи.
+
+    Наблюдавшийся случай: пожелание «брокколи» засчитывало «Beef and
+    vegetables excluding carrots, broccoli, and dark-green leafy».
+    """
+
+    def test_excluding_tail_is_skipped(self, catalog: pd.DataFrame) -> None:
+        found = catalog.loc[catalog["fdc_id"].isin(preferred_ids(catalog, ["broccoli"])), "name"]
+        assert not any("excluding" in name.lower() for name in found)
+        assert "Beef and broccoli" in set(found)
+
+    def test_no_negates_one_item_not_the_rest(self, catalog: pd.DataFrame) -> None:
+        """В «…; no potatoes, gravy» картошки нет, а подлива есть."""
+        found = catalog.loc[catalog["fdc_id"].isin(preferred_ids(catalog, ["gravy"])), "name"]
+        assert any("no potatoes, gravy" in name for name in found)
+
+
+class TestRussianFallback:
+    """Английское слово не нашло ничего — ищем по русскому.
+
+    Модель переводит пожелание словом, которого в USDA нет: «semolina»
+    вместо «farina», «millet porridge» вместо «millet». Блюдо в каталоге
+    есть, а человек слышит «не нашлось».
+    """
+
+    def test_semolina_found_through_russian(self, catalog: pd.DataFrame) -> None:
+        profile = _profile(include=["semolina"], include_ru={"semolina": "манная каша"})
+        terms = _with_russian_fallback(_resolve_preferences(profile), profile, catalog)
+        found = catalog.loc[catalog["fdc_id"].isin(preferred_ids(catalog, terms)), "name"]
+        assert any(name.startswith("Cream of wheat") for name in found)
+
+    def test_english_wins_when_it_finds_something(self, catalog: pd.DataFrame) -> None:
+        """Основа русского слова шире английского — ей не верим, если есть выбор."""
+        profile = _profile(include=["buckwheat"], include_ru={"buckwheat": "гречка"})
+        assert _with_russian_fallback(["buckwheat"], profile, catalog) == ["buckwheat"]
+
+    def test_yo_is_the_same_letter(self, catalog: pd.DataFrame) -> None:
+        """В каталоге «Свекла», человек пишет «свёкла»."""
+        assert preferred_ids(catalog, ["свёкла"])
+
+    def test_dropped_preference_stays_dropped(self, catalog: pd.DataFrame) -> None:
+        """Снятое ограничением пожелание русская пара не воскрешает."""
+        profile = _profile(include=["milk"], exclude=["lactose"],
+                           include_ru={"milk": "молоко"})
+        assert _with_russian_fallback(_resolve_preferences(profile), profile, catalog) == []
+
+    def test_unmatched_note_names_it_in_russian(self, catalog: pd.DataFrame) -> None:
+        """Человек просил «ряженку» — так и сказать, а не «ryazhenka»."""
+        from types import SimpleNamespace
+
+        profile = _profile(include=["ryazhenka"], include_ru={"ryazhenka": "ряженка"})
+        note = NutritionAgent._unmatched_note(SimpleNamespace(catalog=catalog), profile)
+        assert "ряженка" in note and "ryazhenka" not in note
 
 
 class TestPreferencesOffer:
