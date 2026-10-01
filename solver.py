@@ -45,7 +45,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, computed_field
 
 from prices import cost_per_gram, fallback_cost_per_gram
-from restrictions import to_category_pattern, to_pattern
+from restrictions import matches_words, to_category_pattern, to_pattern
 from targets import Targets
 
 # ────────────────────────────────────────────────────────────
@@ -362,7 +362,7 @@ def _filter_catalog(
         # «oil» находился внутри «broiled» и выбрасывал запечённую курицу.
         pattern = to_pattern(exclude)
         if pattern:
-            usable = usable[~usable["name"].str.lower().str.contains(pattern, regex=True, na=False)]
+            usable = usable[~matches_words(usable["name"], pattern)]
 
         # Второй проход — по разделу справочника. Он знает тип блюда там,
         # где название молчит: в «Gyro sandwich» слова «bread» нет, но
@@ -490,9 +490,9 @@ def preferred_ids(catalog: pd.DataFrame, include: list[str] | None) -> set[int]:
     if not pattern:
         return set()
 
-    matched = catalog["name"].str.lower().str.contains(pattern, regex=True, na=False)
+    matched = matches_words(catalog["name"], pattern)
     if "name_ru" in catalog.columns:
-        matched |= catalog["name_ru"].str.lower().str.contains(pattern, regex=True, na=False)
+        matched |= matches_words(catalog["name_ru"], pattern)
 
     by_category = to_category_pattern(include)
     if by_category and "category" in catalog.columns:

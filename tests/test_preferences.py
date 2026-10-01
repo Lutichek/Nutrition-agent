@@ -170,6 +170,20 @@ class TestPreferredIds:
         """
         assert preferred_ids(catalog, ["гречка"]) == {1}
 
+    def test_russian_name_matches_in_shipped_catalog(self) -> None:
+        """Русское пожелание находит блюда в НАСТОЯЩЕМ каталоге.
+
+        Наблюдавшийся случай: с переходом на pandas 3 колонка ``name_ru``
+        стала pyarrow-строкой, регулярка ушла в RE2, а там ``\\b`` знает
+        только латиницу. «творог» находил 0 блюд из 14 без единой ошибки,
+        и агент говорил человеку, что творога в справочнике нет.
+        Фикстура выше ловит то же самое, только пока фикстура строит
+        колонку того же типа, что и parquet.
+        """
+        from foods import load_catalog
+
+        assert len(preferred_ids(load_catalog(), ["творог"])) >= 4
+
     def test_word_boundaries_respected(self, catalog: pd.DataFrame) -> None:
         """«oil» не должен находиться внутри «broiled»."""
         assert preferred_ids(catalog, ["oil"]) == set()

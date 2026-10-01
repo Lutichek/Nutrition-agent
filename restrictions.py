@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import re
 
+import pandas as pd
+
 # ── Категории ────────────────────────────────────────────────
 # Ключ — то, что называет модель; значение — слова, которые ищутся
 # в англоязычных названиях каталога.
@@ -237,6 +239,20 @@ def to_pattern(terms: list[str] | None) -> str:
     # уронить подбор рациона.
     alternatives = "|".join(re.escape(word) for word in words)
     return rf"\b(?:{alternatives})(?:s|es)?\b"
+
+
+def matches_words(names: pd.Series, pattern: str) -> pd.Series:
+    """Какие названия совпали с выражением из ``to_pattern``.
+
+    Только через эту функцию, а не через ``names.str.contains`` напрямую.
+    В pandas 3 строковая колонка хранится в pyarrow, и регулярка уходит
+    в RE2, где ``\\b`` понимает границу слова ТОЛЬКО для латиницы.
+    «гречка» не находилась в «Гречка варёная» без единой ошибки: пожелание
+    по-русски молча не срабатывало, и агент объяснял человеку, что гречки
+    в справочнике нет. В ``object`` поиск идёт через ``re`` из стандартной
+    библиотеки, где граница слова юникодная.
+    """
+    return names.astype(object).str.lower().str.contains(pattern, regex=True, na=False)
 
 
 def to_category_pattern(terms: list[str] | None) -> str:
