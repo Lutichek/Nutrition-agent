@@ -25,6 +25,7 @@ cracker». Поэтому совпадение только по граница�
 from __future__ import annotations
 
 import re
+from itertools import permutations
 
 import pandas as pd
 
@@ -236,19 +237,55 @@ def to_pattern(terms: list[str] | None) -> str:
     Русское слово ищется по основе (см. ``_russian_forms``): оно приходит
     запасным путём для пожеланий, у которых не нашлось английского слова.
 
+    Название из нескольких слов совпадает, когда в блюде есть ВСЕ его слова,
+    в любом порядке (см. ``_term_pattern``).
+
     Пустая строка означает «ничего не исключаем».
     """
     words = expand(terms)
     if not words:
         return ""
 
-    alternatives = "|".join(_word_forms(word) for word in words)
-    return rf"\b(?:{alternatives})\b"
+    return "(?:" + "|".join(_term_pattern(word) for word in words) + ")"
 
 
 _CYRILLIC = re.compile(r"[а-яё]")
-_PLAIN_ENGLISH = re.compile(r"[a-z]+(?:[ '-][a-z]+)*")
+_PLAIN_WORD = re.compile(r"[a-zа-яё]+(?:['-][a-zа-яё]+)*")
 _RUSSIAN_ENDING = re.compile(r"[аяоеиыуюйь]+$")
+
+
+def _term_pattern(term: str) -> str:
+    """Выражение для одного продукта: одно слово — по границам слова,
+    несколько — все слова в любом порядке.
+
+    Порядок слов в USDA обратный разговорному: «Cheese, Feta», «Yogurt,
+    Greek», «Rice, brown and wild». Фраза целиком не находила их вовсе,
+    и это било в обе стороны. Исключение «feta cheese» и «greek yogurt»
+    не отсекало НИЧЕГО — аллерген оставался в подборе. А пожелание «сыр
+    фета» уходило в русский запасной путь, где по основе первого слова
+    «сыр» находило 505 блюд: «Сырое яблоко», «Спаржа, сырая».
+
+    Цена — лишние совпадения: «cream cheese» уносит и «Ravioli,
+    cheese-filled, with cream sauce». Для исключения это беднее выбор,
+    а не аллерген в тарелке; перестало отсекаться ноль блюд.
+
+    «В любом порядке» — перестановками слов, а не просмотром вперёд
+    (``^(?=.*a)(?=.*b)``). Результат тот же до блюда, а фильтр каталога
+    с исключениями «свинина, сладкое, мучное, лактоза» — 15 мс против 211:
+    просмотр вперёд замедлял подбор дня на 8%. Перестановок n!, поэтому
+    для фраз длиннее ``_MAX_PERMUTED`` слов — всё-таки просмотр.
+    """
+    tokens = term.split()
+    if len(tokens) == 1 or not all(_PLAIN_WORD.fullmatch(token) for token in tokens):
+        return rf"\b(?:{_word_forms(term)})\b"
+
+    forms = [rf"\b(?:{_word_forms(token)})\b" for token in tokens]
+    if len(tokens) > _MAX_PERMUTED:
+        return "^" + "".join(f"(?=.*{form})" for form in forms)
+    return "(?:" + "|".join(".*".join(order) for order in permutations(forms)) + ")"
+
+
+_MAX_PERMUTED = 4
 
 
 def _word_forms(word: str) -> str:
@@ -260,13 +297,10 @@ def _word_forms(word: str) -> str:
     # от пользователя. Скобка или звёздочка в ограничении не должна
     # уронить подбор рациона. Всё, что не похоже на обычное слово,
     # ищется буквально, как и раньше.
-    if not _PLAIN_ENGLISH.fullmatch(word):
+    if not _PLAIN_WORD.fullmatch(word):
         return re.escape(word) + "(?:s|es)?"
 
-    # Склоняется только последнее слово: «dried apricots» → «dried apricot».
-    head, _, last = word.rpartition(" ")
-    prefix = re.escape(head) + r"\s+" if head else ""
-    return prefix + _english_forms(last)
+    return _english_forms(word)
 
 
 def _english_forms(word: str) -> str:
@@ -291,15 +325,17 @@ def _russian_forms(word: str) -> str:
     Чередование основы приём не ловит: «свекольный» не найдётся.
 
     Отрезается окончание из гласных, ё приравнивается к е (в каталоге
-    пишут по-разному, сравнение в ``matches_words`` тоже без ё). Из фразы
-    берётся первое слово: в русских названиях продуктов отличает его
-    прилагательное — «МАННАЯ каша», «ГРЕЦКИЕ орехи». Основа короче трёх
-    букв ищется целым словом, иначе «щи» нашли бы всё на «щ».
+    пишут по-разному, сравнение в ``matches_words`` тоже без ё). Основа
+    короче трёх букв ищется целым словом, иначе «щи» нашли бы всё на «щ».
+
+    Слово здесь ОДНО: фразу разбирает ``_term_pattern``. Раньше из фразы
+    бралось только первое слово, и «сыр фета» искался как «сыр…» —
+    вместе со всем «сырым».
     """
-    first = word.replace("ё", "е").split()[0]
-    stem = _RUSSIAN_ENDING.sub("", first)
+    word = word.replace("ё", "е")
+    stem = _RUSSIAN_ENDING.sub("", word)
     if len(stem) < 3:
-        return re.escape(first)
+        return re.escape(word)
     return re.escape(stem) + r"\w*"
 
 

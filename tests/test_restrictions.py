@@ -152,6 +152,29 @@ class TestPluralExclusionsDoNotLeak:
         assert not left["name"].str.contains("no potatoes, gravy", regex=False).any()
 
 
+class TestMultiWordNamesInAnyOrder:
+    """Название из нескольких слов совпадает в любом порядке слов.
+
+    Порядок в USDA обратный разговорному: «Cheese, Feta», «Yogurt, Greek».
+    Фразой целиком исключение «feta cheese» не отсекало ни одного блюда —
+    аллерген оставался в подборе.
+    """
+
+    @pytest.mark.parametrize("term, dish", [
+        ("feta cheese", "Cheese, Feta"),
+        ("greek yogurt", "Yogurt, Greek, NS as to type of milk or flavor"),
+        ("brown rice", "Rice, brown and wild, cooked, NS as to fat"),
+    ])
+    def test_reversed_order_is_excluded(self, catalog, term, dish):
+        assert dish in set(catalog["name"])
+        assert dish not in set(_filter_catalog(catalog, [term])["name"])
+
+    def test_words_must_all_be_present(self):
+        """Одного слова мало: «cream cheese» — не любой «cheese»."""
+        assert matches("cream cheese", "Cheese, cream, low fat")
+        assert not matches("cream cheese", "Cheese, cheddar")
+
+
 class TestFilteringByCatalogSection:
     """Раздел справочника знает то, чего не знает название.
 

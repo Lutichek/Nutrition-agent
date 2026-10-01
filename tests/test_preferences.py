@@ -260,6 +260,19 @@ class TestRussianFallback:
         """В каталоге «Свекла», человек пишет «свёкла»."""
         assert preferred_ids(catalog, ["свёкла"])
 
+    def test_phrase_is_not_its_first_word(self, catalog: pd.DataFrame) -> None:
+        """«сыр фета» — это фета, а не всё, что начинается на «сыр».
+
+        Наблюдавшийся случай: запасной путь искал по основе ПЕРВОГО слова,
+        и «сыр…» находил 505 блюд — «Сырое яблоко», «Спаржа, сырая».
+        Пожелание молча тянуло рацион в случайную сторону.
+        """
+        profile = _profile(include=["feta cheese"], include_ru={"feta cheese": "сыр фета"})
+        terms = _with_russian_fallback(_resolve_preferences(profile), profile, catalog)
+        found = catalog.loc[catalog["fdc_id"].isin(preferred_ids(catalog, terms)), "name"]
+        assert "Cheese, Feta" in set(found)
+        assert len(found) < 10
+
     def test_dropped_preference_stays_dropped(self, catalog: pd.DataFrame) -> None:
         """Снятое ограничением пожелание русская пара не воскрешает."""
         profile = _profile(include=["milk"], exclude=["lactose"],
