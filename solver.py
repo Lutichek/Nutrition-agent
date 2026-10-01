@@ -37,7 +37,6 @@
 from __future__ import annotations
 
 import random
-import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -769,6 +768,7 @@ def _build_day_once(
     tolerance: float = SLOT_TOLERANCE,
     include: list[str] | None = None,
     budget: float | None = None,
+    avoid_ids: set[int] | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -785,6 +785,8 @@ def _build_day_once(
     template = template or DAY_TEMPLATE
 
     usable = _filter_catalog(catalog, exclude, allow_exotic=allow_exotic)
+    if avoid_ids:
+        usable = usable[~usable["fdc_id"].astype(int).isin(avoid_ids)]
     candidates = _candidates_by_role(usable)
 
     # Предпочтения ищем УЖЕ в отфильтрованном каталоге: если человек
@@ -867,6 +869,7 @@ def build_day(
     template: list[tuple[str, str, float]] | None = None,
     include: list[str] | None = None,
     budget: float | None = None,
+    avoid_ids: set[int] | None = None,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -884,9 +887,12 @@ def build_day(
         seed: фиксирует случайность — один seed даёт один и тот же план.
         iterations: сколько замен пробует локальный поиск.
         allow_exotic: разрешить дичь и субпродукты (по умолчанию нет).
+        avoid_ids: блюда, которых в этот день быть не должно (окно
+            разнообразия меню, см. ``build_menu``).
     """
     plan = _build_day_once(catalog, targets, exclude, seed, iterations,
-                           allow_exotic, template, SLOT_TOLERANCE, include, budget)
+                           allow_exotic, template, SLOT_TOLERANCE, include, budget,
+                           avoid_ids)
 
     if check_plan(plan)["kcal_in_range"]:
         # Через эту ветку тоже надо проверить бюджет против нормы: калории
@@ -894,11 +900,12 @@ def build_day(
         # такой день мимо проверки (seed 4: 2023 ккал в допуске, белок
         # 92 г против 112 — и план уехал человеку).
         return _nutrition_wins_over_budget(plan, catalog, targets, exclude, seed,
-                                           iterations, allow_exotic, template, include)
+                                           iterations, allow_exotic, template, include,
+                                           avoid_ids)
 
     relaxed = _build_day_once(catalog, targets, exclude, seed, iterations,
                               allow_exotic, template, SLOT_TOLERANCE_RELAXED,
-                              include, budget)
+                              include, budget, avoid_ids)
 
     # Возвращаем ослабленный только если он и правда лучше: иначе человек
     # получил бы менее сбалансированный день без выигрыша по калориям.
@@ -907,7 +914,8 @@ def build_day(
     best = relaxed if relaxed_gap < strict_gap else plan
 
     return _nutrition_wins_over_budget(best, catalog, targets, exclude, seed,
-                                       iterations, allow_exotic, template, include)
+                                       iterations, allow_exotic, template, include,
+                                       avoid_ids)
 
 
 def _nutrition_wins_over_budget(
@@ -920,6 +928,7 @@ def _nutrition_wins_over_budget(
     allow_exotic: bool,
     template: list[tuple[str, str, float]] | None,
     include: list[str] | None,
+    avoid_ids: set[int] | None = None,
 ) -> DayPlan:
     """Если ради бюджета сломалась норма — вернуть план без бюджета.
 
@@ -944,11 +953,12 @@ def _nutrition_wins_over_budget(
 
     # Тот же день без денежного ограничения.
     unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
-                                allow_exotic, template, SLOT_TOLERANCE, include, None)
+                                allow_exotic, template, SLOT_TOLERANCE, include, None,
+                                avoid_ids)
     if not check_plan(unlimited)["kcal_in_range"]:
         unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
                                     allow_exotic, template, SLOT_TOLERANCE_RELAXED,
-                                    include, None)
+                                    include, None, avoid_ids)
 
     # Бюджет сохраняем в плане: он не выполнен, но назван — и агент
     # обязан сказать об этом, а не промолчать.
@@ -1055,27 +1065,35 @@ def build_menu(
     plans: list[DayPlan] = []
     recent: list[set[int]] = []
 
+    # Любимые блюда окно разнообразия не трогает, иначе предпочтение
+    # отменяло бы само себя: блюдо появлялось один раз и на следующие
+    # два дня выпадало из подбора. Человек, попросивший овсянку
+    # на завтрак, хочет её именно каждый день.
+    liked = preferred_ids(catalog, include)
+
     for day_number in range(days):
-        # Названия блюд последних дней добавляем к исключениям: фильтр
-        # в _filter_catalog работает по подстроке в названии, а точное
-        # совпадение названия — это и есть то самое блюдо.
-        recent_names: list[str] = []
+        # Окно — по fdc_id, а не по названию через exclude. Наблюдавшийся
+        # случай: названия шли в to_pattern уже экранированными, экранировались
+        # второй раз, и шаблон искал обратную косую черту. Окно срабатывало
+        # для 102 названий из 4782 — на семи днях 123 повтора внутри окна
+        # при нуле ошибок и проходящих тестах.
+        #
+        # Сравнивались три починки (7 дней × 6 профилей × 8 сидов):
+        #
+        #     способ                    повторов  уникальных  провал.дней
+        #     как было                     123       0.888          0
+        #     fdc_id, жёсткий фильтр         0       0.922          0   ← этот
+        #     названия без двойного         0       0.932          2
+        #       экранирования (4 сида)
+        #     штраф за повтор, вес 4         1       0.930          0
+        #
+        # Названия выбрасывали и похожие блюда («Rice, white» уносил все
+        # «Rice, white, with …») и ломали норму. Штраф почти не уступает,
+        # но повтор не исключает и добавляет ещё один подбираемый вес.
+        avoid: set[int] = set()
         for used in recent[-variety_window:] if variety_window else []:
-            recent_names.extend(used)
-
-        # Любимые блюда окно разнообразия не трогает, иначе предпочтение
-        # отменяло бы само себя: блюдо появлялось один раз и на следующие
-        # два дня выпадало из подбора. Человек, попросивший овсянку
-        # на завтрак, хочет её именно каждый день.
-        if include and recent_names:
-            liked = to_pattern(include)
-            if liked:
-                recent_names = [
-                    name for name in recent_names
-                    if not re.search(liked, name.lower())
-                ]
-
-        day_exclude = list(exclude or []) + [_escape(name) for name in recent_names]
+            avoid |= used
+        avoid -= liked
 
         day_targets = per_day[day_number]
 
@@ -1083,11 +1101,12 @@ def build_menu(
             plan = build_day(
                 catalog,
                 day_targets,
-                exclude=day_exclude,
+                exclude=list(exclude or []),
                 seed=seed + day_number,
                 iterations=iterations if iterations is not None else 300,
                 include=include,
                 budget=budget,
+                avoid_ids=avoid,
             )
         except PlanNotFeasible:
             # Окно разнообразия сузило каталог слишком сильно — собираем день
@@ -1103,20 +1122,13 @@ def build_menu(
             )
 
         plans.append(plan)
-        recent.append({item.name for item in plan.items})
+        recent.append({item.fdc_id for item in plan.items})
 
     mean = {
         key: sum(t.as_dict()[key] for t in per_day) / len(per_day)
         for key in per_day[0].as_dict()
     }
     return Menu(days=plans, targets=mean)
-
-
-def _escape(name: str) -> str:
-    """Экранировать название блюда для использования как regex-подстроки."""
-    import re
-
-    return re.escape(name)
 
 
 # ────────────────────────────────────────────────────────────

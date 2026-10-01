@@ -304,3 +304,40 @@ class TestCycledMenu:
         per_day = [cycled.for_day(i) for i in range(7)]
         menu = build_menu(catalog, per_day, days=7, seed=0)
         assert menu.targets["kcal"] == pytest.approx(cycled.base.kcal, rel=0.01)
+
+
+class TestVarietyWindow:
+    """Блюдо из последних двух дней не повторяется — кроме любимого.
+
+    Наблюдавшийся случай: окно передавало названия в exclude уже
+    экранированными, to_pattern экранировал их второй раз, и шаблон искал
+    обратную косую черту. Окно срабатывало для 102 названий из 4782:
+    на семи днях — 123 повтора внутри окна, тесты при этом проходили,
+    потому что окно не проверял ни один.
+    """
+
+    @staticmethod
+    def repeats(menu, window: int = 2, allowed: frozenset[int] = frozenset()) -> int:
+        days = [{item.fdc_id for item in day.items} for day in menu.days]
+        return sum(
+            len((ids & set().union(*days[max(0, d - window):d])) - allowed)
+            for d, ids in enumerate(days) if d
+        )
+
+    @pytest.mark.parametrize("seed", [0, 100])
+    def test_no_repeats_inside_window(self, catalog, seed):
+        targets = compute_targets(PROFILES["похудение, женщина"])
+        menu = build_menu(catalog, targets, days=7, seed=seed)
+        assert self.repeats(menu) == 0
+
+    def test_liked_dish_may_repeat(self, catalog):
+        """Окно не отменяет пожелание: «хочу овсянку» — это каждый день."""
+        from solver import preferred_ids
+
+        targets = compute_targets(PROFILES["удержание веса"])
+        menu = build_menu(catalog, targets, days=5, seed=0, include=["oatmeal"])
+        liked = frozenset(preferred_ids(catalog, ["oatmeal"]))
+        assert self.repeats(menu, allowed=liked) == 0
+        days_with_liked = sum(
+            any(item.fdc_id in liked for item in day.items) for day in menu.days)
+        assert days_with_liked >= 4
