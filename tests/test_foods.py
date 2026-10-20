@@ -11,11 +11,13 @@ from __future__ import annotations
 import pytest
 
 from foods import (
+    EXOTIC_CATEGORIES,
     EXOTIC_NAME_PATTERN,
     REQUIRED_NUTRIENTS,
     _portion_rank,
     _role_for_category,
     check_catalog,
+    mark_mainstream,
 )
 
 
@@ -113,6 +115,25 @@ class TestExoticFilter:
 
     def test_pattern_is_anchored(self):
         assert EXOTIC_NAME_PATTERN.startswith("^")
+
+    def test_offal_section_is_never_offered(self, catalog):
+        """«Hog maws» прошёл шаблон по слову и попал в живой план.
+
+        Раздел знает тип блюда, шаблон — только слова, и каждое незнакомое
+        слово было дырой. Из этих разделов в подбор не идёт ничего.
+        """
+        offal = catalog[catalog["category"].isin(EXOTIC_CATEGORIES)]
+        assert "Hog maws" in set(offal["name"])
+        assert not offal["mainstream"].any()
+
+    def test_shipped_catalog_matches_the_rule(self, catalog):
+        """Пометка в репозитории посчитана текущими правилами.
+
+        Правило меняется в foods.py, а parquet обновляется
+        ``python foods.py --refresh-flags``. Забыл второе — тест падает.
+        """
+        stale = catalog.loc[mark_mainstream(catalog) != catalog["mainstream"], "name"]
+        assert stale.empty, f"устаревшая пометка: {stale.tolist()[:5]}"
 
 
 class TestPortionSelection:

@@ -31,6 +31,7 @@
 
     python foods.py          # собрать каталог и показать сводку
     python foods.py --rebuild
+    python foods.py --refresh-flags   # пересчитать mainstream без модели
 """
 
 from __future__ import annotations
@@ -100,6 +101,30 @@ EXOTIC_NAME_PATTERN = (
     r"brains|gizzard|tripe|tongue|chitterlings|sweetbread|liverwurst|blood sausage|"
     r"liver\b|livers\b|heart\b|kidney\b(?! bean))"
 )
+
+# Разделы справочника, целиком не идущие в автоматический подбор.
+#
+# Шаблон выше ловит субпродукт по СЛОВУ, и каждое незнакомое слово — дыра:
+# «Hog maws» (свиные желудки) прошёл, потому что «maws» в шаблоне не было,
+# и попал в живой план. Раздел знает ТИП блюда: в «Liver and organ meats»
+# все 13 блюд — субпродукты, 12 из них шаблон уже ловил.
+EXOTIC_CATEGORIES = frozenset({"Liver and organ meats"})
+
+
+def mark_mainstream(catalog: pd.DataFrame) -> pd.Series:
+    """Что солвер может предлагать сам: не дичь, не субпродукт, не служебная
+    запись и не сырое животное.
+
+    Одна функция для сборки каталога и для ``--refresh-flags``: пометку
+    нельзя править в parquet напрямую — до первой пересборки правка
+    молча откатится (так уже было с переводами, см. translation_fixes).
+    """
+    lowered = catalog["name"].str.lower()
+    exotic = (lowered.str.contains(EXOTIC_NAME_PATTERN, regex=True, na=False)
+              | catalog["category"].isin(EXOTIC_CATEGORIES))
+    service = lowered.str.contains(SERVICE_RECORD_PATTERN, regex=True, na=False)
+    raw_animal = lowered.str.contains(RAW_ANIMAL_PATTERN, regex=True, na=False)
+    return ~(exotic | service | raw_animal)
 
 # Записи, которые вообще не блюда, и позиции общепита.
 #
@@ -360,16 +385,10 @@ def build_catalog(verbose: bool = True) -> pd.DataFrame:
     # ── Мейнстрим или экзотика ───────────────────────────────
     # Дичь и субпродукты остаются в каталоге (если человек спросит про печень,
     # ответить есть чем), но помечены — солвер их не предлагает сам.
-    lowered = catalog["name"].str.lower()
-    exotic = lowered.str.contains(EXOTIC_NAME_PATTERN, regex=True, na=False)
-    service = lowered.str.contains(SERVICE_RECORD_PATTERN, regex=True, na=False)
-    raw_animal = lowered.str.contains(RAW_ANIMAL_PATTERN, regex=True, na=False)
-
-    catalog["mainstream"] = ~(exotic | service | raw_animal)
+    catalog["mainstream"] = mark_mainstream(catalog)
     if verbose:
-        print(f"[foods] помечено как экзотика: {exotic.sum()}")
-        print(f"[foods] служебные записи и общепит: {service.sum()}")
-        print(f"[foods] сырое мясо, рыба и яйца: {raw_animal.sum()}")
+        print(f"[foods] в подбор не идёт (экзотика, служебное, сырое): "
+              f"{(~catalog['mainstream']).sum()}")
 
     # ── КБЖУ на порцию ───────────────────────────────────────
     # В выгрузке нутриенты даны на 100 г, поэтому масштабируем весом порции.
@@ -439,7 +458,25 @@ def check_catalog(catalog: pd.DataFrame) -> dict[str, float]:
     return report
 
 
+def refresh_flags() -> None:
+    """Пересчитать детерминированную пометку mainstream в готовом каталоге.
+
+    Без пересборки: колонки перевода и разметки модели (name_ru,
+    available_ru, familiar_ru) стоят денег и остаются как есть. Пометка
+    считается той же функцией, что и при сборке, — расхождения быть не может.
+    """
+    catalog = pd.read_parquet(CATALOG_PATH)
+    fresh = mark_mainstream(catalog)
+    changed = catalog.loc[fresh != catalog["mainstream"], "name"].tolist()
+    catalog["mainstream"] = fresh
+    catalog.to_parquet(CATALOG_PATH, index=False)
+    print(f"[foods] пометка mainstream изменилась у {len(changed)}: {changed[:10]}")
+
+
 def main() -> None:
+    if "--refresh-flags" in sys.argv:
+        refresh_flags()
+        return
     rebuild = "--rebuild" in sys.argv
     catalog = load_catalog(rebuild=rebuild, verbose=True)
 
