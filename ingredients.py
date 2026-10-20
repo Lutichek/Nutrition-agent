@@ -112,6 +112,24 @@ def load_composition(path: Path | None = None) -> dict[int, list[Ingredient]]:
     return result
 
 
+@lru_cache(maxsize=4)
+def ingredient_dishes(path: Path | None = None) -> dict[str, frozenset[int]]:
+    """Название ингредиента → блюда, в составе которых он есть.
+
+    Для проверки исключений по составу (solver._filter_catalog). Ключи —
+    около двух тысяч уникальных названий против четырнадцати тысяч строк:
+    регулярка гоняется по ним, а не по каждой строке рецептуры.
+    """
+    path = path or COMPOSITION_PATH
+    if not path.exists():
+        return {}
+    frame = pd.read_parquet(path, columns=["fdc_id", "name_en"])
+    return {
+        str(name): frozenset(int(i) for i in group["fdc_id"])
+        for name, group in frame.groupby("name_en")
+    }
+
+
 def build_shares(raw_path: Path | None = None,
                  keep_ids: set[int] | None = None) -> pd.DataFrame:
     """Привести рецептурные граммовки к долям массы блюда.

@@ -38,11 +38,13 @@ from __future__ import annotations
 
 import random
 from collections.abc import Sequence
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
 from pydantic import BaseModel, Field, computed_field
 
+from ingredients import ingredient_dishes
 from prices import cost_per_gram, fallback_cost_per_gram
 from restrictions import matches_words, to_category_pattern, to_pattern
 from targets import Targets
@@ -372,7 +374,39 @@ def _filter_catalog(
                 ~usable["category"].str.lower().str.contains(by_category, regex=True, na=False)
             ]
 
+        # Третий проход — по составу. Название и раздел говорят, ЧТО это
+        # за блюдо, а не что внутри: в «Club sandwich» ветчина и бекон,
+        # в «Spanish rice» бекон, в «Bao bun» сало — и ни слова о свинине.
+        # Без этого прохода после exclude=["pork"] в подборе оставалось
+        # 123 блюда со свининой в рецептуре.
+        if pattern:
+            with_excluded = _dishes_with_ingredient(pattern)
+            if with_excluded:
+                usable = usable[~usable["fdc_id"].astype(int).isin(with_excluded)]
+
     return usable
+
+
+@lru_cache(maxsize=256)
+def _dishes_with_ingredient(pattern: str) -> frozenset[int]:
+    """Блюда, в рецептуре которых есть ингредиент, совпавший с выражением.
+
+    ``skip_absent=True`` — в отличие от названий блюд. Ингредиент — один
+    продукт, и «Potatoes, mashed, flakes without milk» или «Ice cream,
+    no sugar added» честно говорят об отсутствии: спрятать под хвостом
+    там нечего. В названии блюда «…; no potatoes, gravy» подлива есть.
+
+    Кэш по выражению: состав неизменен, а фильтр зовут на каждый день меню.
+
+    Ограничение данных: доли меньше 1% отброшены при сборке состава
+    (ingredients.MIN_SHARE), и следовые количества так не находятся.
+    """
+    index = ingredient_dishes()
+    if not index:
+        return frozenset()
+    names = pd.Series(list(index), dtype=object)
+    hit = names[matches_words(names, pattern, skip_absent=True).to_numpy()]
+    return frozenset().union(*(index[name] for name in hit))
 
 
 def _candidates_by_role(catalog: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:

@@ -32,7 +32,7 @@ class TestCategories:
         assert len(expand(["sweets"])) > 30
 
     def test_plain_term_passes_through(self):
-        assert expand(["pork"]) == ["pork"]
+        assert expand(["mushroom"]) == ["mushroom"]
 
     def test_unknown_term_is_kept_not_dropped(self):
         """Незнакомое ограничение применяем буквально, а не выбрасываем."""
@@ -206,6 +206,71 @@ class TestFilteringByCatalogSection:
 
     def test_unknown_term_has_no_category_rule(self):
         assert to_category_pattern(["quinoa"]) == ""
+
+
+class TestPorkIsCaughtUnderOtherNames:
+    """Свинина в USDA чаще названа без слова «pork».
+
+    Наблюдалось в журнале чата: профиль ``exclude=["pork"]``, в плане —
+    «Hog maws» (свиные желудки). Замер по каталогу: мимо фильтра проходило
+    91 блюдо со свиным словом в названии и ещё больше — со свининой только
+    в рецептуре. Человеку, который не ест свинину по вере, это хуже, чем
+    любая неточность по калориям.
+    """
+
+    @pytest.mark.parametrize("dish", [
+        "Hog maws", "Ham", "Bacon, NS as to type of meat, cooked", "Ham, prosciutto",
+        "Pepperoni, NFS", "Salami, NFS", "Chorizo", "Bratwurst",
+        "Frankfurters or hot dogs and sauerkraut",
+    ])
+    def test_pork_by_name(self, catalog, dish):
+        assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
+        assert dish not in set(_filter_catalog(catalog, ["pork"])["name"])
+
+    @pytest.mark.parametrize("dish", [
+        # Ни слова о свинине в названии — только в рецептуре.
+        "Club sandwich on white",        # ветчина и бекон
+        "Egg, Benedict",                 # канадский бекон
+        "Spanish rice, fat added",       # бекон
+        "Bao bun",                       # свинина и сало
+        "Soup, split pea, with meat",    # свиная лопатка
+        # «Breakfast meat as ingredient in omelet» — бекон, ветчина,
+        # колбаски. Наблюдалось на живом плане без свинины.
+        "Egg omelet or scrambled egg, with meat, made with margarine",
+    ])
+    def test_pork_by_composition(self, catalog, dish):
+        assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
+        assert dish not in set(_filter_catalog(catalog, ["pork"])["name"])
+
+    def test_hot_dog_bun_is_not_pork(self, catalog):
+        """«hot dog» целиком унёс бы булочки — в них свинины нет."""
+        assert "Roll, white, hot dog bun" in set(_filter_catalog(catalog, ["pork"])["name"])
+
+    def test_vegetarian_also_excludes_pork_forms(self):
+        assert {"lard", "prosciutto", "hog"} <= set(expand(["vegetarian"]))
+
+
+class TestExclusionByComposition:
+    """Проверка по составу — для ВСЕХ исключений, не только мяса."""
+
+    def test_milk_inside_mashed_potatoes(self, catalog):
+        """Пюре с молоком: в названии молока нет, в рецептуре — есть."""
+        left = set(_filter_catalog(catalog, ["lactose"])["fdc_id"])
+        assert 2709502 in set(catalog["fdc_id"])
+        assert 2709502 not in left
+
+    def test_absent_ingredient_is_not_a_match(self):
+        """«flakes without milk» — честное отсутствие: у ингредиента нет
+        хвоста, под которым что-то спрятано, в отличие от названия блюда.
+
+        2709503 «Potato, mashed, from dry mix»: молоко в составе упомянуто
+        только как «without milk» (сливки там есть, но это не «milk»).
+        """
+        from solver import _dishes_with_ingredient
+
+        assert 2709503 not in _dishes_with_ingredient(to_pattern(["milk"]))
+        # А сливки находятся — проверка по составу работает и тут.
+        assert 2709503 in _dishes_with_ingredient(to_pattern(["cream"]))
 
 
 class TestDescription:

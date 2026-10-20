@@ -114,7 +114,33 @@ CATEGORIES: dict[str, list[str]] = {
              "meringue", "mayonnaise"],
     "sugar": ["sugar", "sugars", "sweetened", "syrup", "candy", "candies",
               "soda", "cola", "soft drink"],
+    # «Не ем свинину». Своя категория, а не слово «pork» как есть: в USDA
+    # свинина чаще названа без него — «Ham», «Bacon», «Hog maws», «Salami».
+    # Пока категории не было, 91 блюдо со свиным словом в названии
+    # проходило мимо exclude=["pork"], и в план попали свиные желудки.
+    # «Turkey bacon» и «Beef sausage» уходят вместе со свининой: беднее
+    # выбор, а не запрет в тарелке.
+    "pork": [
+        "pork", "ham", "hams", "bacon", "hog", "hogs", "pig", "pigs",
+        "lard", "prosciutto", "pancetta", "salami", "pepperoni", "chorizo",
+        "kielbasa", "bratwurst", "mortadella", "chitterlings", "cracklings",
+        "scrapple", "spareribs", "pupusas del cerdo",
+        "boar",
+        # Мясо неуказанного вида — для того, кто не ест свинину, это риск,
+        # а не «наверное, нет». В США мясо к завтраку — бекон, ветчина,
+        # колбаски; жир «animal fat or drippings» — часто сало; мясная
+        # начинка пиццы — пепперони. «Breakfast meat» один стоял в составе
+        # 51 омлета, и «Омлет с мясом» попадал в план без свинины.
+        "breakfast meat", "animal fat or drippings", "pizza meat topping",
+        # Сосиска из неуказанного мяса: в США это обычно свинина с говядиной.
+        # Не «hot dog» целиком — иначе уходят булочки «hot dog bun».
+        "hot dog nfs", "frankfurters or hot dogs",
+    ],
 }
+
+# Вегетарианец не ест и свинину — включая сало и прошутто, которых
+# в его списке раньше не было.
+CATEGORIES["vegetarian"] = sorted(set(CATEGORIES["vegetarian"] + CATEGORIES["pork"]))
 
 # Веган — это вегетарианец плюс молочное, яйца и мёд. Собирается из готовых
 # списков, чтобы не поддерживать одни и те же слова в двух местах.
@@ -189,6 +215,7 @@ ALIASES = {
     "nut": "nuts", "tree nuts": "nuts",
     "fish": "seafood", "shellfish": "seafood",
     "egg": "eggs",
+    "pork products": "pork", "swine": "pork", "pig meat": "pork",
 }
 
 
@@ -200,7 +227,7 @@ def expand(terms: list[str] | None) -> list[str]:
     чем молча выбросить.
 
     >>> expand(["pork", "sweets"])[:3]
-    ['pork', 'candy', 'candies']
+    ['pork', 'ham', 'hams']
     """
     if not terms:
         return []
