@@ -924,6 +924,61 @@ def build_day(
         avoid_ids: блюда, которых в этот день быть не должно (окно
             разнообразия меню, см. ``build_menu``).
     """
+    args = (catalog, targets, exclude, iterations, allow_exotic, template,
+            include, budget, avoid_ids)
+    plan = _build_day_seeded(*args, seed=seed)
+    if all(check_plan(plan).values()):
+        return plan
+
+    # День не прошёл проверки — пересобрать с производными сидами и взять
+    # лучший. На узком каталоге солвер чувствителен к пути поиска: профиль
+    # без свинины, сладкого, мучного и лактозы проваливал 1 сид из 40
+    # (худшее отклонение 6.9%), а после сужения каталога по составу —
+    # 2 из 40 с отклонением 19%, хотя годные дни в том же пуле были.
+    # Это не подстройка допусков: проверки те же, ищем дольше только там,
+    # где первый поиск не нашёл. Детерминизм сохраняется — производные
+    # сиды выводятся из исходного.
+    best = plan
+    for attempt in range(1, RETRY_SEEDS + 1):
+        alternative = _build_day_seeded(*args, seed=_retry_seed(seed, attempt))
+        if _plan_rank(alternative, targets) < _plan_rank(best, targets):
+            best = alternative
+        if all(check_plan(best).values()):
+            break
+    return best
+
+
+# Сколько раз пересобирать день, не прошедший проверки. Подобрано замером
+# (experiments.measure_solver, «с ограничениями» × 40 сидов).
+RETRY_SEEDS = 4
+
+
+def _retry_seed(seed: int, attempt: int) -> int:
+    """Производный сид: свой для каждой попытки и не совпадающий с соседними
+    днями меню (те идут подряд: seed, seed + 1, ...)."""
+    return seed * 1_009 + attempt * 7_919 + 100_003
+
+
+def _plan_rank(plan: DayPlan, targets: Targets) -> tuple[int, float]:
+    """Чем меньше, тем лучше: сначала число непройденных проверок, потом
+    отклонение по калориям."""
+    failed = sum(not passed for passed in check_plan(plan).values())
+    return failed, abs(plan.totals["kcal"] - targets.kcal) / targets.kcal
+
+
+def _build_day_seeded(
+    catalog: pd.DataFrame,
+    targets: Targets,
+    exclude: list[str] | None,
+    iterations: int,
+    allow_exotic: bool,
+    template: list[tuple[str, str, float]] | None,
+    include: list[str] | None,
+    budget: float | None,
+    avoid_ids: set[int] | None,
+    seed: int,
+) -> DayPlan:
+    """Одна попытка build_day: строгий проход, при неудаче — ослабленный."""
     plan = _build_day_once(catalog, targets, exclude, seed, iterations,
                            allow_exotic, template, SLOT_TOLERANCE, include, budget,
                            avoid_ids)

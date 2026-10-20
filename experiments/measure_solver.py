@@ -72,6 +72,15 @@ PROFILES: dict[str, Profile] = {
         exclude=["pork", "sweets", "flour", "lactose"]),
 }
 
+# Сидов сверх общего числа — профилям, где каталог узкий.
+#
+# Шести сидов на них мало: у «с ограничениями» замер показывал 0 провалов,
+# а на 40 сидах тот же код проваливал 1, худшее отклонение 6.9%. После
+# сужения каталога по составу — 2 провала и 19%, при «0 провалов» в замере.
+# Узкий пул делает солвер чувствительным к пути поиска, и хвост
+# распределения виден только на большой выборке.
+EXTRA_SEEDS: dict[str, int] = {"с ограничениями": 40}
+
 # Корень проекта, а не папка пакета: файл лежит в experiments/, и
 # Path(__file__).parent после переезда стал указывать на неё. Точки
 # отсчёта тогда сохраняются в experiments/_research/, рядом с прежними
@@ -86,15 +95,18 @@ def measure(seeds: int) -> dict:
 
     failures = 0
     runs = 0
-    kcal_deviations: list[float] = []
+    # Отклонения — по профилю: иначе 40 сидов одного профиля перевесили бы
+    # остальные пять, и среднее мерило бы его одного.
+    kcal_by_profile: dict[str, list[float]] = {}
     slot_ratios: list[float] = []
     durations: list[float] = []
     broken: list[str] = []
 
     for label, profile in PROFILES.items():
         targets = compute_targets(profile)
+        kcal_deviations = kcal_by_profile.setdefault(label, [])
 
-        for seed in range(seeds):
+        for seed in range(max(seeds, EXTRA_SEEDS.get(label, 0))):
             runs += 1
             started = time.perf_counter()
             try:
@@ -118,10 +130,13 @@ def measure(seeds: int) -> dict:
             for item, share in zip(plan.items, shares, strict=True):
                 slot_ratios.append(item.kcal / (share * targets.kcal))
 
+    per_profile = [statistics.mean(v) for v in kcal_by_profile.values() if v]
     return {
         "runs": runs,
         "failures": failures,
-        "kcal_deviation": statistics.mean(kcal_deviations) if kcal_deviations else 0.0,
+        "kcal_deviation": statistics.mean(per_profile) if per_profile else 0.0,
+        "worst_kcal_deviation": max(
+            (d for v in kcal_by_profile.values() for d in v), default=0.0),
         "worst_slot": max(slot_ratios) if slot_ratios else 0.0,
         "seconds_per_day": statistics.mean(durations) if durations else 0.0,
         "broken": broken,
@@ -135,14 +150,16 @@ def show(result: dict, against: dict | None = None) -> None:
          "{:.0f}", "меньше"),
         ("отклонение ккал", result["kcal_deviation"],
          against and against["kcal_deviation"], "{:.1%}", "меньше"),
+        ("худшее откл. ккал", result["worst_kcal_deviation"],
+         against and against.get("worst_kcal_deviation"), "{:.1%}", "меньше"),
         ("худший слот", result["worst_slot"], against and against["worst_slot"],
          "{:.1f}x", "меньше"),
         ("секунд на день", result["seconds_per_day"],
          against and against["seconds_per_day"], "{:.2f}", "меньше"),
     ]
 
-    print(f"\nПрогонов: {result['runs']} "
-          f"({len(PROFILES)} профилей × {result['runs'] // len(PROFILES)} сидов)\n")
+    extra = ", ".join(f"«{name}» × {count}" for name, count in EXTRA_SEEDS.items())
+    print(f"\nПрогонов: {result['runs']} ({len(PROFILES)} профилей; {extra})\n")
 
     header = f"  {'показатель':<22} {'сейчас':>10}"
     if against:

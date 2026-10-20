@@ -341,3 +341,31 @@ class TestVarietyWindow:
         days_with_liked = sum(
             any(item.fdc_id in liked for item in day.items) for day in menu.days)
         assert days_with_liked >= 4
+
+
+class TestRetryOnFailedChecks:
+    """День, не прошедший проверки, пересобирается с производными сидами.
+
+    Наблюдалось на замере 40 сидов: профиль без свинины, сладкого, мучного
+    и лактозы проваливал калории на сидах 11 (6.9%), а после проверки
+    исключений по полному составу — на 13 и 22 (до 10%). Шесть сидов
+    штатного замера этого не видели. Годные дни в том же пуле были —
+    первый поиск их просто не находил.
+    """
+
+    PROFILE = Profile(sex="male", age=24, height_cm=168, weight_kg=65,
+                      activity="moderate", goal="gain",
+                      exclude=["pork", "sweets", "flour", "lactose"])
+
+    @pytest.mark.parametrize("seed", [11, 13, 22])
+    def test_observed_failures_now_pass(self, catalog, seed):
+        targets = compute_targets(self.PROFILE)
+        plan = build_day(catalog, targets, exclude=self.PROFILE.exclude, seed=seed)
+        assert all(check_plan(plan).values()), check_plan(plan)
+
+    def test_retry_is_deterministic(self, catalog):
+        """Один seed — один план, и с пересборкой тоже."""
+        targets = compute_targets(self.PROFILE)
+        first = build_day(catalog, targets, exclude=self.PROFILE.exclude, seed=13)
+        second = build_day(catalog, targets, exclude=self.PROFILE.exclude, seed=13)
+        assert [i.fdc_id for i in first.items] == [i.fdc_id for i in second.items]
