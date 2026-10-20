@@ -50,6 +50,10 @@ RUN test -f data/processed/foods.parquet \
       || (echo "НЕТ КАТАЛОГА: выполните python foods.py --rebuild до сборки образа" && exit 1)
 RUN test -f data/processed/ingredients.parquet \
       || (echo "НЕТ СОСТАВА: выполните python ingredients.py --rebuild до сборки образа" && exit 1)
+# Без полного состава ограничения проверяются по усечённому — сервис
+# поднимется, а свинина во вложенных рецептурах пройдёт молча.
+RUN test -f data/processed/ingredient_leaves.parquet \
+      || (echo "НЕТ ПОЛНОГО СОСТАВА: выполните python ingredients.py --rebuild-leaves" && exit 1)
 
 # ── Права ─────────────────────────────────────────────────────
 # Сервис смотрит наружу портом, поэтому работает не от root. Вместе

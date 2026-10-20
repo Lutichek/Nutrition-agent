@@ -46,7 +46,14 @@ from pydantic import BaseModel, Field, computed_field
 
 from ingredients import ingredient_dishes
 from prices import cost_per_gram, fallback_cost_per_gram
-from restrictions import matches_words, to_category_pattern, to_pattern
+from restrictions import (
+    NOT_DAIRY,
+    ingredient_terms,
+    is_dairy_term,
+    matches_words,
+    to_category_pattern,
+    to_pattern,
+)
 from targets import Targets
 
 # ────────────────────────────────────────────────────────────
@@ -379,8 +386,12 @@ def _filter_catalog(
         # в «Spanish rice» бекон, в «Bao bun» сало — и ни слова о свинине.
         # Без этого прохода после exclude=["pork"] в подборе оставалось
         # 123 блюда со свининой в рецептуре.
-        if pattern:
-            with_excluded = _dishes_with_ingredient(pattern)
+        #
+        # Только ограничения-ИНГРЕДИЕНТЫ: «мучное», «сладости» и «жареное» —
+        # типы блюд, их знают название и раздел (restrictions.TYPE_CATEGORIES).
+        by_ingredient = ingredient_terms(exclude)
+        if by_ingredient:
+            with_excluded = _dishes_with_ingredient(tuple(sorted(by_ingredient)))
             if with_excluded:
                 usable = usable[~usable["fdc_id"].astype(int).isin(with_excluded)]
 
@@ -388,25 +399,39 @@ def _filter_catalog(
 
 
 @lru_cache(maxsize=256)
-def _dishes_with_ingredient(pattern: str) -> frozenset[int]:
-    """Блюда, в рецептуре которых есть ингредиент, совпавший с выражением.
+def _dishes_with_ingredient(terms: tuple[str, ...]) -> frozenset[int]:
+    """Блюда, в полном составе которых есть ингредиент из ограничений.
+
+    Состав — полный (ingredients.build_leaves): с раскрытыми вложенными
+    рецептурами и следовыми долями, а не тот, что показывается человеку.
 
     ``skip_absent=True`` — в отличие от названий блюд. Ингредиент — один
     продукт, и «Potatoes, mashed, flakes without milk» или «Ice cream,
     no sugar added» честно говорят об отсутствии: спрятать под хвостом
     там нечего. В названии блюда «…; no potatoes, gravy» подлива есть.
 
-    Кэш по выражению: состав неизменен, а фильтр зовут на каждый день меню.
+    Для молочных ограничений растительное «молоко» не считается
+    (restrictions.NOT_DAIRY): «coconut milk» в карри — не лактоза.
+    Вырезается только само словосочетание, остаток названия проверяется:
+    снимать название целиком — значит пропустить «Granola bar, milk
+    chocolate coated, peanut butter» из-за арахисовой пасты.
 
-    Ограничение данных: доли меньше 1% отброшены при сборке состава
-    (ingredients.MIN_SHARE), и следовые количества так не находятся.
+    Кэш по набору ограничений: состав неизменен, а фильтр зовут на каждый
+    день меню.
     """
     index = ingredient_dishes()
     if not index:
         return frozenset()
     names = pd.Series(list(index), dtype=object)
-    hit = names[matches_words(names, pattern, skip_absent=True).to_numpy()]
-    return frozenset().union(*(index[name] for name in hit))
+    without_plant_milk = names.str.replace(NOT_DAIRY, " ", case=False, regex=True)
+
+    found: set[int] = set()
+    for term in terms:
+        searched = without_plant_milk if is_dairy_term(term) else names
+        mask = matches_words(searched, to_pattern([term]), skip_absent=True).to_numpy()
+        for name in names[mask]:
+            found |= index[name]
+    return frozenset(found)
 
 
 def _candidates_by_role(catalog: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:

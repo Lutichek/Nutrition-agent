@@ -37,6 +37,8 @@ lance_db/*
 !data/processed/
 !data/processed/foods.parquet
 !data/processed/ingredients.parquet
+# Полный состав для проверки ограничений (ingredients.build_leaves), 118 КБ.
+!data/processed/ingredient_leaves.parquet
 !data/processed/corpus_index.json
 
 # Сырьё остаётся снаружи: 28 МБ выгрузки USDA и абстрактов PubMed,

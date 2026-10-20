@@ -221,7 +221,6 @@ class TestPorkIsCaughtUnderOtherNames:
     @pytest.mark.parametrize("dish", [
         "Hog maws", "Ham", "Bacon, NS as to type of meat, cooked", "Ham, prosciutto",
         "Pepperoni, NFS", "Salami, NFS", "Chorizo", "Bratwurst",
-        "Frankfurters or hot dogs and sauerkraut",
     ])
     def test_pork_by_name(self, catalog, dish):
         assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
@@ -234,17 +233,26 @@ class TestPorkIsCaughtUnderOtherNames:
         "Spanish rice, fat added",       # бекон
         "Bao bun",                       # свинина и сало
         "Soup, split pea, with meat",    # свиная лопатка
-        # «Breakfast meat as ingredient in omelet» — бекон, ветчина,
-        # колбаски. Наблюдалось на живом плане без свинины.
+        # «Breakfast meat as ingredient in omelet» — вложенная рецептура:
+        # бекон, ветчина, колбаски. Наблюдалось на живом плане без свинины.
         "Egg omelet or scrambled egg, with meat, made with margarine",
+        # Начинка — продукт SR без рецептуры, ловится словом.
+        "Pizza with meat and vegetables, from frozen, thin crust",
     ])
     def test_pork_by_composition(self, catalog, dish):
         assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
         assert dish not in set(_filter_catalog(catalog, ["pork"])["name"])
 
-    def test_hot_dog_bun_is_not_pork(self, catalog):
-        """«hot dog» целиком унёс бы булочки — в них свинины нет."""
-        assert "Roll, white, hot dog bun" in set(_filter_catalog(catalog, ["pork"])["name"])
+    @pytest.mark.parametrize("dish", [
+        "Roll, white, hot dog bun",
+        # «Hot dog, NFS» по рецептуре — «Frankfurter, beef». Угаданное
+        # «сосиска неизвестного мяса = свинина» уносило его зря.
+        "Frankfurters or hot dogs and sauerkraut",
+        "Beef sausage",
+    ])
+    def test_no_pork_stays(self, catalog, dish):
+        """Беднее выбор — это тоже цена: без свинины блюдо остаётся."""
+        assert dish in set(_filter_catalog(catalog, ["pork"])["name"])
 
     def test_vegetarian_also_excludes_pork_forms(self):
         assert {"lard", "prosciutto", "hog"} <= set(expand(["vegetarian"]))
@@ -268,9 +276,144 @@ class TestExclusionByComposition:
         """
         from solver import _dishes_with_ingredient
 
-        assert 2709503 not in _dishes_with_ingredient(to_pattern(["milk"]))
+        assert 2709503 not in _dishes_with_ingredient(("milk",))
         # А сливки находятся — проверка по составу работает и тут.
-        assert 2709503 in _dishes_with_ingredient(to_pattern(["cream"]))
+        assert 2709503 in _dishes_with_ingredient(("cream",))
+
+    def test_trace_amount_is_found(self, catalog):
+        """Сухое молоко в панировке индейки — 0.2% массы.
+
+        Показываемый состав отбрасывает доли меньше 1%: цене они не важны.
+        Аллергику важны: у 42 блюд молочное есть ТОЛЬКО в таких долях.
+        """
+        assert 2706115 in set(catalog["fdc_id"])
+        assert 2706115 not in set(_filter_catalog(catalog, ["lactose"])["fdc_id"])
+
+    def test_cooking_fat_choice_is_not_butter(self, catalog):
+        """«Fat added» — жир на выбор готовящего, а не сливочное масло.
+
+        «Table fat, NFS» у USDA — смесь сливочного масла и маргарина.
+        Раскрыв её, у человека без лактозы теряли 300+ блюд, которые
+        он и так приготовит на растительном масле.
+        """
+        dish = "Potato, roasted, from fresh, peel eaten, fat added, NS as to fat type"
+        assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
+        assert dish in set(_filter_catalog(catalog, ["lactose"])["name"])
+
+
+class TestTypeCategoriesAreNotCheckedByComposition:
+    """«Не ем мучное» — это «не ем хлеб и выпечку», а не «ни ложки муки».
+
+    Проверка по составу у «мучного» уносила тушёную курицу по-мексикански
+    из-за загустителя в соусе, а профиль с четырьмя ограничениями на 40 сидах
+    проваливал 2 дня с отклонением калорий до 19%.
+    """
+
+    def test_flour_thickened_stew_stays(self, catalog):
+        assert "Stewed chicken with tomato-based sauce, Mexican style" in set(
+            _filter_catalog(catalog, ["flour"])["name"])
+
+    def test_bread_still_goes(self, catalog):
+        left = _filter_catalog(catalog, ["flour"])
+        assert not left["name"].str.lower().str.contains(r"\bbread\b", regex=True).any()
+
+    def test_gluten_is_an_ingredient(self, catalog):
+        """Глютен — ингредиент: та же курица с мукой уходит."""
+        assert "Stewed chicken with tomato-based sauce, Mexican style" not in set(
+            _filter_catalog(catalog, ["gluten"])["name"])
+
+
+class TestPlantMilkIsNotDairy:
+    def test_coconut_milk_is_not_lactose(self):
+        """Хаупия — кокосовый пудинг: «milk» в составе только в «coconut milk»."""
+        from solver import _dishes_with_ingredient
+
+        assert 2710316 not in _dishes_with_ingredient(("lactose",))
+
+    def test_dairy_beside_plant_milk_is_still_found(self):
+        """Вырезается словосочетание, а не название целиком: в «Granola bar,
+        milk chocolate coated, peanut butter» молочный шоколад есть."""
+        import pandas as pd
+
+        from restrictions import NOT_DAIRY, matches_words
+
+        name = pd.Series(["Granola bar, soft, milk chocolate coated, peanut butter"],
+                         dtype=object)
+        cleaned = name.str.replace(NOT_DAIRY, " ", case=False, regex=True)
+        assert matches_words(cleaned, to_pattern(["lactose"]), skip_absent=True).iloc[0]
+
+    def test_rice_pudding_with_milk_is_dairy(self):
+        """Слова только соседние: «rice … milk» через запятую — это молоко."""
+        import pandas as pd
+
+        from restrictions import NOT_DAIRY
+
+        assert not pd.Series(["Rice pudding, made with milk"], dtype=object).str.contains(
+            NOT_DAIRY, case=False, regex=True).iloc[0]
+
+
+class TestLeavesAreBuiltFromRawRecipes:
+    """Сборка полного состава на крошечном сырье — без сети и без выгрузки."""
+
+    @pytest.fixture
+    def raw(self, tmp_path):
+        (tmp_path / "input_food.csv").write_text(
+            "fdc_id,sr_description\n"
+            "1,Egg\n1,Breakfast meat\n1,Oil or table fat\n"   # омлет
+            "2,Bacon\n2,Turkey sausage\n"                      # «мясо к завтраку»
+            "3,Butter\n3,Margarine\n"                          # жир на выбор
+            "4,Loop\n5,Loop back\n",                           # цикл 4 → 5 → 4
+            encoding="utf-8",
+        )
+        (tmp_path / "food.csv").write_text(
+            "fdc_id,description\n1,Omelet\n2,Breakfast meat\n3,Oil or table fat\n"
+            "4,Loop back\n5,Loop\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def _leaves(self, raw, monkeypatch, fat_choices=frozenset()):
+        import ingredients
+
+        monkeypatch.setattr(ingredients, "COOKING_FAT_CHOICES", fat_choices)
+        frame = ingredients.build_leaves(raw / "input_food.csv", raw / "food.csv")
+        return {k: set(g["name_en"]) for k, g in frame.groupby("fdc_id")}
+
+    def test_nested_recipe_is_expanded(self, raw, monkeypatch):
+        omelet = self._leaves(raw, monkeypatch)[1]
+        assert {"Breakfast meat", "Bacon", "Turkey sausage"} <= omelet
+
+    def test_fat_choice_is_not_expanded(self, raw, monkeypatch):
+        omelet = self._leaves(raw, monkeypatch, frozenset({"Oil or table fat"}))[1]
+        assert "Oil or table fat" in omelet
+        assert "Butter" not in omelet
+
+    def test_cycle_terminates(self, raw, monkeypatch):
+        loop = self._leaves(raw, monkeypatch)[4]
+        assert loop == {"Loop", "Loop back"}
+
+
+class TestShippedLeavesMatchComposition:
+    """Полный состав в репозитории не разошёлся с показываемым.
+
+    Собирать его заново тесту нечем — сырья в репозитории нет. Но он
+    обязан быть НАДМНОЖЕСТВОМ показываемого: иначе один из двух
+    артефактов собран по другой версии каталога.
+    """
+
+    def test_leaves_cover_shown_composition(self):
+        import pandas as pd
+
+        from ingredients import COMPOSITION_PATH, LEAVES_PATH
+
+        if not LEAVES_PATH.exists():
+            pytest.fail(f"нет {LEAVES_PATH.name}: python ingredients.py --rebuild-leaves")
+        leaves = pd.read_parquet(LEAVES_PATH)
+        shown = pd.read_parquet(COMPOSITION_PATH, columns=["fdc_id", "name_en"])
+        pairs = set(zip(leaves["fdc_id"], leaves["name_en"], strict=True))
+        missing = [p for p in zip(shown["fdc_id"], shown["name_en"], strict=True)
+                   if p not in pairs]
+        assert not missing, f"расхождение: {missing[:3]}"
 
 
 class TestDescription:

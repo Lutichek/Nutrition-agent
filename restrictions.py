@@ -126,15 +126,15 @@ CATEGORIES: dict[str, list[str]] = {
         "kielbasa", "bratwurst", "mortadella", "chitterlings", "cracklings",
         "scrapple", "spareribs", "pupusas del cerdo",
         "boar",
-        # Мясо неуказанного вида — для того, кто не ест свинину, это риск,
-        # а не «наверное, нет». В США мясо к завтраку — бекон, ветчина,
-        # колбаски; жир «animal fat or drippings» — часто сало; мясная
-        # начинка пиццы — пепперони. «Breakfast meat» один стоял в составе
-        # 51 омлета, и «Омлет с мясом» попадал в план без свинины.
-        "breakfast meat", "animal fat or drippings", "pizza meat topping",
-        # Сосиска из неуказанного мяса: в США это обычно свинина с говядиной.
-        # Не «hot dog» целиком — иначе уходят булочки «hot dog bun».
-        "hot dog nfs", "frankfurters or hot dogs",
+        # Мясная начинка замороженной пиццы — продукт справочника SR, а не
+        # блюдо FNDDS: своей рецептуры у неё нет, и раскрыть её нечем
+        # (ingredients.build_leaves). На деле это пепперони и колбаски.
+        #
+        # Других слов «мясо неизвестно какое» тут нет НАМЕРЕННО. Их заменила
+        # рецептура: «Breakfast meat» раскрывается в бекон и ветчину сам,
+        # а угаданный «hot dog, NFS» по рецептуре оказался говяжьей
+        # сосиской — догадка уносила блюда без свинины.
+        "pizza meat topping",
     ],
 }
 
@@ -217,6 +217,47 @@ ALIASES = {
     "egg": "eggs",
     "pork products": "pork", "swine": "pork", "pig meat": "pork",
 }
+
+
+# Категории-ТИПЫ блюд: по составу они не проверяются.
+#
+# «Не ем мучное» — это «не ем хлеб и выпечку», а не «ни ложки муки
+# в соусе»; «сладости» — десерты, а не сахар в маринаде; «жареное» —
+# способ приготовления, его в рецептуре нет вовсе. Тип блюда знают
+# название и раздел справочника. Проверка по составу у них уносила
+# тушёную курицу по-мексикански из-за загустителя, а профиль с четырьмя
+# ограничениями на 40 сидах проваливал 2 дня с отклонением до 19%.
+#
+# Остальное — ингредиенты (свинина, лактоза, глютен, орехи, яйца,
+# морепродукты, отдельные продукты): для них важно именно что ВНУТРИ,
+# вплоть до следовых количеств.
+TYPE_CATEGORIES = frozenset({"sweets", "flour", "fried"})
+
+# Растительное «молоко», «масло», «сливки» — не молочное. При проверке
+# по составу слово «milk» находило «Nuts, coconut milk» в карри,
+# «butter» — «Peanut butter», «cream» — «Cream of wheat».
+# Слова строго СОСЕДНИЕ: «rice … milk» через запятую или «made with»
+# снял бы «Rice pudding, made with milk» — аллерген в тарелке.
+NOT_DAIRY = (
+    r"\b(?:coconut|almond|soy|soya|oat|rice|cashew|hemp)\s+"
+    r"(?:milk|milks|cream|yogurt|beverage)\b|\bsoymilk\b"
+    r"|\b(?:peanut|almond|cashew|cocoa|apple|shea|nut|seed)\s+butter\b"
+    r"|\bcream\s+(?:substitute|of\s+(?:wheat|rice|tartar))\b"
+    r"|\bnon-?dairy\b"
+)
+
+
+def ingredient_terms(terms: list[str] | None) -> list[str]:
+    """Ограничения, которые проверяются по СОСТАВУ блюда — без типов блюд."""
+    return [
+        term for term in (terms or [])
+        if ALIASES.get(term.strip().lower(), term.strip().lower()) not in TYPE_CATEGORIES
+    ]
+
+
+def is_dairy_term(term: str) -> bool:
+    """Раскрывается ли ограничение в молочные слова (lactose, vegan, «milk»…)."""
+    return bool(set(expand([term])) & set(CATEGORIES["lactose"]))
 
 
 def expand(terms: list[str] | None) -> list[str]:

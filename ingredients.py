@@ -50,6 +50,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -57,11 +58,33 @@ from pathlib import Path
 import pandas as pd
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
+
 HERE = Path(__file__).parent
 PROCESSED = HERE / "data" / "processed"
 COMPOSITION_PATH = PROCESSED / "ingredients.parquet"
 
 RAW_INPUT_FOOD = HERE / "data" / "raw" / "usda" / "survey" / "input_food.csv"
+RAW_FOOD = HERE / "data" / "raw" / "usda" / "survey" / "food.csv"
+
+# Полный состав — только для проверки ограничений (см. build_leaves).
+LEAVES_PATH = PROCESSED / "ingredient_leaves.parquet"
+
+# Жир для готовки «на выбор» — НЕ раскрывается в build_leaves.
+#
+# Рецептура такого ингредиента у USDA — смесь вариантов в долях
+# потребления: «Table fat, NFS» = сливочное масло ИЛИ маргарин. Раскрыв
+# её, «может быть» превращаем в «точно есть»: «картофель с добавлением
+# жира» уходил у человека без лактозы из-за масла, которое он и так
+# заменит растительным. Это 300+ блюд и +75% времени подбора дня на
+# профиле с ограничениями.
+#
+# Список, а не правило «не раскрывать NFS»: «NFS» бывает и просто
+# неуточнённым продуктом со всем его составом — «Non-dairy milk, NFS»
+# это миндальное молоко (32 блюда для аллергика на орехи), в «Spaghetti
+# and meatballs dinner, NFS» есть сыр. «Animal fat or drippings» сюда
+# тоже не входит: там сало, и для свинины это не выбор, а риск.
+COOKING_FAT_CHOICES = frozenset({"Oil or table fat, NFS", "Table fat, NFS"})
 
 # Доля ниже этой в состав не идёт. Соль и специи в рецептуре весят десятые
 # доли грамма: в цене они ничего не меняют, а список превращают в простыню.
@@ -117,10 +140,22 @@ def ingredient_dishes(path: Path | None = None) -> dict[str, frozenset[int]]:
     """Название ингредиента → блюда, в составе которых он есть.
 
     Для проверки исключений по составу (solver._filter_catalog). Ключи —
-    около двух тысяч уникальных названий против четырнадцати тысяч строк:
+    несколько тысяч уникальных названий против десятков тысяч строк:
     регулярка гоняется по ним, а не по каждой строке рецептуры.
+
+    Источник — ПОЛНЫЙ состав (``LEAVES_PATH``, см. ``build_leaves``), а не
+    тот, что показывается человеку и идёт в цену: тот обрезан на 1%
+    и не раскрывает вложенные рецептуры. Если полного нет — предупреждение
+    и показываемый состав: проверка беднее, но не выключена.
     """
-    path = path or COMPOSITION_PATH
+    if path is None:
+        path = LEAVES_PATH
+        if not path.exists():
+            logger.warning(
+                "Нет %s — исключения проверяются по усечённому составу. "
+                "Выполните: python ingredients.py --rebuild-leaves", LEAVES_PATH.name,
+            )
+            path = COMPOSITION_PATH
     if not path.exists():
         return {}
     frame = pd.read_parquet(path, columns=["fdc_id", "name_en"])
@@ -128,6 +163,77 @@ def ingredient_dishes(path: Path | None = None) -> dict[str, frozenset[int]]:
         str(name): frozenset(int(i) for i in group["fdc_id"])
         for name, group in frame.groupby("name_en")
     }
+
+
+def build_leaves(raw_path: Path | None = None, food_path: Path | None = None,
+                 keep_ids: set[int] | None = None) -> pd.DataFrame:
+    """Полный состав блюд для проверки ограничений: (fdc_id, name_en).
+
+    Отличия от ``build_shares`` — оба про то, что прячется:
+
+    * **Вложенные рецептуры раскрываются.** 671 ингредиент из 2333 сам
+      является блюдом FNDDS со своим составом. «Breakfast meat as
+      ingredient in omelet» — это чоризо, бекон, ветчина и колбаски,
+      а по одному названию о свинине не сказано ничего. Раскрытие
+      рекурсивное, с защитой от циклов; название самого составного
+      ингредиента тоже остаётся. Исключение — жир «на выбор»
+      (``COOKING_FAT_CHOICES``).
+    * **Порога по доле нет.** Следовые количества не важны цене, но
+      важны аллергику: у 42 блюд молочное и у 41 глютен есть ТОЛЬКО
+      в долях меньше 1%, которые ``build_shares`` отбрасывает.
+
+    Ингредиент находится как блюдо по описанию: в food.csv описания
+    уникальны (5432 из 5432), так что совпадение однозначно.
+    """
+    frame = pd.read_csv(raw_path or RAW_INPUT_FOOD, usecols=["fdc_id", "sr_description"])
+    frame = frame.dropna()
+    foods = pd.read_csv(food_path or RAW_FOOD, usecols=["fdc_id", "description"])
+
+    recipe: dict[int, list[str]] = {
+        int(fdc_id): list(dict.fromkeys(group["sr_description"]))
+        for fdc_id, group in frame.groupby("fdc_id")
+    }
+    as_dish = dict(zip(foods["description"], foods["fdc_id"].astype(int), strict=True))
+
+    def leaves(fdc_id: int, path: frozenset[int]) -> list[str]:
+        found: list[str] = []
+        for name in recipe.get(fdc_id, []):
+            found.append(name)
+            inner = as_dish.get(name)
+            if name in COOKING_FAT_CHOICES:
+                continue
+            if inner is not None and inner in recipe and inner not in path:
+                found += leaves(inner, path | {inner})
+        return found
+
+    ids = sorted(recipe if keep_ids is None else set(recipe) & set(keep_ids))
+    rows = [
+        (fdc_id, name)
+        for fdc_id in ids
+        for name in dict.fromkeys(leaves(fdc_id, frozenset({fdc_id})))
+    ]
+    return pd.DataFrame(rows, columns=["fdc_id", "name_en"])
+
+
+def rebuild_leaves(verbose: bool = True) -> pd.DataFrame:
+    """Собрать полный состав. Модель не нужна — бесплатно и детерминированно."""
+    from foods import load_catalog
+
+    for path in (RAW_INPUT_FOOD, RAW_FOOD):
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Нет {path.name}. Выполните: python data_sources.py --usda"
+            )
+    keep = set(load_catalog()["fdc_id"].astype(int))
+    leaves = build_leaves(keep_ids=keep)
+
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    leaves.to_parquet(LEAVES_PATH, index=False)
+    if verbose:
+        print(f"Полный состав: {leaves['fdc_id'].nunique():,} блюд, "
+              f"{len(leaves):,} строк, {leaves['name_en'].nunique():,} названий "
+              f"→ {LEAVES_PATH}")
+    return leaves
 
 
 def build_shares(raw_path: Path | None = None,
@@ -256,12 +362,20 @@ def rebuild(verbose: bool = True) -> pd.DataFrame:
     shares.to_parquet(COMPOSITION_PATH, index=False)
     if verbose:
         print(f"Сохранено → {COMPOSITION_PATH}")
+
+    # Вместе с показываемым составом — всегда: два артефакта из одного
+    # сырья не должны разойтись, иначе ограничения проверяются по одной
+    # версии каталога, а человеку показывается другая.
+    rebuild_leaves(verbose=verbose)
     return shares
 
 
 def main() -> None:
     if "--rebuild" in sys.argv[1:]:
         rebuild()
+        return
+    if "--rebuild-leaves" in sys.argv[1:]:
+        rebuild_leaves()
         return
 
     composition = load_composition()
