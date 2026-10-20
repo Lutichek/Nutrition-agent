@@ -28,5 +28,17 @@ services:
     tmpfs:
       - /tmp
 
+    # Журнал чата — единственное, что пишется на диск. Отдельный том:
+    # переживает пересоздание контейнера, остальная система остаётся
+    # только на чтение. Файлы старше 30 дней сервис удаляет сам.
+    # Забрать журналы: docker compose cp nutrition-agent:/app/logs ./logs
+    volumes:
+      - chat_logs:/app/logs
+    environment:
+      CHAT_LOG_DIR: /app/logs
+
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  chat_logs:

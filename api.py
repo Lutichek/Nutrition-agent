@@ -46,6 +46,7 @@ from agent import (
     build_agent,
     for_reader,
 )
+from chat_log import ChatLog, turn_record
 from export import menu_to_xlsx
 from foods import load_catalog
 from providers import get_clients
@@ -277,7 +278,14 @@ async def lifespan(app: FastAPI):
     _state["agent"] = build_agent(llm_client, model=model, embed_client=embed_client)
     _state["sessions"] = SessionStore()
     _state["menus"] = MenuStore()
+    _state["chat_log"] = ChatLog.from_env()
 
+    chat_log = _state["chat_log"]
+    logger.info(
+        "Журнал чата: %s",
+        f"{chat_log.directory}, хранится {chat_log.retention_days} дн."
+        if chat_log.enabled else "выключен",
+    )
     logger.info(
         "Готово за %.1f с: %d блюд, %d чанков",
         time.perf_counter() - started,
@@ -316,6 +324,11 @@ def get_menus() -> MenuStore:
 
 def get_catalog():
     return _state["catalog"]
+
+
+def get_chat_log() -> ChatLog:
+    # Без прогрева (тесты) журнал выключен: на диск никто не пишет.
+    return _state.get("chat_log") or ChatLog(None)
 
 
 # ────────────────────────────────────────────────────────────
@@ -455,6 +468,7 @@ def post_chat(
     agent: NutritionAgent = Depends(get_agent),
     sessions: SessionStore = Depends(get_sessions),
     menus: MenuStore = Depends(get_menus),
+    chat_log: ChatLog = Depends(get_chat_log),
 ) -> ChatResponse:
     """Реплика в разговоре с агентом.
 
@@ -464,15 +478,36 @@ def post_chat(
     """
     session_id, state = sessions.get_or_create(request.session_id)
     started = time.perf_counter()
+    # Номер реплики в разговоре — до ответа: при сбое история не растёт.
+    turn = len(state.history) // 2 + 1
+
+    def elapsed_ms() -> int:
+        return int((time.perf_counter() - started) * 1000)
 
     try:
         answer = agent.run(request.message, state=state)
-    except RuntimeError as error:
-        # Провайдер не ответил даже после ретраев — это внешний сбой, 502.
-        logger.error("Провайдер недоступен: %s", error)
-        raise HTTPException(status_code=502, detail="Модель недоступна, попробуйте позже") from error
+    except Exception as error:
+        # Сбой пишется в журнал ВМЕСТЕ с репликой: по одной трассировке
+        # в логе uvicorn не понять, на какой фразе агент упал.
+        chat_log.write(turn_record(
+            session_id=session_id, turn=turn, message=request.message,
+            elapsed_ms=elapsed_ms(), error=error,
+        ))
+        if isinstance(error, RuntimeError):
+            # Провайдер не ответил даже после ретраев — это внешний сбой, 502.
+            logger.error("Провайдер недоступен: %s", error)
+            raise HTTPException(
+                status_code=502, detail="Модель недоступна, попробуйте позже"
+            ) from error
+        raise
 
     sources = _collect_sources(agent, answer)
+    shown = for_reader(answer.answer)
+    chat_log.write(turn_record(
+        session_id=session_id, turn=turn, message=request.message,
+        answer=answer, shown=shown, sources=[source.pmid for source in sources],
+        elapsed_ms=elapsed_ms(),
+    ))
 
     menu_url = None
     if answer.menu is not None:
@@ -482,7 +517,7 @@ def post_chat(
     return ChatResponse(
         session_id=session_id,
         # Номера PMID вырезаются из текста: статьи человек видит в sources.
-        answer=for_reader(answer.answer),
+        answer=shown,
         sources=sources,
         profile=state.profile,
         menu_url=menu_url,

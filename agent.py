@@ -55,9 +55,11 @@ from __future__ import annotations
 
 import json
 import logging
+import operator
 import re
 import time
-from typing import Any, Literal, TypedDict
+from contextvars import ContextVar
+from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
@@ -79,6 +81,19 @@ from targets import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Ответы модели внутри текущего узла графа — для журнала чата.
+#
+# Пишется в _complete, собирается обёрткой узла (_traced). Через контекст,
+# а не через self: агент один на весь сервис, и реплики разных людей идут
+# в соседних потоках. Вне графа (скрипты замеров) переменная пуста,
+# и _complete ничего не копит.
+_LLM_CALLS: ContextVar[list[dict] | None] = ContextVar("_LLM_CALLS", default=None)
+
+# Сколько символов ответа модели хранить в журнале. Нужное для разбора —
+# JSON маршрутизатора и профиля — укладывается в сотни символов; длинные
+# ответы генерации и так лежат в записи целиком полем answer.
+TRACE_RESPONSE_CHARS = 2000
 
 
 # Признаки того, что деньги кончились НАСОВСЕМ и повторять бессмысленно.
@@ -186,6 +201,11 @@ class RAGAgentAnswer(BaseModel):
     plan_targets: Any = None
     cycled: Any = None
 
+    # Что агент понял по дороге к ответу — для журнала чата (chat_log.py).
+    # Из model_dump исключено: сохранённые ответы для метрик остаются
+    # в прежнем формате и не разрастаются служебным.
+    trace: dict | None = Field(default=None, exclude=True)
+
 
 class ConversationState(BaseModel):
     """Память одного разговора: накопленный профиль и история реплик.
@@ -241,6 +261,10 @@ class AgentState(TypedDict, total=False):
     refine_count: int
 
     answer: str
+
+    # Пройденные узлы: время и ответы модели в каждом. Копится сложением
+    # (operator.add), а не перезаписью — каждый узел дописывает свою строку.
+    trace: Annotated[list[dict], operator.add]
 
 
 # ────────────────────────────────────────────────────────────
@@ -1029,13 +1053,25 @@ class NutritionAgent:
             kwargs["response_format"] = {"type": "json_object"}
 
         last_error: Exception | None = None
+        calls = _LLM_CALLS.get()
+        started = time.perf_counter()
 
         for attempt in range(self.max_retries):
             try:
                 response = self.client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content or ""
+                content = response.choices[0].message.content or ""
+                if calls is not None:
+                    calls.append({
+                        "response": content[:TRACE_RESPONSE_CHARS],
+                        "attempts": attempt + 1,
+                        "seconds": round(time.perf_counter() - started, 2),
+                    })
+                return content
             except Exception as error:
                 last_error = error
+                if calls is not None:
+                    calls.append({"error": f"{type(error).__name__}: {error}"[:500],
+                                  "attempt": attempt + 1})
 
                 # Кончились деньги или квота — повторять бессмысленно.
                 # Баланс не пополнится за четыре секунды паузы, а каждая
@@ -1659,24 +1695,49 @@ class NutritionAgent:
     # ------------------------------------------------------------------
     # Сборка графа
     # ------------------------------------------------------------------
+    @staticmethod
+    def _traced(name: str, node):
+        """Обернуть узел: записать в trace его время и ответы модели в нём.
+
+        Ответ модели — главное для разбора тихих багов: «include=["protein"]»
+        отсеивается дальше по коду, и по итоговому профилю его уже не видно.
+        """
+        def wrapper(state: AgentState) -> AgentState:
+            token = _LLM_CALLS.set([])
+            started = time.perf_counter()
+            try:
+                update = node(state) or {}
+            finally:
+                calls = _LLM_CALLS.get() or []
+                _LLM_CALLS.reset(token)
+            step = {"node": name, "seconds": round(time.perf_counter() - started, 2)}
+            if calls:
+                step["llm"] = calls
+            return {**update, "trace": [step]}
+
+        return wrapper
+
     def _build_graph(self):
         builder = StateGraph(AgentState)
+        nodes = {
+            "classify": self._node_classify,
+            "off_topic": self._node_off_topic,
+            "red_flag": self._node_red_flag,
 
-        builder.add_node("classify", self._node_classify)
-        builder.add_node("off_topic", self._node_off_topic)
-        builder.add_node("red_flag", self._node_red_flag)
+            "extract_profile": self._node_extract_profile,
+            "ask_profile": self._node_ask_profile,
+            "make_plan": self._node_make_plan,
+            "explain_plan": self._node_explain_plan,
 
-        builder.add_node("extract_profile", self._node_extract_profile)
-        builder.add_node("ask_profile", self._node_ask_profile)
-        builder.add_node("make_plan", self._node_make_plan)
-        builder.add_node("explain_plan", self._node_explain_plan)
-
-        builder.add_node("rewrite", self._node_rewrite)
-        builder.add_node("retrieve", self._node_retrieve)
-        builder.add_node("grade", self._node_grade)
-        builder.add_node("refine", self._node_refine)
-        builder.add_node("generate", self._node_generate)
-        builder.add_node("cannot_answer", self._node_cannot_answer)
+            "rewrite": self._node_rewrite,
+            "retrieve": self._node_retrieve,
+            "grade": self._node_grade,
+            "refine": self._node_refine,
+            "generate": self._node_generate,
+            "cannot_answer": self._node_cannot_answer,
+        }
+        for name, node in nodes.items():
+            builder.add_node(name, self._traced(name, node))
 
         builder.set_entry_point("classify")
 
@@ -1786,6 +1847,31 @@ class NutritionAgent:
 
         menu = final_state.get("menu")
 
+        # Достаточно, чтобы повторить план без модели: числа считает
+        # детерминированный код, и профиль + seed + days дают то же меню
+        # до блюда (chat_log.replay_plan). Через /plan и /menu — НЕ то же:
+        # они не учитывают пожелания, бюджет и тренировочные дни.
+        trace = {
+            "intent": final_state.get("intent"),
+            "red_flag": final_state.get("red_flag") or None,
+            "missing": final_state.get("missing") or None,
+            "profile": final_state.get("profile"),
+            "days": final_state.get("days"),
+            "seed": self.seed,
+            "model": self.model,
+            "search_query": final_state.get("search_query"),
+            "refine_count": final_state.get("refine_count"),
+            "chunks": [
+                {"doc_id": int(c["doc_id"]), "chunk_id": int(c["chunk_id"]),
+                 "distance": round(float(c.get("distance", 0.0)), 4)}
+                for c in chunks
+            ] or None,
+            "checks": final_state.get("checks"),
+            "plan_days": [[item.fdc_id for item in day.items] for day in menu.days]
+            if menu is not None else None,
+            "nodes": final_state.get("trace") or [],
+        }
+
         return RAGAgentAnswer(
             dataset_row_id=dataset_row_id,
             answer=answer,
@@ -1796,6 +1882,7 @@ class NutritionAgent:
             cycled=final_state.get("cycled"),
             menu=menu,
             menu_days=len(menu.days) if menu is not None else 0,
+            trace=trace,
         )
 
     def reset(self) -> None:
