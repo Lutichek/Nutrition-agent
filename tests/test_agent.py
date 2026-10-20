@@ -808,3 +808,28 @@ class TestCitationsHiddenFromReader:
             chunks=fake_chunks,
         )
         assert "PMID" in agent.run("Сколько белка?").answer
+
+
+class TestQuestionInPlanBranchIsAnswered:
+    """Вопрос, пришедший в ветку плана, должен дойти до объяснения.
+
+    Наблюдалось в журнале чата: после показанного плана «Сколько белка
+    нужно при похудении?» маршрутизатор стабильно отдаёт в plan (цель уже
+    известна — читается как «посчитай под меня»). Промпт объяснения
+    реплики не видел, и человек получал тот же план повторно, без единого
+    слова о белке.
+    """
+
+    def test_explain_prompt_sees_the_question(self, catalog):
+        agent = make_agent(
+            catalog,
+            script={
+                "маршрутизатор": classify_as("plan"),
+                "Извлеки параметры": json.dumps(FULL_PROFILE),
+                "Объясни человеку": "Вам нужно 107 г белка.",
+            },
+        )
+        agent.run("Сколько белка нужно при похудении?")
+        explain = [p for p in agent.client.calls if "Объясни человеку" in p]
+        assert explain, "ветка плана не дошла до объяснения"
+        assert "Сколько белка нужно при похудении?" in explain[0]
