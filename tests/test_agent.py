@@ -838,3 +838,52 @@ class TestQuestionInPlanBranchIsAnswered:
         explain = [p for p in agent.client.calls if "Объясни человеку" in p]
         assert explain, "ветка плана не дошла до объяснения"
         assert "Сколько белка нужно при похудении?" in explain[0]
+
+
+class TestPersonalNormsInQuestionBranch:
+    """Ветка вопросов знает расчёт нормы, если профиль собран.
+
+    Наблюдалось: после плана «А почему так мало углеводов?» уходило в
+    вопросы, и ответ был о низкоуглеводных диетах вообще. Без профиля
+    промпт обязан совпадать с прежним до байта — на нём сняты все метрики
+    оценки, а там профиля нет.
+    """
+
+    SCRIPT = {
+        "маршрутизатор": classify_as("question"),
+        "has_relevant": '{"has_relevant": true, "keep": [1, 2]}',
+        "ассистент по питанию. Ответь": "ответ",
+    }
+
+    def _generate_prompt(self, agent):
+        return [p for p in agent.client.calls if "ассистент по питанию. Ответь" in p][0]
+
+    def test_prompt_unchanged_without_profile(self, catalog, fake_chunks):
+        from agent import ANSWER_PROMPTS, FRAGMENTS_HEADER
+
+        agent = make_agent(catalog, script=self.SCRIPT, chunks=fake_chunks)
+        agent.run("Сколько белка?")
+        prompt = self._generate_prompt(agent)
+        template = ANSWER_PROMPTS[agent.answer_style]
+        # Блок вставляется ТОЛЬКО перед заголовком фрагментов, поэтому всё
+        # до него обязано совпасть с шаблоном буквально.
+        expected_head = template.split(FRAGMENTS_HEADER)[0].format(question="Сколько белка?")
+        assert prompt.split(FRAGMENTS_HEADER)[0] == expected_head
+
+    def test_complete_profile_adds_computed_norms(self, catalog, fake_chunks):
+        from targets import Profile, compute_targets
+
+        agent = make_agent(catalog, script=self.SCRIPT, chunks=fake_chunks)
+        agent.profile.update(FULL_PROFILE)
+        agent.run("А почему так мало углеводов?")
+        prompt = self._generate_prompt(agent)
+        carbs = round(compute_targets(Profile(**FULL_PROFILE)).carb_g)
+        assert "Его норма" in prompt
+        assert str(carbs) in prompt, "в промпт должны попасть числа из targets.py"
+
+    def test_incomplete_profile_is_not_guessed(self, catalog, fake_chunks):
+        """Без активности норма считалась бы по умолчанию — это домысел."""
+        agent = make_agent(catalog, script=self.SCRIPT, chunks=fake_chunks)
+        agent.profile.update({k: v for k, v in FULL_PROFILE.items() if k != "activity"})
+        agent.run("А почему так мало углеводов?")
+        assert "Его норма" not in self._generate_prompt(agent)
