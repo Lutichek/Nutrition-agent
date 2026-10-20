@@ -44,6 +44,7 @@ from agent import (
     ConversationState,
     NutritionAgent,
     build_agent,
+    for_reader,
 )
 from export import menu_to_xlsx
 from foods import load_catalog
@@ -480,7 +481,8 @@ def post_chat(
 
     return ChatResponse(
         session_id=session_id,
-        answer=answer.answer,
+        # Номера PMID вырезаются из текста: статьи человек видит в sources.
+        answer=for_reader(answer.answer),
         sources=sources,
         profile=state.profile,
         menu_url=menu_url,

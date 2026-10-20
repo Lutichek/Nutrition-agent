@@ -13,7 +13,7 @@ import json
 import pytest
 from conftest import FakeLLMClient, FakeRetriever
 
-from agent import NutritionAgent, parse_json_response
+from agent import NutritionAgent, for_reader, parse_json_response
 
 
 def make_agent(catalog, script=None, chunks=None, **kwargs) -> NutritionAgent:
@@ -761,3 +761,50 @@ class TestRecompositionIsRecognised:
         agent.run("Мужчина, 24, 167 см, 65 кг, тренируюсь 3 раза в неделю, "
                   "мягкая рекомпозиция")
         assert agent.profile["goal"] == "recomp"
+
+
+class TestCitationsHiddenFromReader:
+    """Номера PMID нужны модели, а не человеку.
+
+    Промпт велит ссылаться номером PMID — иначе модель пишет «[1][2]».
+    Человек же статьи видит карточками под ответом, и голые номера в тексте
+    для него шум. Формы ниже — все, что встретились в 840 сохранённых ответах.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "shown"),
+        [
+            ("Белка нужно больше [PMID 111].", "Белка нужно больше."),
+            ("Так [PMID 111], [PMID 222]. Дальше", "Так. Дальше"),
+            ("Так [PMID 111][PMID 222].", "Так."),
+            ("Это взято из статьи с PMID 111.", "Это взято из статьи."),
+        ],
+    )
+    def test_inline_citations_removed(self, raw, shown):
+        assert for_reader(raw) == shown
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            "Использованные PMID: 111, 222.",
+            "Использованные PMID: [PMID 111], [PMID 222].",
+            "Использованные PMID: [PMID 111]",
+        ],
+    )
+    def test_sources_line_dropped_whole(self, tail):
+        """От «Использованные PMID: …» не должна оставаться пустая подпись."""
+        raw = f"Ответ [PMID 111].\n\nПомните про врача. \n\n{tail} "
+        assert for_reader(raw) == "Ответ.\n\nПомните про врача."
+
+    def test_agent_answer_keeps_pmid(self, catalog, fake_chunks):
+        """Вырезается только при показе: по сырому ответу считаются метрики."""
+        agent = make_agent(
+            catalog,
+            script={
+                "маршрутизатор": classify_as("question"),
+                "has_relevant": '{"has_relevant": true, "keep": [1, 2]}',
+                "ассистент по питанию. Ответь": "Ответ [PMID 111].",
+            },
+            chunks=fake_chunks,
+        )
+        assert "PMID" in agent.run("Сколько белка?").answer

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sys
 
-from agent import build_agent
+from agent import build_agent, for_reader
 from providers import get_clients
 
 # Сценарий подобран так, чтобы задеть каждую ветку графа: уточнение профиля,
@@ -50,7 +50,7 @@ def main() -> None:
         answer = agent.run(message, verbose=True)
 
         print()
-        print(f"АГЕНТ: {answer.answer}")
+        print(f"АГЕНТ: {for_reader(answer.answer)}")
         print()
 
     print("=" * 78)

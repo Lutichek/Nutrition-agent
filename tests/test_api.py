@@ -156,6 +156,17 @@ class TestChatEndpoint:
         body = client.post("/chat", json={"message": "Сколько белка?"}).json()
         assert all(source["pmid"] for source in body["sources"])
 
+    def test_answer_hides_pmid_but_keeps_sources(self, client):
+        """Номер PMID человеку не говорит ничего: в тексте его быть не должно.
+
+        Статьи при этом никуда не деваются — они приходят карточками
+        в ``sources``, собранными из найденных фрагментов, а не из текста.
+        """
+        body = client.post("/chat", json={"message": "Сколько белка?"}).json()
+        assert "PMID" not in body["answer"]
+        assert body["answer"] == "Белка нужно больше."
+        assert len(body["sources"]) == 2
+
     def test_session_is_reused(self, client):
         first = client.post("/chat", json={"message": "Привет"}).json()
         second = client.post(
