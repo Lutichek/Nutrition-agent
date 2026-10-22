@@ -208,6 +208,10 @@ uv sync
 cp .env.example .env        # и вписать POLZA_AI_API_KEY
 ```
 
+Тесты и линтер запускайте через `uv run --extra dev pytest` и
+`uv run --extra dev ruff check .` (или `make test`, `make lint`). Обычный
+`uv run` убирает dev-зависимости из окружения, и pytest пропадает.
+
 Каталог блюд и справочник статей уже лежат в репозитории, но векторный
 индекс надо собрать — он весит 44 МБ и в git не идёт:
 

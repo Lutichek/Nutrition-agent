@@ -9,6 +9,12 @@
 
 PY := python
 
+# Инструменты разработки — только через --extra dev. Обычный `uv run`
+# синхронизирует окружение по умолчанию и УДАЛЯЕТ pytest и ruff, если
+# они ставились `uv sync --extra dev`: после любого `uv run python ...`
+# `pytest` молча пропадал, и прогоны жаловались «нет pytest в .venv».
+DEV := uv run --extra dev
+
 help:  ## Показать этот список
 	@grep -E '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
@@ -22,13 +28,13 @@ run:  ## Поднять сервис на http://127.0.0.1:8000
 	uvicorn api:app --host 127.0.0.1 --port 8000
 
 test:  ## Прогнать тесты (сеть не нужна)
-	$(PY) -m pytest -q
+	$(DEV) pytest -q
 
 lint:  ## Линтер
-	ruff check .
+	$(DEV) ruff check .
 
 fix:  ## Линтер с автоисправлением
-	ruff check . --fix
+	$(DEV) ruff check . --fix
 
 metrics:  ## Метрики качества RAG по сохранённым ответам
 	$(PY) run_eval.py --metrics
