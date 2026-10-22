@@ -282,3 +282,48 @@ class TestCheapEndAfterSkillAudit:
     def test_chips_are_not_priced_as_potatoes(self):
         grams = 1000
         assert cost_of(grams, "Snacks, potato chips, plain, salted") >= 300
+
+
+class TestSecondCheapEndScan:
+    """Второй скан дешёвого конца — по просьбе «цены выглядят слишком дёшево».
+
+    Пять разных ошибок, каждая со своей причиной; в бюджетных планах
+    брюссельская капуста по 31 ₽/кг стояла в 3 днях из 20.
+    """
+
+    @pytest.mark.parametrize(("ingredient", "key"), [
+        # «vegetable» стоит раньше «oil»: масло в 777 рецептурах шло
+        # по цене замороженных овощей — 373 вместо 158 ₽/кг.
+        ("Vegetable oil, NFS", "растительное масло"),
+        # Сухая лапша быстрого приготовления — не готовый суп.
+        ("Soup, ramen noodle, any flavor, dry", "лапша быстрого приготовления"),
+        # Капуста других сортов — не по цене белокочанной.
+        ("Brussels sprouts, raw", "замороженные овощи"),
+        ("Cabbage, chinese (pak-choi), raw", "капуста пекинская и цветные сорта"),
+        ("Cabbage, red, raw", "капуста пекинская и цветные сорта"),
+        # «…no salt added» — пометка: овощ шёл по цене соли.
+        ("Escarole, cooked, boiled, drained, no salt added", "зелень"),
+        ("Lotus root, cooked, boiled, drained, without salt", "замороженные овощи"),
+    ])
+    def test_key(self, ingredient, key):
+        assert price_key_for(ingredient) == key
+
+    @pytest.mark.parametrize("ingredient", [
+        "Cabbage, green, raw",                                  # белокочанная — как была
+        "Fast foods, potato, french fried in vegetable oil",    # картофель, не масло
+        "Salt, table",
+    ])
+    def test_neighbours_unchanged(self, ingredient):
+        assert price_key_for(ingredient) in {"капуста", "картофель", "соль"}
+
+    def test_dry_mix_is_not_divided_by_cooking_yield(self):
+        """Вода в рецептуре стоит отдельно: делить сухой полуфабрикат ещё
+        и на множитель варки — считать её второй раз (Rice-A-Roni ×3)."""
+        dry = cost_of(1000, "RICE-A-RONI, chicken flavor, unprepared")
+        cooked = cost_of(1000, "Rice, white, long-grain, regular, enriched, cooked")
+        assert dry == pytest.approx(cooked * 3, rel=0.01)
+
+    def test_prepared_from_mix_still_cooked(self):
+        """«made from packaged mix» — уже приготовленное, множитель нужен."""
+        assert cost_of(1000, "Macaroni or noodles with cheese, made from packaged mix") < \
+            cost_of(1000, "Pasta mix, classic beef, unprepared")

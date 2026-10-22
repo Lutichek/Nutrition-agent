@@ -157,6 +157,10 @@ PRICES: dict[str, Price] = {
     "морковь": Price(38.90),
     "лук": Price(40.72),
     "капуста": Price(30.78),
+    # Росстат даёт только белокочанную; пекинская (pak-choi), краснокочанная
+    # и савойская шли по её цене — 31 ₽/кг, втрое дешевле прилавка.
+    # Среднее по рознице: пекинская ~100, красная ~80, савойская ~150.
+    "капуста пекинская и цветные сорта": Price(110.0, derived=True),
     "свёкла": Price(35.02),
     "помидоры": Price(218.56),
     "огурцы": Price(216.63),
@@ -225,6 +229,9 @@ PRICES: dict[str, Price] = {
     "молочный десерт": Price(450.0, derived=True),
     # Солёные снеки: рядом с печеньем, но обычно дороже.
     "снеки": Price(420.0, derived=True),
+    # Лапша быстрого приготовления, СУХАЯ: пачка 60–90 г стоит 30–70 ₽.
+    # Шла по цене готового супа (90 ₽/кг) — суп с рамэном выходил 13 ₽/кг.
+    "лапша быстрого приготовления": Price(500.0, derived=True),
     # Батончики и питание «для спорта» — разброс огромный, цифра самая
     # грубая во всей таблице.
     "батончики": Price(1200.0, derived=True),
@@ -297,6 +304,18 @@ PRIORITY_RULES: list[tuple[str, str]] = [
     # Крекеры — по названию первым словом: «Crackers, saltine (includes
     # oyster, soda…)» иначе уходил в устрицы по слову «oyster» (996 ₽/кг).
     ("печенье", r"^crackers?\b|\brice crackers?\b|\bcrackers?, rice\b"),
+    # Второй скан дешёвого конца (шаг 42):
+    # — «Vegetable oil, NFS» — первым стоит «vegetable», и масло в 777
+    #   рецептурах шло по цене замороженных овощей (373 вместо 158 ₽/кг);
+    #   «french fried in vegetable oil» — картофель, поэтому якорь ^;
+    ("растительное масло", r"^vegetable oil\b"),
+    # — сухая лапша быстрого приготовления — не готовый суп;
+    ("лапша быстрого приготовления", r"\bramen\b.*\b(?:dry|unprepared)\b|instant noodle"),
+    # — капуста других сортов — не по цене белокочанной; брюссельскую
+    #   у нас продают в основном замороженной.
+    ("замороженные овощи", r"brussels sprouts?"),
+    ("капуста пекинская и цветные сорта",
+     r"cabbage, (?:chinese|napa|red|savoy)|pak-?choi|bok choy"),
     ("орехи", r"peanut butter|almond butter|nut butter"),
     ("творог", r"cottage cheese|ricotta"),
     ("печень", r"liver|giblet"),
@@ -407,7 +426,7 @@ PRICE_RULES: list[tuple[str, str]] = [
     ("картофель", r"potato|french fries|hash brown"),
     ("морковь", r"carrot"),
     ("лук", r"onion|leek|shallot"),
-    ("капуста", r"cabbage|coleslaw|sauerkraut|brussels sprout"),
+    ("капуста", r"cabbage|coleslaw|sauerkraut"),
     ("свёкла", r"beet\b|beets\b"),
     ("помидоры", r"tomato"),
     ("огурцы", r"cucumber|pickle"),
@@ -507,8 +526,9 @@ PRICE_RULES: list[tuple[str, str]] = [
     # «Cornmeal mush» состоит из неё и воды, и без правила блюдо выходило
     # по цене воды, то есть практически бесплатным.
     ("мука", r"cornmeal|corn flour|masa\b"),
-    ("замороженные овощи", r"mirepoix|cassava|taro\b|nopales|plantain|yuca\b|jicama"),
-    ("зелень", r"watercress|endive|radicchio|sprouts?\b"),
+    ("замороженные овощи", r"mirepoix|cassava|taro\b|nopales|plantain|yuca\b|jicama|"
+                           r"lotus root"),
+    ("зелень", r"watercress|endive|escarole|radicchio|sprouts?\b"),
     ("сахар", r"frosting|icing|glaze\b|jell(?:y|ies)\b"),
     ("растительное масло", r"table fat|\bfat, NFS\b"),
     ("мороженое", r"frozen novelt|popsicle|\bice pop\b|milkshake|\bshake,"),
@@ -526,7 +546,20 @@ _EXCLUSION_TAIL = re.compile(r",\s*(excludes|excluding|not)\b.*$", re.IGNORECASE
 # в «овсяные хлопья» с множителем 4.5 — тем, что задан для каши на воде, —
 # и стоил 30 ₽/кг вместо примерно семисот. Сухой продукт воды не набирает.
 # Слову «barley» это не мешает: граница слова не даёт совпасть.
-_RAW = re.compile(r"\b(raw|uncooked|dry|dried|fresh|bars?|crisps?)\b", re.IGNORECASE)
+#
+# «unprepared» и «dehydrated» — сухие полуфабрикаты: в рецептуре рядом
+# стоит вода отдельной строкой, и деление на множитель варки считало её
+# второй раз. Rice-A-Roni, макароны с сыром из пакета, фунчоза выходили
+# в 2.4–3 раза дешевле. «mix» сюда НЕ входит: «made from packaged mix» —
+# уже приготовленное.
+_RAW = re.compile(r"\b(raw|uncooked|dry|dried|fresh|bars?|crisps?|unprepared|dehydrated)\b",
+                  re.IGNORECASE)
+
+# «…, without salt», «no salt added» — пометка, а не ингредиент: эскароль
+# и корень лотоса шли по цене соли (22 ₽/кг), потому что больше ничего
+# в названии правила не находили.
+_SALT_TAIL = re.compile(r",?\s*(?:no salt added|without (?:added )?salt|with salt|salt added)\b",
+                        re.IGNORECASE)
 
 # Ниже этой цены продукт считается почти бесплатным. Сюда попадает только
 # водопроводная вода. Такие ингредиенты дают свою стоимость, но не дают
@@ -549,7 +582,7 @@ def _match(text: str) -> str | None:
     там одни и те же две тысячи названий прогоняются тысячи раз.
     Без кэша каждое обращение прогоняет под сотню регулярок.
     """
-    cleaned = _EXCLUSION_TAIL.sub("", text)
+    cleaned = _SALT_TAIL.sub("", _EXCLUSION_TAIL.sub("", text))
 
     for key, pattern in _COMPILED_PRIORITY:
         if pattern.search(cleaned):
