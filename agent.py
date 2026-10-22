@@ -680,17 +680,30 @@ _SOURCES_LINE = re.compile(
 )
 
 
+# Предлог, державшийся только за ссылку: «например, в [PMID 1] и [PMID 2].»
+# давало «например, в.». Снимается вместе с группой; если от оборота
+# осталось голое «например», уходит и оно.
+_PREPOSITION_BEFORE_CITATION = re.compile(
+    r"\s+\b(?:в|во|из|на|по|с|со)(?=\s*[\[(]\s*PMID)", re.IGNORECASE
+)
+_DANGLING_EXAMPLE = re.compile(r",\s*например,?\s*(?=[.;!?])", re.IGNORECASE)
+
+
 def for_reader(text: str) -> str:
     """Ответ в том виде, в каком его читает человек: без номеров PMID."""
     lines = []
     for line in text.split("\n"):
         had_pmid = "PMID" in line.upper()
+        line = _PREPOSITION_BEFORE_CITATION.sub("", line)
         line = _CITATION_GROUP.sub("", line)
         line = _BARE_PMID.sub("", line)
         if had_pmid and _SOURCES_LINE.match(line):
             # От «Использованные PMID: 123, 456» осталась одна подпись.
             continue
         line = re.sub(r"\s+([.,;:!?)])", r"\1", line)
+        if had_pmid:
+            line = _DANGLING_EXAMPLE.sub("", line)
+            line = re.sub(r",([.;!?])", r"\1", line)
         lines.append(re.sub(r"(?<=\S) {2,}", " ", line).rstrip())
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 

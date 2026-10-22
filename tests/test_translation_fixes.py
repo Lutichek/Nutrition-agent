@@ -54,6 +54,26 @@ class TestPlainReplacements:
         assert phrases.index("панировка не съедена") < phrases.index("панировка съедена")
 
 
+class TestFoundBySkillRuns:
+    """Переводы, найденные прогонами навыков в живых планах и подборе."""
+
+    @pytest.mark.parametrize(("name", "broken", "expected"), [
+        # Фруктовый десерт под посыпкой — не чипсы.
+        ("Crisp, apple", "Яблочный чипс", "Яблочный крамбл"),
+        # Пометка опроса «NFS» осталась транслитом.
+        ("Cookie, NFS", "Печенье, НФС", "Печенье"),
+        ("Cereal, O's, NFS", "Завтрак, О, НФС", "Хлопья-колечки"),
+        ("Starfruit, raw", "Звёздный фрукт, сырой", "Карамбола, сырая"),
+    ])
+    def test_repaired(self, name, broken, expected):
+        assert apply(make(name, broken))["name_ru"].iloc[0] == expected
+
+    def test_potato_chips_stay_chips(self):
+        """«чипс» → «крамбл» только для «Crisp,»: чипсы остаются чипсами."""
+        fixed = apply(make("Chips, rice", "Рисовые чипсы"))
+        assert fixed["name_ru"].iloc[0] == "Рисовые чипсы"
+
+
 class TestScopedReplacements:
     """Замены, верные только для конкретных блюд оригинала."""
 
