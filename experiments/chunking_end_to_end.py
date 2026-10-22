@@ -176,7 +176,7 @@ def main() -> None:
     print("ВЕРДИКТ")
     print("=" * 72)
     print(f"Порог приёмки задан до прогона: нижняя граница выше {JUDGE_NOISE_FLOOR:.3f}")
-    print(f"  (собственный шум судьи, см. experiments/judge_noise.py)")
+    print("  (собственный шум судьи, см. experiments/judge_noise.py)")
     print()
     if correctness["значимо"] and correctness["низ"] > JUDGE_NOISE_FLOOR:
         print("МИГРИРОВАТЬ. Прирост дошёл до ответа и превышает погрешность прибора.")

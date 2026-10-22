@@ -206,7 +206,7 @@ def main() -> None:
 
     if "--list" in sys.argv[1:]:
         print("Доступные прогоны:")
-        for name, (answers, metrics, what) in RUNS.items():
+        for name, (_answers, metrics, what) in RUNS.items():
             mark = "" if (RESEARCH_DIR / metrics).exists() else "   (файла нет)"
             print(f"  {name:<10} {what:<28} {metrics}{mark}")
         return

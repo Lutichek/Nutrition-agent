@@ -69,14 +69,14 @@ from evaluation import (
     _recall_ceiling,
     _reciprocal_rank,
 )
+from lance_db import build_vectorstore, open_table, read_all
+from make_eval_dataset import DATASET_PATH
 from measurement import (
     METRIC_COLUMNS,
     QUERIES_PATH,
     RESEARCH_DIR,
     paired_bootstrap,
 )
-from lance_db import build_vectorstore, open_table, read_all
-from make_eval_dataset import DATASET_PATH
 from providers import get_clients
 from retriever import Retriever
 

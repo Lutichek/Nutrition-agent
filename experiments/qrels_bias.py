@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -46,9 +45,9 @@ from tqdm.auto import tqdm
 
 from build_qrels import JUDGE_BATCH, JUDGE_PROMPT, QRELS_PATH, load_qrels
 from evaluation_answers import _judge
-from measurement import METRIC_COLUMNS, RESEARCH_DIR, RUNS_PATH, paired_bootstrap
 from lance_db import open_table, read_all
 from make_eval_dataset import DATASET_PATH
+from measurement import METRIC_COLUMNS, RESEARCH_DIR, RUNS_PATH, paired_bootstrap
 from providers import get_polza_client
 
 # Независимый судья: другое семейство моделей, обучен отдельно.

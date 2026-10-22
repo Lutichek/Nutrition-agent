@@ -251,7 +251,7 @@ def build_shopping_list(menu, catalog=None) -> ShoppingList:
 
     categories: dict[int, str] = {}
     if catalog is not None:
-        categories = dict(zip(catalog["fdc_id"].astype(int), catalog["category"].astype(str)))
+        categories = dict(zip(catalog["fdc_id"].astype(int), catalog["category"].astype(str), strict=True))
 
     merged: dict[int, dict] = {}
     for plan in plans:

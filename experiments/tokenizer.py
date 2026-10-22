@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from agent import Chunk, RAGAgentAnswer
-from build_qrels import QRELS_PATH, load_qrels
+from build_qrels import load_qrels
 from embedder import Embedder
 from evaluation import evaluate
 from lance_db import open_table

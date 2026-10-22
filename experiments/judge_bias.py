@@ -23,7 +23,6 @@ Llama обучена независимо — расхождение с ней �
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import pandas as pd
 
