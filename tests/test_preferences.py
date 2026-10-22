@@ -27,8 +27,8 @@ from agent import (
 from solver import (
     PREFERENCE_SATURATION,
     _preference_penalty,
-    preferred_ids,
     build_day,
+    preferred_ids,
 )
 from targets import Profile, compute_targets
 
