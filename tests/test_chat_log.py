@@ -19,7 +19,7 @@ import agent as agent_module
 import api
 from agent import NutritionAgent
 from api import SessionStore, app
-from chat_log import ChatLog, replay_plan
+from chat_log import ChatLog, dialogues, main, replay_plan
 
 FULL_PROFILE = {
     "sex": "female", "age": 31, "height_cm": 168, "weight_kg": 74,
@@ -174,6 +174,85 @@ class TestRetention:
         assert not old.exists()
         assert recent.exists()
         assert foreign.exists(), "чужие файлы журнал не трогает"
+
+    def test_old_reading_copy_removed_too(self, tmp_path):
+        """Переписка .md — те же вес и диагнозы, что в журнале.
+
+        Не попади она под очистку, срок хранения в 30 дней соблюдался бы
+        только на бумаге: журнал удалён, а его читаемая копия лежит вечно.
+        """
+        today = date.today()
+        old = tmp_path / f"chat-{(today - timedelta(days=31)).isoformat()}.md"
+        recent = tmp_path / f"chat-{(today - timedelta(days=5)).isoformat()}.md"
+        for path in (old, recent):
+            path.write_text("# переписка\n", encoding="utf-8")
+
+        ChatLog(tmp_path, retention_days=30).write({"message": "x"})
+
+        assert not old.exists()
+        assert recent.exists()
+
+
+def _record(session, turn, message, **extra):
+    return {"ts": "2026-10-22T09:37:18+00:00", "session_id": session, "turn": turn,
+            "status": "ok", "elapsed_ms": 1500, "message": message, **extra}
+
+
+class TestDialogues:
+    def test_turns_grouped_by_conversation(self):
+        """В файле реплики разговоров перемешаны по времени — читать
+        надо разговор целиком, иначе второй вопрос оторван от первого."""
+        records = [
+            _record("a", 1, "первый вопрос А", answer="ответ А1"),
+            _record("b", 1, "вопрос Б", answer="ответ Б1"),
+            _record("a", 2, "второй вопрос А", answer="ответ А2"),
+        ]
+        text = dialogues(records)
+
+        assert "Разговоров: 2, реплик: 3" in text
+        first_a, second_a, b = (text.index(s) for s in ("ответ А1", "ответ А2", "ответ Б1"))
+        assert first_a < second_a < b
+
+    def test_shows_what_the_person_saw(self):
+        """Жалуются на показанный текст: в сыром ответе ещё стоят PMID."""
+        record = _record("a", 1, "белок?", answer="Нужно больше [PMID 111].",
+                         shown="Нужно больше.", sources=["111"])
+        text = dialogues([record])
+
+        assert "Нужно больше." in text
+        assert "[PMID 111]" not in text
+        assert "pubmed.ncbi.nlm.nih.gov/111/" in text
+
+    def test_failed_turn_visible_in_place(self):
+        """Реплика со сбоем ответа не имеет — она не должна пропасть молча."""
+        record = _record("a", 1, "белок?", status="error", error="RuntimeError: provider down")
+        text = dialogues([record])
+
+        assert "белок?" in text
+        assert "RuntimeError: provider down" in text
+
+    def test_plan_without_cost_is_not_zero(self):
+        """Стоимость дня бывает None — «не посчитана», а не 0 ₽."""
+        record = _record("a", 1, "план", answer="план готов",
+                         plan={"kcal": 1800, "target_kcal": 1810, "cost": None, "budget": 500})
+        text = dialogues([record])
+
+        assert "1800 из 1810 ккал" in text
+        assert "≈" not in text, "сумма не названа, раз её нет"
+
+    def test_writes_reading_copy_next_to_log(self, tmp_path, capsys):
+        """Копия рядом с журналом: там её найдёт очистка по сроку."""
+        log = tmp_path / "chat-2026-10-22.jsonl"
+        log.write_text(
+            json.dumps(_record("a", 1, "Сколько белка?", answer="1.6 г/кг"), ensure_ascii=False)
+            + "\n{битая строка\n",
+            encoding="utf-8",
+        )
+        main([str(log)])
+
+        copy = tmp_path / "chat-2026-10-22.md"
+        assert "Сколько белка?" in copy.read_text(encoding="utf-8")
+        assert str(copy) in capsys.readouterr().out
 
 
 class TestFromEnv:

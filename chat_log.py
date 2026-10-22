@@ -13,9 +13,13 @@
 Ручки ``/plan`` и ``/menu`` для этого не годятся: пожелания, бюджет
 и тренировочные дни они не учитывают, и план выйдет другим.
 
-Чтение::
+Чтение — переписка «вопрос → ответ» по разговорам::
 
-    jq 'select(.status == "error")' logs/chat-2026-10-20.jsonl
+    uv run --extra dev python chat_log.py            # все журналы → logs/chat-*.md
+    uv run --extra dev python chat_log.py logs/chat-2026-10-20.jsonl
+
+Файл открывается в VS Code, Ctrl+Shift+V — оформленный вид. Таблицей::
+
     pd.read_json("logs/chat-2026-10-20.jsonl", lines=True)
 
 Три правила, каждое — из уже случившегося:
@@ -52,7 +56,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_DIR = Path(__file__).parent / "logs"
 DEFAULT_RETENTION_DAYS = 30
 
-_FILE_RE = re.compile(r"^chat-(\d{4}-\d{2}-\d{2})\.jsonl$")
+# .md — переписка для чтения (``dialogues``): в ней те же вес и диагнозы,
+# поэтому срок хранения у неё общий с журналом.
+_FILE_RE = re.compile(r"^chat-(\d{4}-\d{2}-\d{2})\.(jsonl|md)$")
 
 
 class ChatLog:
@@ -114,7 +120,7 @@ class ChatLog:
     def _cleanup(self, today: date) -> None:
         """Удалить файлы старше срока хранения."""
         border = today - timedelta(days=self.retention_days)
-        for path in self.directory.glob("chat-*.jsonl"):
+        for path in self.directory.glob("chat-*"):
             match = _FILE_RE.match(path.name)
             if not match:
                 continue
@@ -182,3 +188,107 @@ def turn_record(
             traceback.format_exception(type(error), error, error.__traceback__)
         )
     return record
+
+
+def read_records(path: Path) -> list[dict[str, Any]]:
+    """Записи журнала по порядку. Битая строка пропускается, а не роняет чтение."""
+    records = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning("%s:%d — строка не JSON, пропущена", path, number)
+    return records
+
+
+def _local_time(ts: str | None) -> str:
+    if not ts:
+        return "?"
+    try:
+        return datetime.fromisoformat(ts).astimezone().strftime("%H:%M:%S")
+    except ValueError:
+        return ts
+
+
+def _quote(text: str) -> str:
+    return "\n".join(f"> {line}" if line else ">" for line in text.splitlines()) or ">"
+
+
+def dialogues(records: list[dict[str, Any]], title: str = "Журнал чата") -> str:
+    """Переписка в Markdown: разговоры по порядку первой реплики, внутри — по ``turn``.
+
+    Ответ берётся ПОКАЗАННЫЙ (``shown``), а не сырой: человек жалуется
+    на то, что видел. Сбой реплики виден на её месте, а не теряется.
+    """
+    sessions: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        sessions.setdefault(record.get("session_id", "?"), []).append(record)
+
+    lines = [f"# {title}", "", f"Разговоров: {len(sessions)}, реплик: {len(records)}. "
+             "Время местное.", ""]
+    for number, (session_id, turns) in enumerate(sessions.items(), 1):
+        lines += [
+            "---", "",
+            f"## Разговор {number} · {_local_time(turns[0].get('ts'))}",
+            f"`{session_id}`", "",
+        ]
+        for record in sorted(turns, key=lambda r: r.get("turn", 0)):
+            seconds = record.get("elapsed_ms", 0) / 1000
+            intent = (record.get("trace") or {}).get("intent")
+            meta = f"{_local_time(record.get('ts'))}, {seconds:.1f} с"
+            if intent:
+                meta += f", {intent}"
+            lines += [f"### {record.get('turn', '?')}. Вопрос · {meta}", "",
+                      _quote(record.get("message", "")), ""]
+
+            if record.get("status") == "error":
+                lines += [f"**❌ Сбой:** `{record.get('error', 'нет описания')}`", ""]
+                continue
+
+            lines += ["**Ответ:**", "", record.get("shown") or record.get("answer") or "—", ""]
+            plan = record.get("plan")
+            if plan:
+                summary = f"{plan.get('kcal')} из {plan.get('target_kcal')} ккал"
+                if plan.get("cost") is not None:
+                    summary += f", ≈{plan['cost']:.0f} ₽"
+                if plan.get("budget"):
+                    summary += f" при бюджете {plan['budget']:.0f} ₽"
+                lines += [f"*План:* {summary}", ""]
+            sources = record.get("sources") or []
+            if sources:
+                links = ", ".join(
+                    f"[{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)" for pmid in sources
+                )
+                lines += [f"*Источники:* {links}", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Журнал чата → переписка «вопрос → ответ».")
+    parser.add_argument("logs", nargs="*", type=Path,
+                        help="файлы chat-*.jsonl; без аргументов — все из logs/")
+    parser.add_argument("--stdout", action="store_true", help="напечатать, а не писать .md")
+    args = parser.parse_args(argv)
+
+    paths = args.logs or sorted(DEFAULT_DIR.glob("chat-*.jsonl"))
+    if not paths:
+        print(f"Журналов нет в {DEFAULT_DIR}")
+        return
+    for path in paths:
+        text = dialogues(read_records(path), title=f"Журнал чата {path.stem.removeprefix('chat-')}")
+        if args.stdout:
+            print(text)
+        else:
+            # Рядом с журналом, а не где-то ещё: там его найдёт очистка
+            # по сроку хранения, и в git/образ он не попадёт (logs/ закрыт).
+            out = path.with_suffix(".md")
+            out.write_text(text, encoding="utf-8")
+            print(out)
+
+
+if __name__ == "__main__":
+    main()
