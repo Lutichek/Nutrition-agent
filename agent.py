@@ -1561,6 +1561,12 @@ class NutritionAgent:
         if not budget:
             return ""
 
+        # Стоимость не посчитана — так и говорим, а не «уложились»
+        # или «не уложились»: ни то ни другое не известно.
+        if plan.cost is None:
+            return ("⚠️ Проверить бюджет не получилось: для части блюд нет цены, "
+                    "и сумму дня я называть не стану.")
+
         if plan.within_budget:
             left = budget - plan.cost
             text = f"В ваш бюджет уложился: {plan.cost:.0f} ₽ из {budget:.0f} ₽ в день"

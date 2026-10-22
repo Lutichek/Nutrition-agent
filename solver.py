@@ -45,7 +45,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, computed_field
 
 from ingredients import ingredient_dishes
-from prices import cost_per_gram, fallback_cost_per_gram
+from prices import cost_per_gram
 from restrictions import (
     GLUTEN_FREE,
     cautions_for,
@@ -269,15 +269,17 @@ class DayPlan(BaseModel):
 
     @computed_field
     @property
-    def cost(self) -> float:
-        """Во что обходится день, рубли."""
-        return round(day_cost(self.items), 1)
+    def cost(self) -> float | None:
+        """Во что обходится день, рубли. None — у какого-то блюда нет цены."""
+        total = day_cost(self.items)
+        return None if total is None else round(total, 1)
 
     @computed_field
     @property
     def within_budget(self) -> bool | None:
-        """Уложились ли в бюджет. None — бюджета не задавали."""
-        if not self.budget:
+        """Уложились ли в бюджет. None — бюджета не задавали или стоимость
+        посчитать нельзя: «не знаем» не превращается ни в «да», ни в «нет»."""
+        if not self.budget or self.cost is None:
             return None
         return self.cost <= self.budget
 
@@ -361,9 +363,17 @@ def _filter_catalog(
     # Цена отсева невелика: 77 блюд из 4782, не более 3.3% внутри любой
     # роли. Проверено, что ни одна роль не обеднела настолько, чтобы
     # подбор перестал сходиться.
+    #
+    # Без условия «если цены есть»: раньше пустая таблица цен молча
+    # выключала этот отсев, и план собирался из блюд, стоимость которых
+    # никто не знает. Нет цен — это поломка данных, о ней надо сказать.
     priced = cost_per_gram()
-    if priced:
-        usable = usable[usable["fdc_id"].astype(int).isin(priced)]
+    if not priced:
+        raise RuntimeError(
+            "Цены блюд не посчитаны (prices.cost_per_gram пуст) — подбор без цен "
+            "занизил бы стоимость молча. Проверьте ingredients.parquet и prices.py."
+        )
+    usable = usable[usable["fdc_id"].astype(int).isin(priced)]
 
     if exclude:
         # Раскрытие категорий и сборку выражения делает restrictions:
@@ -616,31 +626,35 @@ def _budget_penalty(items: list[MealItem], budget: float | None,
     if not budget or budget <= 0 or not items:
         return 0.0
 
-    # Неопознанное блюдо берём по медиане, а НЕ за ноль: иначе солвер
-    # набивает день тем, чему не нашлось цены.
-    #
-    # Страховка, а не основной механизм: такие блюда отсеиваются ещё
-    # в `_filter_catalog` и до подбора не доходят. Ветка остаётся на
-    # случай плана, собранного в обход фильтра.
-    default = fallback_cost_per_gram()
-    total = sum(costs.get(item.fdc_id, default) * item.grams for item in items)
+    # Блюдо без цены сюда не доходит: `_filter_catalog` его не пускает.
+    # Раньше на этот случай стояла медиана — и блюдо без цены тихо
+    # получало «среднюю» стоимость. Теперь это ошибка: значит, план
+    # собран в обход фильтра, и молчать о таком нельзя. Ноль тем более
+    # нельзя: солвер немедленно набил бы день «бесплатным» (так в рацион
+    # на 60 ₽ однажды попало 169 г жареных раков без цены).
+    unpriced = [item.name for item in items if item.fdc_id not in costs]
+    if unpriced:
+        raise ValueError(f"Блюда без цены в подборе под бюджет: {unpriced[:3]}")
+    total = sum(costs[item.fdc_id] * item.grams for item in items)
     if total <= budget:
         return 0.0
 
     return (total - budget) / budget * BUDGET_WEIGHT
 
 
-def day_cost(items: list[MealItem], costs: dict[int, float] | None = None) -> float:
-    """Во что обходится день, рубли.
+def day_cost(items: list[MealItem], costs: dict[int, float] | None = None) -> float | None:
+    """Во что обходится день, рубли. None — посчитать нельзя.
 
-    Блюдо без цены считается по медиане каталога (fallback_cost_per_gram),
-    а НЕ нулём: иначе день из неопознанных блюд выглядел бы бесплатным.
-    В подбор такие блюда и так не идут (_filter_catalog), медиана —
-    страховка для плана, собранного в обход фильтра.
+    Если хоть у одного блюда нет цены, стоимость дня НЕ называется:
+    ни нулём (день выглядел бы дешевле), ни медианой (число выглядело бы
+    посчитанным, а было бы догадкой). В план такие блюда не идут —
+    `_filter_catalog` их отсекает, — так что None означает план,
+    собранный в обход фильтра, и агент говорит об этом прямо.
     """
     costs = costs if costs is not None else cost_per_gram()
-    default = fallback_cost_per_gram()
-    return sum(costs.get(item.fdc_id, default) * item.grams for item in items)
+    if any(item.fdc_id not in costs for item in items):
+        return None
+    return sum(costs[item.fdc_id] * item.grams for item in items)
 
 
 def _loss(totals: dict[str, float], targets: dict[str, float]) -> float:

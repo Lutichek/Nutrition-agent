@@ -26,7 +26,7 @@ from __future__ import annotations
 import pytest
 
 from agent import NutritionAgent, _budget_from_text
-from prices import cost_per_gram, fallback_cost_per_gram, price_key_for
+from prices import cost_per_gram, price_key_for
 from solver import build_day, build_menu, check_plan, day_cost
 from targets import Profile, compute_targets
 
@@ -134,26 +134,50 @@ class TestUnpricedDishesNeverReachThePlan:
 
 
 class TestUnpricedIsNotFree:
-    """Отсутствие цены — не ноль. Главное правило измерительного слоя."""
+    """Отсутствие цены — не ноль и не медиана. Главное правило измерительного слоя.
 
-    def test_fallback_is_the_catalog_median(self) -> None:
-        """Неопознанное блюдо считается по медиане, а не за ноль.
+    Сначала неопознанное блюдо считали бесплатным, и солвер поставил
+    в рацион на 60 ₽ 169 г жареных раков за ноль рублей. Потом — по медиане:
+    ошибка ушла, но «не знаем» по-прежнему подменялось числом. Теперь блюдо
+    без цены исключается, а стоимость дня с ним не называется вовсе.
+    """
 
-        Наблюдавшийся случай: в подборе под бюджет цена бралась как
-        ``costs.get(fdc_id, 0.0)``. Солвер немедленно нашёл «Раки,
-        жареные» — цены нет, белка 24 г — и поставил 169 г за ноль рублей.
-        Отсутствие оценки превратилось в самую выгодную оценку.
-        """
-        fallback = fallback_cost_per_gram()
-        assert fallback > 0
+    def _plan_with_unpriced(self, catalog, targets):
+        from solver import _make_item
 
-        values = sorted(cost_per_gram().values())
-        assert values[0] < fallback < values[-1]
+        plan = build_day(catalog, targets, seed=0)
+        priced = cost_per_gram()
+        record = catalog[~catalog["fdc_id"].isin(priced)].iloc[0].to_dict()
+        items = [*plan.items, _make_item("snack", record, 1.0)]
+        return plan.model_copy(update={"items": items, "budget": 500.0})
 
-    def test_day_cost_does_not_treat_unknown_as_free(self, catalog, targets) -> None:
+    def test_priced_day_has_a_cost(self, catalog, targets) -> None:
         plan = build_day(catalog, targets, seed=0)
         assert day_cost(plan.items) == pytest.approx(plan.cost, abs=0.5)
         assert plan.cost > 0
+
+    def test_unpriced_dish_makes_cost_unknown(self, catalog, targets) -> None:
+        """Ни ноль, ни медиана: стоимость дня с блюдом без цены — None."""
+        plan = self._plan_with_unpriced(catalog, targets)
+        assert plan.cost is None
+        # «Не знаем» не превращается ни в «уложились», ни в «не уложились».
+        assert plan.within_budget is None
+
+    def test_budget_penalty_refuses_unpriced(self, catalog, targets) -> None:
+        """В подбор под бюджет блюдо без цены попасть не может — а если
+        попало, это обход фильтра, и о нём надо сказать, а не досчитать."""
+        from solver import _budget_penalty
+
+        plan = self._plan_with_unpriced(catalog, targets)
+        with pytest.raises(ValueError, match="без цены"):
+            _budget_penalty(plan.items, 500.0, cost_per_gram())
+
+    def test_agent_does_not_name_unknown_cost(self, catalog, targets) -> None:
+        from agent import NutritionAgent
+
+        note = NutritionAgent._budget_note(self._plan_with_unpriced(catalog, targets), 1)
+        assert "посчитать" in note or "не получилось" in note
+        assert "уложился" not in note
 
 
 class TestPricesTheOptimiserExploited:
