@@ -288,6 +288,15 @@ PRICES: dict[str, Price] = {
 # надо брать по макаронам. Порядок правил в списке остаётся тай-брейком
 # при равной позиции.
 PRIORITY_RULES: list[tuple[str, str]] = [
+    # Снеки по цене сырья — дешёвый конец, найденный прогонами навыков:
+    # в «Snacks, potato chips» первым стоит «potato», и чипсы шли по цене
+    # картофеля (38 ₽/кг), рисовые чипсы — риса (43), кукурузные — овощей.
+    # Подбор под бюджет шёл именно за ними. Шоколадная крошка («chocolate
+    # chips», «Baking chocolate, semisweet chips») — шоколад, не снеки.
+    ("снеки", r"^(?!.*\bchocolate\b).*\bchips?\b|\bcrisps\b"),
+    # Крекеры — по названию первым словом: «Crackers, saltine (includes
+    # oyster, soda…)» иначе уходил в устрицы по слову «oyster» (996 ₽/кг).
+    ("печенье", r"^crackers?\b|\brice crackers?\b|\bcrackers?, rice\b"),
     ("орехи", r"peanut butter|almond butter|nut butter"),
     ("творог", r"cottage cheese|ricotta"),
     ("печень", r"liver|giblet"),
@@ -300,6 +309,15 @@ PRIORITY_RULES: list[tuple[str, str]] = [
     # Котлеты из рыбы и краба — строго перед выпечкой, иначе слово «cake»
     # уносит их в торты.
     ("рыбное филе", r"(?:fish|crab|salmon|tuna)\s+(?:cake|patty|patties)"),
+    # Ракообразные и моллюски были в «рыбе мороженой» (420 ₽/кг). Своей
+    # строки у Росстата нет; ближайшая — креветки. Строго ПОСЛЕ котлет
+    # («Crab cake» — котлета) и с отсевом крабовых палочек из сурими.
+    ("рыба мороженая", r"(?:imitation|surimi).*crab|crab.*(?:imitation|surimi)"),
+    # Границы слова обязательны: без них «scalloped» (картофель
+    # запечённый) уходил в гребешки, 38 → 996 ₽/кг. Устричный соус — соус,
+    # и в USDA он записан наоборот: «Sauce, oyster, ready-to-serve».
+    ("креветки", r"crayfish|crawfish|lobster|\bcrabs?\b|\bscallops?\b|\bmussels?\b|"
+                 r"\bclams?\b|(?<!sauce, )\boysters?\b(?! sauce)"),
     # Выпечка с названием начинки: «Apple pie» — это пирог, а не яблоки.
     # Главное слово снова стоит вторым, и позиция обманывает.
     # «cheesecake» пишется слитно, границы слова внутри нет — отдельной

@@ -174,7 +174,10 @@ class TestPricesTheOptimiserExploited:
         ("Duck, roasted, without skin", "утка"),
         ("Tofu, firm", "тофу"),
         ("Soy nuts", "тофу"),
-        ("Crayfish, fried", "рыба мороженая"),
+        # Сначала раки ушли из «0 ₽» в «рыбу мороженую» (420 ₽/кг) — и всё
+        # равно оставались вдвое дешевле правды (~700). Теперь — креветки,
+        # ближайшая строка Росстата для ракообразных.
+        ("Crayfish, fried", "креветки"),
     ])
     def test_category_is_no_longer_borrowed(self, name: str, expected: str) -> None:
         assert price_key_for(name) == expected

@@ -247,3 +247,38 @@ class TestDayCostIsPlausible:
                 build_menu(catalog, targets, days=7, seed=seed), catalog)
             per_day = shopping.total_cost / 7
             assert 150 < per_day < 3000, f"seed {seed}: {per_day:.0f} ₽ в день"
+
+
+class TestCheapEndAfterSkillAudit:
+    """Дешёвый конец, найденный прогонами навыков nutrition-dev.
+
+    Подбор под бюджет шёл именно за этими блюдами: при бюджете 150 ₽ чипсы
+    или раки стояли в 8 днях из 20, после правки — в 2.
+    """
+
+    @pytest.mark.parametrize(("ingredient", "key"), [
+        # Первым в названии стоит сырьё, и цена бралась по нему.
+        ("Snacks, potato chips, plain, salted", "снеки"),     # было: картофель, 38 ₽/кг
+        ("Snacks, brown rice chips", "снеки"),                # было: рис, 43
+        ("Snacks, corn-based, extruded, chips, plain", "снеки"),
+        ("Rice crackers", "печенье"),
+        ("Crustaceans, crayfish, mixed species, wild, raw", "креветки"),  # было: рыба, 420
+        ("Crustaceans, lobster, northern, raw", "креветки"),
+    ])
+    def test_snacks_and_shellfish(self, ingredient, key):
+        assert price_key_for(ingredient) == key
+
+    @pytest.mark.parametrize(("ingredient", "not_key"), [
+        # Ловушки, вскрытые повторным сканированием после правки:
+        ("Potatoes, scalloped, home-prepared with butter", "креветки"),   # «scalloped»
+        ("Crackers, saltine (includes oyster, soda, soup)", "креветки"),  # oyster crackers
+        ("Sauce, oyster, ready-to-serve", "креветки"),                   # соус, не устрицы
+        ("Crustaceans, crab, alaska king, imitation, made from surimi", "креветки"),
+        ("Baking chocolate, semisweet chips", "снеки"),                  # шоколадная крошка
+    ])
+    def test_lookalikes_stay_out(self, ingredient, not_key):
+        assert price_key_for(ingredient) != not_key
+
+    def test_chips_are_not_priced_as_potatoes(self):
+        grams = 1000
+        assert cost_of(grams, "Snacks, potato chips, plain, salted") >= 300
