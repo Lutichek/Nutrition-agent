@@ -68,7 +68,15 @@ from data_preporation import load_corpus_index
 from foods import load_catalog
 from restrictions import expand, to_pattern
 from shopping import build_shopping_list
-from solver import DayPlan, PlanNotFeasible, preferred_ids, build_menu, check_plan, day_word
+from solver import (
+    DayPlan,
+    PlanNotFeasible,
+    build_menu,
+    check_plan,
+    day_word,
+    plan_cautions,
+    preferred_ids,
+)
 from targets import (
     ACTIVITY_FACTORS,
     ACTIVITY_LABELS,
@@ -1505,6 +1513,10 @@ class NutritionAgent:
         if cost:
             text += cost
 
+        caution = self._caution_note(profile, state.get("menu"), plan)
+        if caution:
+            text += caution
+
         # Сначала — о непонятых пожеланиях, потом предложение назвать новые.
         # Обратный порядок выглядел бы издевательством: «назовите любимые
         # продукты» сразу после «ваш любимый продукт я не нашёл».
@@ -1576,6 +1588,22 @@ class NutritionAgent:
             return ""
 
         return "\n\n" + estimate if estimate else ""
+
+    @staticmethod
+    def _caution_note(profile: Profile, menu: Any, plan: DayPlan) -> str:
+        """Назвать спорные продукты плана: овёс при глютене, желатин при свинине.
+
+        Текстом из кода, а не просьбой к модели: предупреждение об аллергене
+        не должно зависеть от того, вспомнит ли о нём генерация.
+        """
+        days = menu.days if menu is not None else [plan]
+        items = [item for day in days for item in day.items]
+        lines = []
+        for label, text, names in plan_cautions(items, profile.exclude):
+            shown = ", ".join(f"«{name}»" for name in names[:4])
+            more = f" и ещё {len(names) - 4}" if len(names) > 4 else ""
+            lines.append(f"⚠️ {label.capitalize()} в плане: {shown}{more}. {text}.")
+        return "\n\n" + "\n".join(lines) if lines else ""
 
     def _unmatched_note(self, profile: Profile) -> str:
         """Сказать вслух, какие пожелания не удалось выполнить.

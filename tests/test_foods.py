@@ -357,3 +357,11 @@ class TestTranslationReadsLikeFood:
         """«Роти» — лепёшка; замена rotisserie не должна была её задеть."""
         assert catalog["name_ru"].str.contains("чапатти или роти", na=False).any()
 
+
+
+class TestNotEatenHere:
+    def test_burdock_is_not_offered(self, catalog):
+        """«Лопух, вареный» стоял в живом плане: модель сочла его привычным."""
+        burdock = catalog[catalog["name"] == "Burdock, cooked"]
+        assert len(burdock) == 1
+        assert not burdock["mainstream"].iloc[0]

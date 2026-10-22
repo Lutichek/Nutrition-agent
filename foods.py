@@ -110,6 +110,12 @@ EXOTIC_NAME_PATTERN = (
 # все 13 блюд — субпродукты, 12 из них шаблон уже ловил.
 EXOTIC_CATEGORIES = frozenset({"Liver and organ meats"})
 
+# Что у нас не едят, хотя модель (review_familiar.py) пометила привычным.
+# Решение владельца продукта, а не замер: «Лопух, вареный» стоял в живом
+# плане. Здесь, а не правкой familiar_ru в parquet — колонку пишет модель,
+# и при пересборке правка молча откатилась бы.
+NOT_EATEN_HERE_PATTERN = r"^burdock\b"
+
 
 def mark_mainstream(catalog: pd.DataFrame) -> pd.Series:
     """Что солвер может предлагать сам: не дичь, не субпродукт, не служебная
@@ -121,6 +127,7 @@ def mark_mainstream(catalog: pd.DataFrame) -> pd.Series:
     """
     lowered = catalog["name"].str.lower()
     exotic = (lowered.str.contains(EXOTIC_NAME_PATTERN, regex=True, na=False)
+              | lowered.str.contains(NOT_EATEN_HERE_PATTERN, regex=True, na=False)
               | catalog["category"].isin(EXOTIC_CATEGORIES))
     service = lowered.str.contains(SERVICE_RECORD_PATTERN, regex=True, na=False)
     raw_animal = lowered.str.contains(RAW_ANIMAL_PATTERN, regex=True, na=False)

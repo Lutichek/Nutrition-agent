@@ -74,6 +74,32 @@ CATEGORIES: dict[str, list[str]] = {
         "pastries", "tortilla", "tortillas", "pancake", "pancakes",
         "waffle", "waffles", "bagel", "bagels", "muffin", "muffins",
         "pizza", "dumpling", "dumplings", "breaded",
+        # Аудит глютена (навык nutrition-dev): 108 блюд с пшеницей или ячменём
+        # проходили exclude=["gluten"], в планах — 26–30% дней. Пшеница
+        # там, где слова «wheat» нет:
+        # — зерно и изделия под своими именами;
+        "seitan", "bulgur", "semolina", "farina", "spelt", "graham", "panko",
+        "orzo", "lasagna", "ravioli", "tortellini", "gnocchi", "ramen", "udon",
+        "wonton", "wontons", "egg roll", "egg rolls", "potsticker", "potstickers",
+        "biscuit", "biscuits", "croissant", "croissants", "doughnut", "doughnuts",
+        "donut", "donuts", "bun", "buns", "pita", "crepe", "crepes", "pie crust",
+        "pretzel", "pretzels", "crouton", "croutons", "breadstick", "breadsticks",
+        "breading", "batter", "battered", "stuffing", "ice cream cone",
+        "chicken nugget", "chicken nuggets", "kiev",
+        # — солод и пиво (ячмень);
+        "malt", "malted", "beer", "coffee substitute", "cereal grain beverage",
+        "milky way",
+        # — продукты справочника SR без рецептуры: мука или соевый соус
+        #   на пшенице в них по определению, а раскрыть их нечем
+        #   (тот же довод, что у «pizza meat topping» для свинины).
+        #   «Gravy, canned» стоял в 33 блюдах, грибной суп-концентрат — в 18;
+        "gravy", "cream of mushroom", "cheese sauce prepared recipe",
+        "soy sauce", "teriyaki", "hoisin", "lo mein", "chow mein",
+        "fried rice", "hot and sour soup", "surimi", "vermicelli mix",
+        "crunch coating",
+        # Голое «flour» НЕ вписывать: уносит рисовую, кукурузную и
+        # гречневую муку, а пшеничную и так ловит «wheat». «nugget» без
+        # «chicken» уносил «Ice cream bar, stick or nugget».
     ],
     # Вегетарианство: без мяса и рыбы
     "vegetarian": [
@@ -96,7 +122,9 @@ CATEGORIES: dict[str, list[str]] = {
     ],
     "alcohol": [
         "beer", "wine", "vodka", "whiskey", "whisky", "rum", "liqueur",
-        "brandy", "cocktail", "cocktails", "ale", "cider", "champagne",
+        # «hard cider», а не «cider»: в USDA «Apple cider» — яблочный сок
+        # (раздел «Apple juice»), и при халяле он уходил как алкоголь.
+        "brandy", "cocktail", "cocktails", "ale", "hard cider", "champagne",
     ],
     "nuts": [
         "nut", "nuts", "peanut", "peanuts", "almond", "almonds", "walnut",
@@ -142,6 +170,11 @@ CATEGORIES: dict[str, list[str]] = {
 # в его списке раньше не было.
 CATEGORIES["vegetarian"] = sorted(set(CATEGORIES["vegetarian"] + CATEGORIES["pork"]))
 
+# Халяль: без свинины и без алкоголя. Желатин не исключается, а
+# подсвечивается (CAUTIONS): он бывает и свиным, и говяжьим, и рыбным.
+# Без этой категории «halal» искался буквально и не отсекал ничего.
+CATEGORIES["halal"] = sorted(set(CATEGORIES["pork"] + CATEGORIES["alcohol"]))
+
 # Веган — это вегетарианец плюс молочное, яйца и мёд. Собирается из готовых
 # списков, чтобы не поддерживать одни и те же слова в двух местах.
 CATEGORIES["vegan"] = sorted(set(
@@ -178,9 +211,14 @@ CATEGORY_PATTERNS: dict[str, list[str]] = {
         "cheese", "milk", "yogurt", "ice cream", "frozen dairy",
         "dairy drinks", "cream-based", "butter",
     ],
+    # Подстроки «pasta», «noodles», «tortilla» уносили разделы целиком:
+    # «Pasta, noodles, cooked grains» — с единственной в каталоге гречкой,
+    # пшеном и киноа, «Tortilla, corn, other chips» — с кукурузными чипсами.
+    # Пшеничное в этих разделах ловится по названию (pasta, noodle, bulgur,
+    # couscous, barley), поэтому раздел сужен до тех, где глютен — всё.
     "gluten": [
         "bread", "rolls and buns", "bagels", "biscuits", "muffins",
-        "pancakes", "cracker", "tortilla", "pizza", "pasta", "noodles",
+        "pancakes", "cracker", "tortillas", "pizza", "pasta mixed",
         "grain-based", "cookies", "cakes and pies", "doughnut",
         "sandwich", "burger", "burritos", "pretzel", "macaroni",
     ],
@@ -216,7 +254,64 @@ ALIASES = {
     "fish": "seafood", "shellfish": "seafood",
     "egg": "eggs",
     "pork products": "pork", "swine": "pork", "pig meat": "pork",
+    # Формулировки диагноза и «X-free». Незнакомое слово ищется буквально,
+    # и это опасно в обе стороны: «gluten-free» буквально уносил именно
+    # безглютеновое (11 блюд) и оставлял всё остальное, а «celiac»,
+    # «no gluten», «halal», «dairy-free», «nut allergy» не отсекали ничего.
+    "celiac": "gluten", "coeliac": "gluten", "celiac disease": "gluten",
+    "gluten-free": "gluten", "gluten free": "gluten", "no gluten": "gluten",
+    "without gluten": "gluten", "wheat allergy": "gluten",
+    "dairy-free": "lactose", "dairy free": "lactose", "milk allergy": "lactose",
+    "lactose intolerance": "lactose", "no dairy": "lactose",
+    "nut allergy": "nuts", "tree nut allergy": "nuts", "peanut allergy": "peanut",
+    "egg allergy": "eggs", "fish allergy": "seafood", "shellfish allergy": "seafood",
+    "no pork": "pork", "vegetarian diet": "vegetarian", "vegan diet": "vegan",
+    "no alcohol": "alcohol", "alcohol-free": "alcohol",
 }
+
+# ── Исключения из совпадений ─────────────────────────────────
+# Слово категории есть, продукта нет. Вырезается только словосочетание,
+# остаток названия проверяется как обычно (см. NOT_DAIRY ниже).
+#
+# Глютен: рисовая лапша и бумага, кукурузная тортилья — без пшеницы.
+# Лист «Rice noodles» по слову «noodles» уносил 7 блюд пад-тай и фо.
+NOT_GLUTEN = (
+    r"\brice\s+(?:noodles?|paper|vermicelli|crackers?|cakes?)\b"
+    r"|\bcorn\s+tortillas?\b|\btortillas?,\s+corn\b"
+)
+# ── Предупреждения: не исключать, а сказать вслух ────────────
+# Продукт, который при ограничении СПОРЕН, а не запрещён: решает человек,
+# но знать о нём он обязан. Выбор владельца продукта (не кода):
+#
+# * овёс при глютене: сам по себе без глютена, но почти всегда загрязнён
+#   пшеницей; исключать — значит отнять 60 блюд, в основном завтраки;
+# * желатин при отказе от свинины: бывает свиным, говяжьим, рыбным —
+#   по названию не различить.
+#
+# Ключ — категории ограничения (после ALIASES), значение — что искать
+# в полном составе блюда, как назвать по-русски и что сказать.
+CAUTIONS: list[tuple[frozenset[str], str, str, str]] = [
+    (frozenset({"gluten"}), r"\boats?\b|\boatmeal\b|\bgranola\b|\bmuesli\b", "овёс",
+     "Обычный овёс почти всегда загрязнён пшеницей, поэтому при целиакии "
+     "берите овёс и хлопья с маркировкой «без глютена»"),
+    (frozenset({"pork", "halal"}), r"\bgelatin", "желатин",
+     "Желатин бывает свиным или содержит следы свинины. Если это для вас "
+     "важно, выбирайте продукт с говяжьим или рыбным желатином либо "
+     "с маркировкой «халяль»"),
+]
+
+
+def cautions_for(terms: list[str] | None) -> list[tuple[str, str, str]]:
+    """Предупреждения, относящиеся к ограничениям: (что искать, название, текст)."""
+    categories = {ALIASES.get(t.strip().lower(), t.strip().lower()) for t in terms or []}
+    return [(regex, label, text) for keys, regex, label, text in CAUTIONS
+            if keys & categories]
+
+
+# Пометка «gluten free» снимает совпадение со всего названия: «Bread,
+# gluten free» — хлеб, но без глютена. 12 таких блюд уходили по словам
+# bread, pasta, cracker. Только для глютена: для «мучного» это всё равно хлеб.
+GLUTEN_FREE = r"\bgluten[-\s]*free\b"
 
 
 # Категории-ТИПЫ блюд: по составу они не проверяются.
@@ -241,7 +336,13 @@ TYPE_CATEGORIES = frozenset({"sweets", "flour", "fried"})
 NOT_DAIRY = (
     r"\b(?:coconut|almond|soy|soya|oat|rice|cashew|hemp)\s+"
     r"(?:milk|milks|cream|yogurt|beverage)\b|\bsoymilk\b"
-    r"|\b(?:peanut|almond|cashew|cocoa|apple|shea|nut|seed)\s+butter\b"
+    # Ореховая паста — не молочное, только когда название ЕЮ И ЯВЛЯЕТСЯ:
+    # «Peanut butter, smooth», «Nuts, cashew butter». В «Cookie, peanut
+    # butter» и «Chocolate candy, peanut butter filled» вырезанная паста
+    # прятала сливочное масло и молочный шоколад — 8 блюд возвращались
+    # человеку без лактозы.
+    r"|^(?:peanut|almond|cashew|nut|seed|sunflower seed)\s+butter\b"
+    r"|^nuts,\s+\w+\s+butter\b|\b(?:cocoa|shea|apple)\s+butter\b"
     r"|\bcream\s+(?:substitute|of\s+(?:wheat|rice|tartar))\b"
     r"|\bnon-?dairy\b"
 )
@@ -258,6 +359,48 @@ def ingredient_terms(terms: list[str] | None) -> list[str]:
 def is_dairy_term(term: str) -> bool:
     """Раскрывается ли ограничение в молочные слова (lactose, vegan, «milk»…)."""
     return bool(set(expand([term])) & set(CATEGORIES["lactose"]))
+
+
+def is_gluten_term(term: str) -> bool:
+    """Ограничение — глютен (в том числе синонимом), а не «мучное»."""
+    key = term.strip().lower()
+    return ALIASES.get(key, key) == "gluten"
+
+
+def has_exceptions(term: str) -> bool:
+    return is_dairy_term(term) or is_gluten_term(term)
+
+
+def without_exceptions(names: pd.Series, term: str) -> pd.Series:
+    """Названия, в которых вырезаны ложные совпадения для этого ограничения.
+
+    Применяется и к названиям блюд, и к ингредиентам полного состава —
+    в обоих местах «coconut milk» не молоко, а «rice noodles» не пшеница.
+    """
+    out = names.astype(object)
+    if is_dairy_term(term):
+        out = out.str.replace(NOT_DAIRY, " ", case=False, regex=True)
+    if is_gluten_term(term):
+        out = out.where(~out.str.contains(GLUTEN_FREE, case=False, regex=True, na=False), "")
+        out = out.str.replace(NOT_GLUTEN, " ", case=False, regex=True)
+    return out
+
+
+def matches_terms(names: pd.Series, terms: list[str], skip_absent: bool = False) -> pd.Series:
+    """Совпадение с любым из ограничений — с учётом исключений каждого.
+
+    Ограничения без исключений ищутся одним выражением, как раньше,
+    — это быстрее и даёт тот же результат.
+    """
+    hit = pd.Series(False, index=names.index)
+    plain = [t for t in terms if not has_exceptions(t)]
+    if plain and (pattern := to_pattern(plain)):
+        hit |= matches_words(names, pattern, skip_absent=skip_absent)
+    for term in terms:
+        if has_exceptions(term) and (pattern := to_pattern([term])):
+            hit |= matches_words(without_exceptions(names, term), pattern,
+                                 skip_absent=skip_absent)
+    return hit
 
 
 def expand(terms: list[str] | None) -> list[str]:
@@ -282,7 +425,9 @@ def expand(terms: list[str] | None) -> list[str]:
             continue
 
         category = ALIASES.get(term, term)
-        for word in CATEGORIES.get(category, [term]):
+        # [category], а не [term]: синоним может вести и на отдельный продукт
+        # («peanut allergy» → «peanut»), а не только на категорию.
+        for word in CATEGORIES.get(category, [category]):
             if word not in seen:
                 seen.add(word)
                 words.append(word)

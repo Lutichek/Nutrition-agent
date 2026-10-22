@@ -426,3 +426,120 @@ class TestDescription:
 
     def test_empty_is_empty(self):
         assert describe(None) == "" and describe([]) == ""
+
+
+class TestGlutenHiddenSources:
+    """Аудит глютена: 108 блюд с пшеницей или ячменём проходили фильтр.
+
+    Слова «wheat» в их составе нет: подлива из банки, грибной суп-
+    концентрат, ресторанный жареный рис и ло мейн на соевом соусе,
+    панировка, солод, гренки. В планах с exclude=["gluten"] такое блюдо
+    стояло в 26–30% дней.
+    """
+
+    @pytest.mark.parametrize("dish", [
+        "Rice, white, with gravy, NS as to fat",
+        "Beef with mushroom sauce",
+        "Lo mein, meatless",
+        "Rice, fried, with pork",
+        "Chicken kiev",
+        "Caesar salad, with romaine, no dressing",
+        "Milk, malted",
+        "Beer, nonalcoholic",
+        "Light ice cream cone, vanilla, prepackaged",
+    ])
+    def test_hidden_gluten_is_excluded(self, catalog, dish):
+        assert dish in set(catalog["name"]), "блюдо пропало из каталога — тест устарел"
+        assert dish not in set(_filter_catalog(catalog, ["gluten"])["name"])
+
+
+class TestGlutenFreeStays:
+    """Обратная сторона: фильтр глютена уносил безглютеновое.
+
+    Подстрока «noodles» в разделе «Pasta, noodles, cooked grains» — единственную
+    гречку, пшено и киноа; лист «Rice noodles» — пад-тай; «tortilla» —
+    кукурузные чипсы; пометку «gluten free» не видел никто.
+    """
+
+    @pytest.mark.parametrize("dish", [
+        "Buckwheat groats", "Millet", "Quinoa, no added fat", "Rice noodles, cooked",
+        "Pad Thai with chicken", "Corn chips, plain", "Bread, gluten free",
+    ])
+    def test_gluten_free_dish_stays(self, catalog, dish):
+        assert dish in set(_filter_catalog(catalog, ["gluten"])["name"])
+
+    def test_gluten_free_bread_is_still_flour(self, catalog):
+        """«Не ем мучное» — хлеб остаётся хлебом и без глютена."""
+        assert "Bread, gluten free" not in set(_filter_catalog(catalog, ["flour"])["name"])
+
+
+class TestRestrictionSynonyms:
+    """Незнакомое слово ищется буквально — и это опасно в обе стороны.
+
+    «gluten-free» уносил именно безглютеновое и оставлял всё остальное;
+    «celiac», «halal», «dairy-free», «nut allergy» не отсекали ничего.
+    """
+
+    @pytest.mark.parametrize(("synonym", "category"), [
+        ("celiac", "gluten"), ("gluten-free", "gluten"), ("no gluten", "gluten"),
+        ("dairy-free", "lactose"), ("nut allergy", "nuts"),
+    ])
+    def test_synonym_equals_category(self, catalog, synonym, category):
+        assert set(_filter_catalog(catalog, [synonym])["fdc_id"]) == \
+            set(_filter_catalog(catalog, [category])["fdc_id"])
+
+    def test_halal_excludes_pork_and_alcohol(self, catalog):
+        left = set(_filter_catalog(catalog, ["halal"])["name"])
+        assert "Bacon, NS as to type of meat, cooked" not in left
+        assert "Beer, nonalcoholic" not in left
+        # «Apple cider» в USDA — сок, а не алкоголь.
+        assert "Apple cider" in left
+
+    def test_synonym_to_single_product(self):
+        """Синоним может вести на продукт, а не только на категорию."""
+        assert expand(["peanut allergy"]) == ["peanut"]
+
+
+class TestNutButterIsNotDairyOnlyByItself:
+    """Ореховая паста — не молочное, только когда блюдо ею и является.
+
+    Неякорное исключение вырезало «peanut butter» из «Cookie, peanut butter»
+    и «Chocolate candy, peanut butter filled»: печенье на сливочном масле
+    и молочный шоколад возвращались человеку без лактозы.
+    """
+
+    def test_peanut_butter_cookie_is_dairy(self, catalog):
+        assert "Cookie, peanut butter" not in set(_filter_catalog(catalog, ["lactose"])["name"])
+
+    def test_plant_milk_is_not_milk(self, catalog):
+        assert "Almond milk, unsweetened" in set(_filter_catalog(catalog, ["milk"])["name"])
+
+
+class TestCautions:
+    """Спорное не исключается, а называется вслух (решение владельца)."""
+
+    def _item(self, catalog, name):
+        from solver import _make_item
+
+        record = catalog[catalog["name"] == name].iloc[0].to_dict()
+        return _make_item("breakfast", record, 1.0)
+
+    def test_oats_named_for_gluten(self, catalog):
+        from solver import plan_cautions
+
+        oatmeal = self._item(catalog, "Oatmeal, regular or quick, made with water, no added fat")
+        found = plan_cautions([oatmeal], ["celiac"])
+        assert [label for label, _, _ in found] == ["овёс"]
+        assert "без глютена" in found[0][1]
+
+    def test_gelatin_named_for_pork(self, catalog):
+        from solver import plan_cautions
+
+        dessert = self._item(catalog, "Gelatin dessert")
+        assert [label for label, _, _ in plan_cautions([dessert], ["pork"])] == ["желатин"]
+        assert plan_cautions([dessert], ["gluten"]) == []
+
+    def test_oats_are_not_excluded(self, catalog):
+        """Овёс остаётся в подборе: предупреждение, а не запрет."""
+        assert "Oatmeal, regular or quick, made with water, no added fat" in set(
+            _filter_catalog(catalog, ["gluten"])["name"])

@@ -47,9 +47,11 @@ from pydantic import BaseModel, Field, computed_field
 from ingredients import ingredient_dishes
 from prices import cost_per_gram, fallback_cost_per_gram
 from restrictions import (
-    NOT_DAIRY,
+    GLUTEN_FREE,
+    cautions_for,
     ingredient_terms,
-    is_dairy_term,
+    is_gluten_term,
+    matches_terms,
     matches_words,
     to_category_pattern,
     to_pattern,
@@ -368,18 +370,30 @@ def _filter_catalog(
         # «сладости» превращаются в полсотни слов, а совпадение ищется
         # по границам слова. Наивная подстрока здесь не годилась —
         # «oil» находился внутри «broiled» и выбрасывал запечённую курицу.
-        pattern = to_pattern(exclude)
-        if pattern:
-            usable = usable[~matches_words(usable["name"], pattern)]
+        # С исключениями: «Almond milk» не молоко, «Rice noodles» и «Bread,
+        # gluten free» не глютен (restrictions.without_exceptions).
+        usable = usable[~matches_terms(usable["name"], exclude).to_numpy()]
 
         # Второй проход — по разделу справочника. Он знает тип блюда там,
         # где название молчит: в «Gyro sandwich» слова «bread» нет, но
         # раздел «Sandwiches» сразу говорит, что внутри лепёшка.
-        by_category = to_category_pattern(exclude)
-        if by_category and "category" in usable.columns:
-            usable = usable[
-                ~usable["category"].str.lower().str.contains(by_category, regex=True, na=False)
-            ]
+        #
+        # Пометку «gluten free» раздел не видит: «Bread, gluten free» лежит
+        # в «Yeast breads». Для глютена такие блюда разделом не отсекаются
+        # (их состав проверяет третий проход), для «мучного» — отсекаются:
+        # это всё равно хлеб.
+        if "category" in usable.columns:
+            sections = usable["category"].str.lower()
+            other = [t for t in exclude if not is_gluten_term(t)]
+            gluten = [t for t in exclude if is_gluten_term(t)]
+            dropped = pd.Series(False, index=usable.index)
+            if other and (pattern := to_category_pattern(other)):
+                dropped |= sections.str.contains(pattern, regex=True, na=False)
+            if gluten and (pattern := to_category_pattern(gluten)):
+                gluten_free = usable["name"].str.contains(GLUTEN_FREE, case=False, regex=True,
+                                                          na=False)
+                dropped |= sections.str.contains(pattern, regex=True, na=False) & ~gluten_free
+            usable = usable[~dropped]
 
         # Третий проход — по составу. Название и раздел говорят, ЧТО это
         # за блюдо, а не что внутри: в «Club sandwich» ветчина и бекон,
@@ -410,8 +424,9 @@ def _dishes_with_ingredient(terms: tuple[str, ...]) -> frozenset[int]:
     no sugar added» честно говорят об отсутствии: спрятать под хвостом
     там нечего. В названии блюда «…; no potatoes, gravy» подлива есть.
 
-    Для молочных ограничений растительное «молоко» не считается
-    (restrictions.NOT_DAIRY): «coconut milk» в карри — не лактоза.
+    Исключения — restrictions.without_exceptions: растительное «молоко»
+    не лактоза (NOT_DAIRY), рисовая лапша и «gluten free» не глютен
+    (NOT_GLUTEN, GLUTEN_FREE).
     Вырезается только само словосочетание, остаток названия проверяется:
     снимать название целиком — значит пропустить «Granola bar, milk
     chocolate coated, peanut butter» из-за арахисовой пасты.
@@ -423,15 +438,8 @@ def _dishes_with_ingredient(terms: tuple[str, ...]) -> frozenset[int]:
     if not index:
         return frozenset()
     names = pd.Series(list(index), dtype=object)
-    without_plant_milk = names.str.replace(NOT_DAIRY, " ", case=False, regex=True)
-
-    found: set[int] = set()
-    for term in terms:
-        searched = without_plant_milk if is_dairy_term(term) else names
-        mask = matches_words(searched, to_pattern([term]), skip_absent=True).to_numpy()
-        for name in names[mask]:
-            found |= index[name]
-    return frozenset(found)
+    mask = matches_terms(names, list(terms), skip_absent=True).to_numpy()
+    return frozenset().union(*(index[name] for name in names[mask]))
 
 
 def _candidates_by_role(catalog: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
@@ -1260,6 +1268,32 @@ TOLERANCES: dict[str, tuple[float, float]] = {
 }
 
 MIN_FIBER_SHARE = 0.60
+
+
+@lru_cache(maxsize=16)
+def _dishes_with_leaf(regex: str) -> frozenset[int]:
+    """Блюда, в полном составе которых есть ингредиент, совпавший с выражением."""
+    index = ingredient_dishes()
+    names = pd.Series(list(index), dtype=object)
+    hit = names[names.str.contains(regex, case=False, regex=True, na=False).to_numpy()]
+    return frozenset().union(*(index[name] for name in hit))
+
+
+def plan_cautions(items: Sequence[MealItem], exclude: list[str] | None
+                  ) -> list[tuple[str, str, list[str]]]:
+    """Спорные продукты в плане: (название, что сказать, блюда по-русски).
+
+    Не фильтр: эти блюда в план идут (restrictions.CAUTIONS — решение
+    владельца продукта), но человек должен услышать о них, а не найти сам.
+    """
+    found = []
+    for regex, label, text in cautions_for(exclude):
+        dishes = _dishes_with_leaf(regex)
+        names = list(dict.fromkeys(
+            item.name_ru or item.name for item in items if item.fdc_id in dishes))
+        if names:
+            found.append((label, text, names))
+    return found
 
 
 def check_plan(plan: DayPlan) -> dict[str, bool]:
