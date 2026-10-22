@@ -7,13 +7,16 @@
 .DEFAULT_GOAL := help
 .PHONY: help setup check run test lint fix metrics solver docker docker-logs clean         retrieval judge-noise qrels-bias chunking chunking-e2e \n        answer-prompt dataset-scope
 
-PY := python
-
 # Инструменты разработки — только через --extra dev. Обычный `uv run`
 # синхронизирует окружение по умолчанию и УДАЛЯЕТ pytest и ruff, если
 # они ставились `uv sync --extra dev`: после любого `uv run python ...`
 # `pytest` молча пропадал, и прогоны жаловались «нет pytest в .venv».
 DEV := uv run --extra dev
+
+# Python — тоже из окружения проекта. Голые `python` и `uvicorn` берут
+# первый попавшийся в PATH: на Windows это был глобальный Python 3.10
+# без зависимостей, и сервис падал с «No module named 'langgraph'».
+PY := $(DEV) python
 
 help:  ## Показать этот список
 	@grep -E '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -25,7 +28,7 @@ check:  ## Проверить готовность к запуску (без о�
 	$(PY) check_setup.py --offline
 
 run:  ## Поднять сервис на http://127.0.0.1:8000
-	uvicorn api:app --host 127.0.0.1 --port 8000
+	$(DEV) uvicorn api:app --host 127.0.0.1 --port 8000
 
 test:  ## Прогнать тесты (сеть не нужна)
 	$(DEV) pytest -q

@@ -216,11 +216,16 @@ cp .env.example .env        # и вписать POLZA_AI_API_KEY
 индекс надо собрать — он весит 44 МБ и в git не идёт:
 
 ```bash
-python data_sources.py      # сырьё, ~30 МБ, бесплатно
-python build_index.py       # векторный индекс
-python check_setup.py       # проверка по слоям: что готово, чего нет
-uvicorn api:app
+uv run python data_sources.py      # сырьё, ~30 МБ, бесплатно
+uv run python build_index.py       # векторный индекс
+uv run python check_setup.py       # проверка по слоям: что готово, чего нет
+uv run uvicorn api:app
 ```
+
+Команды — через `uv run`: голые `python` и `uvicorn` берут первый Python
+из PATH, а не окружение проекта, и падают с `No module named 'langgraph'`.
+Либо активируйте окружение: `.venv\Scripts\activate` (Windows) или
+`source .venv/bin/activate`.
 
 Откройте **http://127.0.0.1:8000**. Документация API — на `/docs`.
 Полная пересборка каталога с нуля описана в [data/README.md](data/README.md).
