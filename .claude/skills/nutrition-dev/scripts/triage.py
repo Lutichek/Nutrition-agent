@@ -25,7 +25,7 @@ from agent import NutritionAgent  # noqa: E402
 from chat_log import replay_plan  # noqa: E402
 from foods import load_catalog  # noqa: E402
 from ingredients import LEAVES_PATH  # noqa: E402
-from restrictions import matches_words, to_pattern  # noqa: E402
+from restrictions import matches_terms  # noqa: E402
 from solver import _filter_catalog  # noqa: E402
 
 QUESTION = re.compile(r"\?|^(?:сколько|почему|зачем|можно ли|полезн|вредн|что)", re.I)
@@ -53,15 +53,15 @@ def flags_for(record: dict, catalog, names, leaves, agent) -> list[str]:
     if plan_days:
         exclude = profile.get("exclude") or []
         allowed = set(_filter_catalog(catalog, exclude)["fdc_id"])
-        pattern = to_pattern(exclude) if exclude else ""
         for day, ids in enumerate(plan_days, start=1):
             for fdc_id in ids:
                 if fdc_id in allowed:
                     continue
                 why = ""
-                if pattern:
+                if exclude:
+                    # Как у фильтра каталога — с исключениями (matches_terms).
                     own = leaves.loc[leaves["fdc_id"] == fdc_id, "name_en"].astype(object)
-                    hit = own[matches_words(own, pattern, skip_absent=True).to_numpy()]
+                    hit = own[matches_terms(own, exclude, skip_absent=True).to_numpy()]
                     why = f" — в составе: {', '.join(hit[:2])}" if len(hit) else ""
                 flags.append(f"день {day}: «{names.get(fdc_id, fdc_id)}» сейчас не прошло бы "
                              f"фильтр (exclude={exclude}){why}")

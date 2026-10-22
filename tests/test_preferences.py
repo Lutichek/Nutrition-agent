@@ -71,6 +71,21 @@ class TestConflictWithRestrictions:
         profile = _profile(include=["ham"], exclude=["graham cracker"])
         assert _resolve_preferences(profile) == ["ham"]
 
+    @pytest.mark.parametrize(("wish", "restriction"), [
+        ("almond milk", "lactose"),
+        ("coconut milk", "lactose"),
+        ("rice noodles", "gluten"),
+    ])
+    def test_exception_is_not_a_conflict(self, wish: str, restriction: str) -> None:
+        """Растительное молоко — не молоко, рисовая лапша — не пшеница.
+
+        Найдено пилотом graphify: проверка конфликта шла голым re.search
+        без исключений фильтра. Пожелание снималось, человеку говорилось
+        «снято вашим ограничением» — а фильтр каталога эти блюда пропускал.
+        """
+        profile = _profile(include=[wish, "milk"], exclude=[restriction])
+        assert wish in _resolve_preferences(profile)
+
     def test_no_restrictions_keeps_everything(self) -> None:
         profile = _profile(include=["fish", "rice"], exclude=[])
         assert _resolve_preferences(profile) == ["fish", "rice"]

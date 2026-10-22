@@ -61,12 +61,13 @@ import time
 from contextvars import ContextVar
 from typing import Annotated, Any, Literal, TypedDict
 
+import pandas as pd
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
 from data_preporation import load_corpus_index
 from foods import load_catalog
-from restrictions import expand, to_pattern
+from restrictions import expand, matches_terms
 from shopping import build_shopping_list
 from solver import (
     DayPlan,
@@ -851,8 +852,13 @@ def _resolve_preferences(profile: Profile) -> list[str]:
 
     Сравниваем ПОСЛЕ раскрытия категорий, иначе конфликт не виден:
     «lactose» и «milk» — разные слова, но первое раскрывается во второе.
-    Проверка идёт по тому же шаблону с границами слова, что и фильтр
-    каталога, — чтобы «хочу ham» не выживало при исключении «graham».
+    Проверка идёт ТЕМ ЖЕ сопоставлением, что и фильтр каталога
+    (restrictions.matches_terms): с границами слова — чтобы «хочу ham»
+    не выживало при исключении «graham», — и с исключениями. Раньше
+    здесь стоял голый re.search без исключений, и при запрете лактозы
+    снимались «almond milk» и «coconut milk», а при глютене — «rice
+    noodles»; человеку при этом говорилось «снято вашим ограничением»,
+    хотя фильтр каталога эти блюда пропускал.
 
     Сам солвер этот конфликт тоже переживёт (предпочтения он ищет
     в УЖЕ отфильтрованном каталоге), но тогда пожелание просто молча
@@ -865,17 +871,13 @@ def _resolve_preferences(profile: Profile) -> list[str]:
     if not wanted or not profile.exclude:
         return wanted
 
-    forbidden = to_pattern(profile.exclude)
-    if not forbidden:
-        return wanted
-
     kept: list[str] = []
     for term in wanted:
         # Раскрываем пожелание и смотрим, не попало ли хоть одно слово
         # под запрет. Достаточно одного: «молочка» без молока — уже
         # не то, о чём просили.
-        words = expand([term]) or [term]
-        if any(re.search(forbidden, word.lower()) for word in words):
+        words = pd.Series(expand([term]) or [term], dtype=object)
+        if matches_terms(words, profile.exclude).any():
             continue
         kept.append(term)
 

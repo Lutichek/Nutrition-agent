@@ -29,9 +29,11 @@ from restrictions import (  # noqa: E402
     CATEGORIES,
     expand,
     ingredient_terms,
+    matches_terms,
     matches_words,
     to_category_pattern,
     to_pattern,
+    without_exceptions,
 )
 from solver import _dishes_with_ingredient, _filter_catalog  # noqa: E402
 
@@ -83,11 +85,18 @@ def show_removed(base: pd.DataFrame, allowed_ids: set, leaves: pd.DataFrame,
     composition = _dishes_with_ingredient(tuple(sorted(ingredient_terms(exclude))))
     words = expand(exclude)
 
+    # Сопоставление — то же, что у фильтра (matches_terms, с исключениями):
+    # иначе скрипт объяснял бы отсев «словом», которое фильтр на деле
+    # вырезал как «almond milk» или «rice noodles».
     rows = []
     for row in removed.itertuples():
         name = pd.Series([row.name], dtype=object)
-        word = next((w for w in words if matches_words(name, to_pattern([w])).iloc[0]), None)
-        if word:
+        if matches_terms(name, exclude).iloc[0]:
+            cleaned = name
+            for term in exclude:
+                cleaned = without_exceptions(cleaned, term)
+            word = next((w for w in words if matches_words(cleaned, to_pattern([w])).iloc[0]),
+                        "?")
             rows.append(("название", word, row.name))
             continue
         match = re.search(category_re, str(row.category).lower()) if category_re else None
@@ -96,7 +105,7 @@ def show_removed(base: pd.DataFrame, allowed_ids: set, leaves: pd.DataFrame,
             continue
         if row.fdc_id in composition:
             own = leaves.loc[leaves["fdc_id"] == row.fdc_id, "name_en"].astype(object)
-            hit = own[matches_words(own, to_pattern(exclude), skip_absent=True).to_numpy()]
+            hit = own[matches_terms(own, exclude, skip_absent=True).to_numpy()]
             rows.append(("состав", hit.iloc[0] if len(hit) else "?", row.name))
     frame = pd.DataFrame(rows, columns=["проход", "сработало", "блюдо"])
     print(f"Отсечено {len(removed)} блюд. По проходу и слову — просмотри, нет ли лишнего")
@@ -183,9 +192,8 @@ def main() -> None:
 
     # 2. Без гипотезы: составные ингредиенты в оставшихся блюдах. Редкие
     # утечки (1-2 блюда) внизу списка — смотри его целиком, не только топ.
-    pattern = to_pattern(args.exclude)
     composite = unique[unique.str.contains(COMPOSITE) & ~unique.str.contains(NOISE)]
-    flagged = composite[~matches_words(composite, pattern, skip_absent=True).to_numpy()]
+    flagged = composite[~matches_terms(composite, args.exclude, skip_absent=True).to_numpy()]
     counts = (in_pool[in_pool["name_en"].isin(set(flagged))]
               .groupby("name_en")["fdc_id"].nunique().sort_values(ascending=False))
     print(f"Составные ингредиенты в оставшихся блюдах (просмотри глазами, топ {args.top}):")
