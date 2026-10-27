@@ -110,6 +110,62 @@ _LLM_CALLS: ContextVar[list[dict] | None] = ContextVar("_LLM_CALLS", default=Non
 # а не плодят потоки.
 _MENU_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="menu")
 
+# Вызовы модели наперёд (NutritionAgent.speculate): пока classify решает,
+# куда идти, extract_profile и rewrite уже спрашивают модель. Потоки
+# ждут сеть, а не считают, — восьми хватает на несколько разговоров сразу.
+_LLM_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm")
+
+
+class _Speculation:
+    """Вызовы модели, запущенные до того, как стало ясно, понадобятся ли они.
+
+    Ответ отдаётся узлу, ТОЛЬКО если его промпт совпал символ в символ:
+    тогда это тот же вызов, просто начатый раньше. Не совпал (состояние
+    успело поменяться) или вызов ещё стоит в очереди — узел спрашивает
+    модель сам, и опережение ничего не меняет, кроме потраченного вызова.
+    """
+
+    def __init__(self) -> None:
+        self._calls: dict[str, tuple[str, Future]] = {}
+        self._taken: set[str] = set()
+
+    def start(self, name: str, prompt: str, call) -> None:
+        self._calls[name] = (prompt, _LLM_POOL.submit(call))
+
+    def take(self, name: str, prompt: str) -> tuple[str, list[dict]] | None:
+        """(ответ, вызовы для trace) или None — тогда узел вызывает модель сам."""
+        entry = self._calls.get(name)
+        if entry is None or entry[0] != prompt:
+            return None
+        future = entry[1]
+        if future.cancel():  # ещё не начался: ждать очередь дольше, чем спросить
+            return None
+        self._taken.add(name)
+        raw, calls, error = future.result()
+        if error is not None:
+            raise error
+        return raw, calls
+
+    def unused(self) -> list[dict]:
+        """Невостребованные вызовы — для trace: их токены тоже потрачены.
+
+        Незавершённые не ждутся: ответ человеку из-за учёта не задерживается,
+        и такой вызов помечается pending, а не выдаётся за бесплатный.
+        """
+        steps = []
+        for name, (_prompt, future) in self._calls.items():
+            if name in self._taken or future.cancelled():
+                continue
+            # Своё имя шага: под именем настоящего узла запись смешалась бы
+            # с ним в разборе журнала. seconds = 0 — ответ он не задерживал.
+            step = {"node": "speculative_unused", "for": name, "seconds": 0.0}
+            if future.done():
+                step["llm"] = future.result()[1]
+            else:
+                step["pending"] = True
+            steps.append(step)
+        return steps
+
 # Сколько символов ответа модели хранить в журнале. Нужное для разбора —
 # JSON маршрутизатора и профиля — укладывается в сотни символов; длинные
 # ответы генерации и так лежат в записи целиком полем answer.
@@ -273,6 +329,7 @@ class AgentState(TypedDict, total=False):
     plan: Any              # DayPlan — первый день, его показываем в ответе
     menu: Any              # Menu — всё меню на запрошенный период
     menu_rest: Any         # Future[list[DayPlan]] — дни со второго, пока собираются
+    speculative: Any       # _Speculation — вызовы модели, начатые в classify наперёд
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -1107,8 +1164,14 @@ class NutritionAgent:
         max_retries: int = 3,
         strict_grade: bool = True,
         answer_style: str = "full",
+        speculate: bool = False,
     ) -> None:
         self.client = client
+        # Опережение (см. _Speculation) включает сервис: там ждёт человек.
+        # В прогонах метрик и тестах оно выключено — время там никого
+        # не держит, а невостребованный вызов на каждом вопросе стоил бы
+        # денег без пользы.
+        self.speculate = speculate
         self.model = model
         self.retriever = retriever
         self.catalog = catalog if catalog is not None else load_catalog()
@@ -1214,6 +1277,47 @@ class NutritionAgent:
             f"Модель не ответила после {self.max_retries} попыток: {last_error}"
         ) from last_error
 
+    def _call_in_background(self, prompt: str, json_mode: bool):
+        """Вызов модели в потоке пула. Возвращает (ответ, вызовы, ошибка).
+
+        Вызовы для trace копятся в СВОЁМ списке: ContextVar в поток пула
+        не переходит, и без этого вызов пропал бы из журнала вместе
+        с токенами. Ошибка возвращается, а не бросается, — чтобы узел,
+        которому вызов нужен, поднял её у себя, с теми же записями о попытках.
+        """
+        token = _LLM_CALLS.set([])
+        try:
+            try:
+                return self._complete(prompt, json_mode=json_mode), _LLM_CALLS.get(), None
+            except Exception as error:
+                return None, _LLM_CALLS.get(), error
+        finally:
+            _LLM_CALLS.reset(token)
+
+    def _ask(self, state: AgentState, name: str, prompt: str, json_mode: bool = False) -> str:
+        """Ответ модели для узла: готовый из опережения или новый вызов."""
+        speculation: _Speculation | None = state.get("speculative")
+        ready = speculation.take(name, prompt) if speculation is not None else None
+        if ready is None:
+            return self._complete(prompt, json_mode=json_mode)
+        raw, calls = ready
+        current = _LLM_CALLS.get()
+        if current is not None:
+            current.extend({**call, "speculative": True} for call in calls)
+        return raw
+
+    def _extract_prompt(self, state: AgentState) -> str:
+        known = dict(state.get("profile") or {})
+        return EXTRACT_PROFILE_PROMPT.format(
+            known=json.dumps(known, ensure_ascii=False) if known else "(ничего)",
+            question=state["question"],
+            history=self._format_history(state.get("history")),
+        )
+
+    @staticmethod
+    def _rewrite_prompt(state: AgentState) -> str:
+        return REWRITE_PROMPT.format(question=state["question"])
+
     # Сколько символов ответа агента оставлять в истории.
     #
     # Историю получают два узла — classify и extract_profile, — и оба задают
@@ -1266,7 +1370,22 @@ class NutritionAgent:
     # Узлы: маршрутизация
     # ------------------------------------------------------------------
     def _node_classify(self, state: AgentState) -> AgentState:
-        """Понять, чего хочет пользователь, и проверить на противопоказания."""
+        """Понять, чего хочет пользователь, и проверить на противопоказания.
+
+        С ``speculate`` следующие шаги обеих веток спрашивают модель, пока
+        идёт этот вызов: какой понадобится, станет ясно только из его ответа,
+        а ждать его — 1.4-2.3 с на каждой реплике (experiments/latency.py).
+        """
+        speculation = None
+        if self.speculate:
+            speculation = _Speculation()
+            for name, prompt, json_mode in (
+                ("extract_profile", self._extract_prompt(state), True),
+                ("rewrite", self._rewrite_prompt(state), False),
+            ):
+                speculation.start(name, prompt, lambda p=prompt, j=json_mode:
+                                  self._call_in_background(p, j))
+
         raw = self._complete(
             CLASSIFY_PROMPT.format(
                 question=state["question"],
@@ -1285,6 +1404,7 @@ class NutritionAgent:
         return {
             "intent": intent,
             "red_flag": str(parsed.get("red_flag") or "").strip(),
+            "speculative": speculation,
         }
 
     def _route_after_classify(self, state: AgentState) -> str:
@@ -1324,14 +1444,7 @@ class NutritionAgent:
         """Достать из разговора параметры человека и дополнить ими профиль."""
         known = dict(state.get("profile") or {})
 
-        raw = self._complete(
-            EXTRACT_PROFILE_PROMPT.format(
-                known=json.dumps(known, ensure_ascii=False) if known else "(ничего)",
-                question=state["question"],
-                history=self._format_history(state.get("history")),
-            ),
-            json_mode=True,
-        )
+        raw = self._ask(state, "extract_profile", self._extract_prompt(state), json_mode=True)
         extracted = parse_json_response(raw)
 
         # days — это параметр запроса, а не свойство человека, поэтому
@@ -1810,7 +1923,7 @@ class NutritionAgent:
     # ------------------------------------------------------------------
     def _node_rewrite(self, state: AgentState) -> AgentState:
         """Перевести вопрос на английский и превратить в поисковый запрос."""
-        query = self._complete(REWRITE_PROMPT.format(question=state["question"]))
+        query = self._ask(state, "rewrite", self._rewrite_prompt(state))
         query = query.strip().strip('"')
         return {"search_query": query or state["question"], "refine_count": 0}
 
@@ -2079,7 +2192,9 @@ class NutritionAgent:
             "checks": final_state.get("checks"),
             "plan_days": [[item.fdc_id for item in day.items] for day in menu.days]
             if menu is not None else None,
-            "nodes": final_state.get("trace") or [],
+            "nodes": (final_state.get("trace") or []) + (
+                final_state["speculative"].unused()
+                if final_state.get("speculative") is not None else []),
         }
 
         return RAGAgentAnswer(
@@ -2198,6 +2313,8 @@ def build_agent(
     # "short" — отклонённая базовая линия, оставлена, чтобы было с чем
     # сравнивать. "evidence" — кандидат, см. GENERATE_PROMPT_EVIDENCE.
     answer_style: str = "full",
+    # Вызовы модели наперёд — для сервиса (см. NutritionAgent.speculate).
+    speculate: bool = False,
 ) -> NutritionAgent:
     """Собрать готового агента: БД → эмбеддер → ретривер → каталог → граф.
 
@@ -2232,4 +2349,5 @@ def build_agent(
         seed=seed,
         strict_grade=strict_grade,
         answer_style=answer_style,
+        speculate=speculate,
     )

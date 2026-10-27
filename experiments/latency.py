@@ -131,10 +131,14 @@ def main() -> None:
     parser.add_argument("--save", help="сохранить сводку под этим именем")
     parser.add_argument("--against", help="сравнить с сохранённой сводкой")
     parser.add_argument("--cases", nargs="*", help="только эти случаи (по началу названия)")
+    parser.add_argument("--no-speculate", action="store_true",
+                        help="без вызовов наперёд — для сравнения с ними")
     args = parser.parse_args()
 
     llm_client, model, embed_client = get_clients("polza")
-    agent = build_agent(llm_client, model=model, embed_client=embed_client)
+    # Как в сервисе (api.py): меряется то, что ждёт человек.
+    agent = build_agent(llm_client, model=model, embed_client=embed_client,
+                        speculate=not args.no_speculate)
 
     cases = {name: text for name, text in CASES.items()
              if not args.cases or any(name.startswith(c) for c in args.cases)}

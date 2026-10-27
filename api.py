@@ -275,7 +275,10 @@ async def lifespan(app: FastAPI):
     llm_client, model, embed_client = get_clients(os.getenv("LLM_PROVIDER", "polza"))
 
     _state["catalog"] = load_catalog()
-    _state["agent"] = build_agent(llm_client, model=model, embed_client=embed_client)
+    # speculate — здесь ждёт человек: следующие шаги спрашивают модель,
+    # пока classify решает маршрут (experiments/latency.py).
+    _state["agent"] = build_agent(
+        llm_client, model=model, embed_client=embed_client, speculate=True)
     _state["sessions"] = SessionStore()
     _state["menus"] = MenuStore()
     _state["chat_log"] = ChatLog.from_env()
