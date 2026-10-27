@@ -22,7 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from openai import OpenAI
+import httpx
+from openai import DefaultHttpxClient, OpenAI
 
 from config import settings
 
@@ -36,6 +37,26 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_POLZA_MODEL = "openai/gpt-4o-mini"
 DEFAULT_GIGACHAT_MODEL = "GigaChat-2"
 
+# Соединение с провайдером — самое ненадёжное место всего ответа.
+#
+# Замер: TLS-рукопожатие с api.polza.ai зависало примерно в половине
+# новых соединений (TCP открывается за 0.01 с, удачное рукопожатие 0.24 с).
+# По умолчанию httpx закрывает простаивающее соединение через 5 с, то есть
+# почти каждая реплика человека открывала его заново, ждала таймаут
+# соединения 5 с и повтор SDK. Вызов «ответь одним словом», 15 раз с паузой
+# 8 с, как между репликами:
+#
+#     настройка               медиана   дольше 3 с   максимум   сбоев
+#     как было                  4.55 с     7 из 15      7.9 с      1
+#     держать 5 мин             1.73 с     1 из 15     12.6 с      1
+#     5 мин + установка 2 с     1.51 с     1 из 15      4.1 с      0   ← эта
+#
+# Короткий таймаут — только на установку соединения: удачное укладывается
+# в четверть секунды, а зависшее бросать сразу и повторять (повторы SDK)
+# дешевле, чем ждать. Ответ модели ждётся сколько нужно, как и раньше.
+KEEPALIVE_SECONDS = 300.0
+CONNECT_TIMEOUT_SECONDS = 2.0
+
 
 def get_polza_client() -> OpenAI:
     """Клиент polza.ai (OpenAI-совместимый)."""
@@ -44,7 +65,16 @@ def get_polza_client() -> OpenAI:
             "Не задан POLZA_AI_API_KEY. Скопируйте .env.example в .env "
             "и укажите ключ."
         )
-    return OpenAI(base_url=POLZA_BASE_URL, api_key=settings.polza_ai_api_key)
+    return OpenAI(
+        base_url=POLZA_BASE_URL,
+        api_key=settings.polza_ai_api_key,
+        timeout=httpx.Timeout(600.0, connect=CONNECT_TIMEOUT_SECONDS),
+        http_client=DefaultHttpxClient(limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=KEEPALIVE_SECONDS,
+        )),
+    )
 
 
 def get_gigachat_client() -> OpenAI:
@@ -74,7 +104,9 @@ def get_clients(llm_provider: str = "polza") -> tuple[Any, str, Any]:
         return get_gigachat_client(), DEFAULT_GIGACHAT_MODEL, embed_client
 
     if llm_provider == "polza":
-        return get_polza_client(), DEFAULT_POLZA_MODEL, embed_client
+        # Один клиент на оба дела: у каждого клиента свой набор соединений,
+        # и отдельный клиент эмбеддингов открывал бы своё на каждый поиск.
+        return embed_client, DEFAULT_POLZA_MODEL, embed_client
 
     raise ValueError(f"Неизвестный провайдер: {llm_provider}. Доступны: polza, gigachat")
 
