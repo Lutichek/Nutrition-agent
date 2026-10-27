@@ -51,6 +51,10 @@ def main() -> None:
 
         print()
         print(f"АГЕНТ: {for_reader(answer.answer)}")
+        # План модель в тексте не перечисляет — в интерфейсе он идёт
+        # карточкой. Здесь карточки нет, поэтому печатаем его из данных.
+        if answer.plan is not None:
+            print("\nПЛАН (карточка):" + answer.plan.render())
         print()
 
     print("=" * 78)

@@ -58,6 +58,7 @@ import logging
 import operator
 import re
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -71,10 +72,13 @@ from restrictions import expand, matches_terms
 from shopping import build_shopping_list
 from solver import (
     DayPlan,
+    Menu,
     PlanNotFeasible,
-    build_menu,
     check_plan,
     day_word,
+    mean_targets,
+    menu_days,
+    menu_targets,
     plan_cautions,
     preferred_ids,
 )
@@ -98,6 +102,13 @@ logger = logging.getLogger(__name__)
 # в соседних потоках. Вне графа (скрипты замеров) переменная пуста,
 # и _complete ничего не копит.
 _LLM_CALLS: ContextVar[list[dict] | None] = ContextVar("_LLM_CALLS", default=None)
+
+# Дни меню со второго собираются здесь, пока модель объясняет первый
+# (_node_make_plan). Солвер считает на чистом Python, а поток запроса в это
+# время ждёт сеть — GIL свободен, и сборка идёт почти без помех. Пул общий
+# на сервис: по потоку на одновременный расчёт, лишние ждут в очереди,
+# а не плодят потоки.
+_MENU_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="menu")
 
 # Сколько символов ответа модели хранить в журнале. Нужное для разбора —
 # JSON маршрутизатора и профиля — укладывается в сотни символов; длинные
@@ -261,6 +272,7 @@ class AgentState(TypedDict, total=False):
     cycled: Any            # CycledTargets — нормы тренировочного дня и отдыха
     plan: Any              # DayPlan — первый день, его показываем в ответе
     menu: Any              # Menu — всё меню на запрошенный период
+    menu_rest: Any         # Future[list[DayPlan]] — дни со второго, пока собираются
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -581,6 +593,15 @@ ANSWER_PROMPTS = {
 }
 
 
+# План модель НЕ перепечатывает (пункт 2). Раньше просили «приведи план как
+# есть»: копия занимала 44-72% ответа, хотя карточка в интерфейсе показывает
+# тот же план из данных и подробнее. Выходной текст — самая медленная часть
+# ответа, и это единственное место, где модель держала в руках числа плана.
+# Замер — experiments/latency.py.
+#
+# Примера фразы о плане в пункте 2 нет намеренно: был «в плане упор на белок
+# за завтраком», и модель вставляла его дословно — про план, где это не так.
+# Пример в промпте модель читает как готовый текст.
 EXPLAIN_PLAN_PROMPT = """Ты — ассистент по питанию. Объясни человеку его план на день.
 
 Реплика человека: {question}
@@ -608,7 +629,10 @@ EXPLAIN_PLAN_PROMPT = """Ты — ассистент по питанию. Объ
    белка нужно спортсменам?»), НЕ выдавай его норму за общую
    рекомендацию: скажи прямо, что посчитал это для него.
 1. Коротко — какая норма получилась и почему именно такая.
-2. Приведи план как есть, ничего не пересчитывая.
+2. План человек видит карточкой рядом с ответом: блюда, граммы, калории.
+   НЕ перечисляй блюда и граммовки и не пересказывай план по приёмам
+   пищи. Ничего не утверждай о составе плана, чего нельзя прямо
+   прочитать в нём выше.
 3. Если в проверках что-то не прошло — честно скажи, что именно.
 4. Если во фрагментах есть обоснование норм — перескажи его своими словами:
    что показали исследования. Номера PMID и номера фрагментов НЕ пиши:
@@ -1144,11 +1168,19 @@ class NutritionAgent:
                 response = self.client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content or ""
                 if calls is not None:
-                    calls.append({
+                    call = {
                         "response": content[:TRACE_RESPONSE_CHARS],
                         "attempts": attempt + 1,
                         "seconds": round(time.perf_counter() - started, 2),
-                    })
+                    }
+                    # Токены — только если провайдер их вернул. Нет счётчика —
+                    # нет поля, а не ноль: «0 токенов» читалось бы как бесплатный вызов.
+                    usage = getattr(response, "usage", None)
+                    for field in ("prompt_tokens", "completion_tokens"):
+                        value = getattr(usage, field, None)
+                        if isinstance(value, int):
+                            call[field] = value
+                    calls.append(call)
                 return content
             except Exception as error:
                 last_error = error
@@ -1376,7 +1408,7 @@ class NutritionAgent:
         )
         return {"answer": answer.strip()}
 
-    def _node_make_plan(self, state: AgentState) -> AgentState:
+    def _node_make_plan(self, state: AgentState, defer_rest: bool = False) -> AgentState:
         """Детерминированная часть: нормы, сборка дня и проверки.
 
         Здесь нет ни одного обращения к модели — и это принципиально.
@@ -1425,43 +1457,72 @@ class NutritionAgent:
         # 10%» там, где день сошёлся со своей целью с точностью 0.1%.
         shown_targets = per_day[0] if cycled else targets
 
+        all_targets = menu_targets(per_day, days)
+        day_plans = menu_days(
+            self.catalog,
+            all_targets,
+            exclude=profile.exclude,
+            include=_with_russian_fallback(
+                _resolve_preferences(profile), profile, self.catalog),
+            budget=profile.budget_rub_per_day,
+            seed=self.seed,
+        )
         try:
-            menu = build_menu(
-                self.catalog,
-                per_day,
-                days=days,
-                exclude=profile.exclude,
-                include=_with_russian_fallback(
-                    _resolve_preferences(profile), profile, self.catalog),
-                budget=profile.budget_rub_per_day,
-                seed=self.seed,
-            )
+            first = next(day_plans)
+            # Остальные дни — в фоне, пока модель объясняет первый: объяснение
+            # ничего, кроме первого дня, не читает. Ждёт их explain_plan уже
+            # ПОСЛЕ вызова модели (_finish_menu). Вне графа (replay_plan,
+            # скрипты) — сразу, чтобы узел сам по себе отдавал меню целиком.
+            if defer_rest and days > 1:
+                rest: Future | list[DayPlan] = _MENU_POOL.submit(list, day_plans)
+            else:
+                rest = list(day_plans)
         except PlanNotFeasible as error:
-            # Каталог после исключений слишком узкий. Это не поломка, а нормальный
-            # исход: человек мог исключить половину еды. Отвечаем по-человечески.
-            excluded = ", ".join(profile.exclude) if profile.exclude else "—"
-            return {
-                "profile": profile.model_dump(),
-                "targets": targets,
-                "answer": (
-                    "Не получилось собрать рацион: после ваших ограничений "
-                    f"({excluded}) в справочнике почти не осталось подходящих блюд. "
-                    f"{error} Попробуйте убрать часть ограничений.\n\n"
-                    f"Норму при этом я посчитал:\n{explain(profile, targets)}"
-                ),
-            }
+            return self._infeasible(profile, targets, error)
 
-        checks = check_plan(menu.days[0])
-
-        return {
+        result = {
             "profile": profile.model_dump(),
             "targets": targets,
             "plan_targets": shown_targets,
             "cycled": cycled,
-            "menu": menu,
-            "plan": menu.days[0],
+            "plan": first,
             "days": days,
-            "checks": checks,
+            "checks": check_plan(first),
+        }
+        if isinstance(rest, Future):
+            result["menu_rest"] = (rest, all_targets)
+        else:
+            result["menu"] = Menu(days=[first, *rest], targets=mean_targets(all_targets))
+        return result
+
+    def _node_make_plan_in_graph(self, state: AgentState) -> AgentState:
+        return self._node_make_plan(state, defer_rest=True)
+
+    @staticmethod
+    def _finish_menu(state: AgentState) -> Menu | None:
+        """Меню целиком: дождаться дней, собранных в фоне за время вызова модели."""
+        if state.get("menu") is not None:
+            return state["menu"]
+        pending = state.get("menu_rest")
+        if pending is None:
+            return None
+        future, all_targets = pending
+        return Menu(days=[state["plan"], *future.result()], targets=mean_targets(all_targets))
+
+    @staticmethod
+    def _infeasible(profile: Profile, targets: Targets, error: PlanNotFeasible) -> AgentState:
+        # Каталог после исключений слишком узкий. Это не поломка, а нормальный
+        # исход: человек мог исключить половину еды. Отвечаем по-человечески.
+        excluded = ", ".join(profile.exclude) if profile.exclude else "—"
+        return {
+            "profile": profile.model_dump(),
+            "targets": targets,
+            "answer": (
+                "Не получилось собрать рацион: после ваших ограничений "
+                f"({excluded}) в справочнике почти не осталось подходящих блюд. "
+                f"{error} Попробуйте убрать часть ограничений.\n\n"
+                f"Норму при этом я посчитал:\n{explain(profile, targets)}"
+            ),
         }
 
     def _route_after_plan(self, state: AgentState) -> str:
@@ -1493,7 +1554,7 @@ class NutritionAgent:
         period_note = ""
         if days > 1:
             period_note = (
-                f"\n\nЭто меню на {days} {day_word(days)}. Выше показан "
+                f"\n\nЭто меню на {days} {day_word(days)}. В карточке показан "
                 f"первый день как образец — скажи об этом и добавь, что полное "
                 f"меню можно скачать кнопкой рядом с ответом. Не перечисляй "
                 f"остальные дни в тексте."
@@ -1518,17 +1579,28 @@ class NutritionAgent:
 
         text = answer.strip()
 
+        # Дни со второго собирались, пока модель писала объяснение.
+        # Не собрались — ответ тот же, что раньше давал make_plan: объяснение
+        # первого дня без остального меню выдало бы неделю, которой нет.
+        try:
+            menu = self._finish_menu(state)
+        except PlanNotFeasible as error:
+            # План первого дня снимается: иначе карточка показала бы его
+            # рядом с текстом «не получилось собрать рацион».
+            return {**self._infeasible(profile, targets, error),
+                    "plan": None, "menu": None, "menu_rest": None}
+
         # Бюджет — раньше общей стоимости: человек спрашивал «уложился ли»,
         # а не «сколько вышло». Сумма идёт следом как обоснование.
         budget = self._budget_note(plan, days)
         if budget:
             text += "\n\n" + budget
 
-        cost = self._cost_note(state.get("menu") or plan)
+        cost = self._cost_note(menu or plan)
         if cost:
             text += cost
 
-        caution = self._caution_note(profile, state.get("menu"), plan)
+        caution = self._caution_note(profile, menu, plan)
         if caution:
             text += caution
 
@@ -1543,7 +1615,8 @@ class NutritionAgent:
         if offer:
             text += offer
 
-        return {"answer": text, "chunks": chunks, "search_query": query}
+        return {"answer": text, "chunks": chunks, "search_query": query,
+                "menu": menu, "menu_rest": None}
 
     @staticmethod
     def _budget_note(plan: DayPlan, days: int) -> str:
@@ -1863,7 +1936,7 @@ class NutritionAgent:
 
             "extract_profile": self._node_extract_profile,
             "ask_profile": self._node_ask_profile,
-            "make_plan": self._node_make_plan,
+            "make_plan": self._node_make_plan_in_graph,
             "explain_plan": self._node_explain_plan,
 
             "rewrite": self._node_rewrite,

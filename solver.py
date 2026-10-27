@@ -37,7 +37,7 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -1199,6 +1199,16 @@ def build_menu(
     циклирование: у тренировочного дня и дня отдыха разная калорийность,
     и собирать их по одной норме бессмысленно.
     """
+    per_day = menu_targets(targets, days)
+    plans = list(menu_days(
+        catalog, per_day, exclude=exclude, seed=seed, iterations=iterations,
+        variety_window=variety_window, include=include, budget=budget,
+    ))
+    return Menu(days=plans, targets=mean_targets(per_day))
+
+
+def menu_targets(targets: Targets | Sequence[Targets], days: int) -> list[Targets]:
+    """Норма на каждый день меню: одна на все дни или своя у каждого."""
     if days < 1:
         raise ValueError("Меню нельзя собрать меньше чем на один день")
 
@@ -1207,8 +1217,37 @@ def build_menu(
         raise ValueError(
             f"Норм передано {len(per_day)}, а дней {days} — должно совпадать"
         )
+    return per_day
 
-    plans: list[DayPlan] = []
+
+def mean_targets(per_day: Sequence[Targets]) -> dict[str, float]:
+    """Средняя норма меню — то, с чем сравнивается неделя целиком."""
+    return {
+        key: sum(t.as_dict()[key] for t in per_day) / len(per_day)
+        for key in per_day[0].as_dict()
+    }
+
+
+def menu_days(
+    catalog: pd.DataFrame,
+    per_day: Sequence[Targets],
+    exclude: list[str] | None = None,
+    seed: int = 0,
+    iterations: int | None = None,
+    variety_window: int = 2,
+    include: list[str] | None = None,
+    budget: float | None = None,
+) -> Iterator[DayPlan]:
+    """Дни меню по одному — те же, что собирает ``build_menu``, и в том же порядке.
+
+    Генератор, а не список, ради агента: объяснение первого дня моделью
+    идёт параллельно со сборкой остальных (``NutritionAgent._node_make_plan``).
+    Меню на месяц собирается 16 с, а объясняется только первый день —
+    ждать остальные 29 дней перед вызовом модели незачем. Состояние окна
+    разнообразия живёт внутри генератора, поэтому дни выходят те же до
+    блюда, что и при сборке целиком.
+    """
+    days = len(per_day)
     recent: list[set[int]] = []
 
     # Любимые блюда окно разнообразия не трогает, иначе предпочтение
@@ -1267,14 +1306,8 @@ def build_menu(
                 budget=budget,
             )
 
-        plans.append(plan)
         recent.append({item.fdc_id for item in plan.items})
-
-    mean = {
-        key: sum(t.as_dict()[key] for t in per_day) / len(per_day)
-        for key in per_day[0].as_dict()
-    }
-    return Menu(days=plans, targets=mean)
+        yield plan
 
 
 # ────────────────────────────────────────────────────────────
