@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from conftest import FakeLLMClient, FakeRetriever
@@ -160,9 +160,19 @@ class TestFailures:
         assert not (tmp_path / "logs").exists()
 
 
+def utc_today():
+    """Сутки журнала — по UTC, как в ChatLog.write.
+
+    С местной датой тест падал в первые часы суток (UTC+5: с 00:00 до 05:00):
+    «31 день назад» по местному календарю для журнала был ровно 30-м,
+    и файл законно оставался.
+    """
+    return datetime.now(UTC).date()
+
+
 class TestRetention:
     def test_old_files_removed_recent_kept(self, tmp_path):
-        today = date.today()
+        today = utc_today()
         old = tmp_path / f"chat-{(today - timedelta(days=31)).isoformat()}.jsonl"
         recent = tmp_path / f"chat-{(today - timedelta(days=5)).isoformat()}.jsonl"
         foreign = tmp_path / "notes.jsonl"
@@ -181,7 +191,7 @@ class TestRetention:
         Не попади она под очистку, срок хранения в 30 дней соблюдался бы
         только на бумаге: журнал удалён, а его читаемая копия лежит вечно.
         """
-        today = date.today()
+        today = utc_today()
         old = tmp_path / f"chat-{(today - timedelta(days=31)).isoformat()}.md"
         recent = tmp_path / f"chat-{(today - timedelta(days=5)).isoformat()}.md"
         for path in (old, recent):
