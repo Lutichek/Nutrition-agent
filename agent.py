@@ -58,6 +58,7 @@ import logging
 import operator
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from typing import Annotated, Any, Literal, TypedDict
@@ -310,6 +311,22 @@ class ConversationState(BaseModel):
 
 Intent = Literal["plan", "question", "off_topic"]
 
+# Что показать человеку, пока идёт шаг (событие «stage» в run(on_event=...)).
+# Раньше страница угадывала этап по таймеру: «ищу в статьях» на 4-й секунде
+# показывалось и тогда, когда агент собирал рацион и в статьи не ходил.
+STAGE_LABELS = {
+    "classify": "разбираю вопрос",
+    "extract_profile": "уточняю параметры",
+    "ask_profile": "формулирую вопрос",
+    "make_plan": "подбираю блюда",
+    "explain_plan": "объясняю расчёт",
+    "rewrite": "формулирую запрос",
+    "retrieve": "ищу в статьях",
+    "grade": "отбираю фрагменты",
+    "refine": "ищу другими словами",
+    "generate": "пишу ответ",
+}
+
 
 class AgentState(TypedDict, total=False):
     """Данные, которые узлы графа передают друг другу."""
@@ -330,6 +347,7 @@ class AgentState(TypedDict, total=False):
     menu: Any              # Menu — всё меню на запрошенный период
     menu_rest: Any         # Future[list[DayPlan]] — дни со второго, пока собираются
     speculative: Any       # _Speculation — вызовы модели, начатые в classify наперёд
+    on_event: Any          # Callable[[dict], None] — события для ответа по частям
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -789,6 +807,27 @@ def for_reader(text: str) -> str:
         lines.append(re.sub(r"(?<=\S) {2,}", " ", line).rstrip())
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
+
+def for_reader_partial(raw: str) -> str:
+    """``for_reader`` для ответа, который модель ещё пишет.
+
+    Хвост придерживается до конца ссылки: она приходит кусками, и
+    «[PMID 12» или «(PMID 1» мелькнули бы на экране раньше, чем их
+    вырежут. Держится всё от последней незакрытой скобки — обычная
+    скобка в тексте лишь чуть позже появится — и недописанное «PMID»
+    без скобки: _BARE_PMID снимает его только вместе с цифрами.
+    """
+    for opening, closing in (("[", "]"), ("(", ")")):
+        opened = raw.rfind(opening)
+        if opened != -1 and closing not in raw[opened:]:
+            raw = raw[:opened]
+    raw = _PMID_TAIL.sub("", raw)
+    return for_reader(raw)
+
+
+# «P», «PM», «PMI», «PMID», «PMID: 12» в самом конце недописанного текста.
+_PMID_TAIL = re.compile(r"\bP(?:M(?:I(?:D)?)?)?\b:?[\s\d,;]*$")
+
 # Предложение назвать любимые продукты. Показывается ОДИН раз и только
 # после того, как человек увидел собранный рацион.
 #
@@ -1208,11 +1247,22 @@ class NutritionAgent:
     # ------------------------------------------------------------------
     # Вспомогательное
     # ------------------------------------------------------------------
-    def _complete(self, prompt: str, temperature: float = 0.0, json_mode: bool = False) -> str:
+    def _complete(
+        self,
+        prompt: str,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        on_text: Callable[[str], None] | None = None,
+    ) -> str:
         """Один вызов модели с повторами при сетевых сбоях.
 
         Ретраи здесь обязательны: у графа до семи обращений к модели на реплику,
         и без повторов один случайный таймаут провайдера ронял бы весь ответ.
+
+        ``on_text`` — ответ по частям: получает весь накопленный текст после
+        каждого куска. При повторе попытки текст начинается заново, и первый
+        же кусок новой попытки заменяет показанное — склейки обрывка
+        с новым ответом не бывает.
         """
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1228,19 +1278,25 @@ class NutritionAgent:
 
         for attempt in range(self.max_retries):
             try:
-                response = self.client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content or ""
+                if on_text is not None:
+                    content, usage = self._stream(kwargs, on_text)
+                else:
+                    response = self.client.chat.completions.create(**kwargs)
+                    content = response.choices[0].message.content or ""
+                    usage = getattr(response, "usage", None)
                 if calls is not None:
                     call = {
                         "response": content[:TRACE_RESPONSE_CHARS],
                         "attempts": attempt + 1,
                         "seconds": round(time.perf_counter() - started, 2),
                     }
+                    if on_text is not None:
+                        call["streamed"] = True
                     # Токены — только если провайдер их вернул. Нет счётчика —
                     # нет поля, а не ноль: «0 токенов» читалось бы как бесплатный вызов.
-                    usage = getattr(response, "usage", None)
                     for field in ("prompt_tokens", "completion_tokens"):
-                        value = getattr(usage, field, None)
+                        value = (usage.get(field) if isinstance(usage, dict)
+                                 else getattr(usage, field, None))
                         if isinstance(value, int):
                             call[field] = value
                     calls.append(call)
@@ -1276,6 +1332,49 @@ class NutritionAgent:
         raise RuntimeError(
             f"Модель не ответила после {self.max_retries} попыток: {last_error}"
         ) from last_error
+
+    @staticmethod
+    def _text_sink(state: AgentState) -> Callable[[str], None] | None:
+        """Куда отдавать финальный текст по частям — или None, если некуда.
+
+        Только для узлов, чей ответ модели и есть ответ человеку. Сырой
+        текст, с номерами PMID: вырезает их тот, кто показывает (api.py),
+        — тем же for_reader, что и готовый ответ.
+        """
+        emit = state.get("on_event")
+        if emit is None:
+            return None
+        return lambda text: emit({"type": "text", "raw": text})
+
+    def _stream(self, kwargs: dict[str, Any], on_text: Callable[[str], None]):
+        """Ответ модели по частям. Возвращает (текст, usage или None).
+
+        Поток читается ВРУЧНУЮ и до конца, а не итератором SDK. Замер:
+        после итератора SDK в наборе соединений оставалось 0 — он бросает
+        чтение на «[DONE]» и закрывает недочитанное, и соединение
+        выбрасывается. С зависающим рукопожатием (providers.py) это лишние
+        секунды на КАЖДОМ потоковом ответе и на следующем вызове за ним.
+        """
+        text = ""
+        usage = None
+        with self.client.chat.completions.with_streaming_response.create(
+            **kwargs, stream=True, stream_options={"include_usage": True},
+        ) as response:
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    continue
+                chunk = json.loads(data)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece:
+                        text += piece
+                        on_text(text)
+        return text, usage
 
     def _call_in_background(self, prompt: str, json_mode: bool):
         """Вызов модели в потоке пула. Возвращает (ответ, вызовы, ошибка).
@@ -1518,6 +1617,7 @@ class NutritionAgent:
                 ),
             ),
             temperature=0.3,
+            on_text=self._text_sink(state),
         )
         return {"answer": answer.strip()}
 
@@ -1688,6 +1788,7 @@ class NutritionAgent:
                 context=self._format_context(chunks),
             ),
             temperature=0.3,
+            on_text=self._text_sink(state),
         )
 
         text = answer.strip()
@@ -1987,7 +2088,7 @@ class NutritionAgent:
         personal = self._personal_norms(state.get("profile"))
         if personal:
             prompt = prompt.replace(FRAGMENTS_HEADER, personal + FRAGMENTS_HEADER, 1)
-        answer = self._complete(prompt, temperature=0.2)
+        answer = self._complete(prompt, temperature=0.2, on_text=self._text_sink(state))
         return {"answer": answer.strip()}
 
     def _personal_norms(self, raw_profile: dict | None) -> str:
@@ -2026,6 +2127,9 @@ class NutritionAgent:
         отсеивается дальше по коду, и по итоговому профилю его уже не видно.
         """
         def wrapper(state: AgentState) -> AgentState:
+            emit = state.get("on_event")
+            if emit is not None and name in STAGE_LABELS:
+                emit({"type": "stage", "node": name, "label": STAGE_LABELS[name]})
             token = _LLM_CALLS.set([])
             started = time.perf_counter()
             try:
@@ -2111,10 +2215,15 @@ class NutritionAgent:
         dataset_row_id: str | None = None,
         remember: bool = True,
         state: ConversationState | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> RAGAgentAnswer:
         """Ответить на реплику пользователя.
 
         Args:
+            on_event: события для ответа по частям — {"type": "stage", ...}
+                в начале каждого шага и {"type": "text", "raw": ...} по мере
+                того, как модель пишет финальный ответ. Вызывается из потока,
+                в котором идёт ответ. Итоговый ответ от этого не меняется.
             remember: сохранять ли профиль и историю для следующих реплик.
                 На прогоне метрик это выключают: вопросы там независимы,
                 и профиль от одного не должен протекать в другой.
@@ -2134,6 +2243,7 @@ class NutritionAgent:
                 "history": list(memory.history) if remember else [],
                 "profile": dict(memory.profile) if remember else {},
                 "days": memory.days if remember else 1,
+                "on_event": on_event,
             }
         )
 

@@ -617,45 +617,102 @@ function addMessage(role, html) {
   return node;
 }
 
-// Ожидание бывает долгим: меню на месяц — это полминуты. Молчаливое «…»
-// в такой паузе выглядит как зависание, поэтому показываем, что происходит,
-// и сколько уже идёт.
+// Ожидание бывает долгим: меню на месяц — это двадцать секунд. Молчаливое
+// «…» в такой паузе выглядит как зависание, поэтому показываем, что
+// происходит, и сколько уже идёт. Этап присылает сервер (событие stage):
+// раньше он угадывался по таймеру, и «ищу в статьях» горело на 4-й секунде
+// и тогда, когда агент собирал рацион и в статьи не ходил.
 function showThinking() {
   const node = addMessage("agent",
     `<div class="thinking"><span class="dots"><i></i><i></i><i></i></span>
-     <span id="think-text">думаю</span></div>`);
+     <span class="think-text">думаю</span></div>`);
+  const label = node.querySelector(".think-text");
   const started = Date.now();
-  const stages = [[0, "думаю"], [4, "ищу в статьях"], [9, "считаю норму"],
-                  [15, "подбираю блюда"], [30, "собираю меню на все дни"]];
-  const timer = setInterval(() => {
-    const sec = Math.round((Date.now() - started) / 1000);
-    const stage = stages.filter(([t]) => sec >= t).pop()[1];
-    const label = $("think-text");
-    if (label) label.textContent = `${stage}… ${sec} с`;
-  }, 1000);
-  return () => { clearInterval(timer); node.remove(); };
+  let stage = "думаю";
+  const draw = () => {
+    label.textContent = `${stage}… ${Math.round((Date.now() - started) / 1000)} с`;
+  };
+  const timer = setInterval(draw, 1000);
+  return {
+    stage(text) { stage = text; draw(); },
+    remove() { clearInterval(timer); node.remove(); },
+  };
+}
+
+function renderAnswer(data) {
+  return renderCycle(data.cycled) + renderPlan(data) +
+    `<div class="text">${renderText(data.answer)}</div>` +
+    renderDownload(data) + renderSources(data.sources) +
+    renderChecked(data) + renderProfile(data.profile);
+}
+
+// Ответ по частям: /chat/stream шлёт события SSE. EventSource не годится —
+// он умеет только GET, а реплика уходит POST-ом, поэтому поток читается
+// вручную. Событие text несёт ВЕСЬ текст на сейчас, не приращение.
+async function* streamEvents(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      const data = block.split("\n").filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trim()).join("\n");
+      if (data) yield JSON.parse(data);
+    }
+  }
 }
 
 async function send(text) {
   addMessage("user", escape(text));
-  const done = showThinking();
+  const thinking = showThinking();
+  let node = null;  // сообщение агента — появляется с первым текстом
   $("send").disabled = true;
 
   try {
-    const data = await api("/chat", {
+    const response = await fetch("/chat/stream", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: text, session_id: sessionId }),
     });
-    sessionId = data.session_id;
-    done();
-    addMessage("agent",
-      renderCycle(data.cycled) + renderPlan(data) +
-      `<div class="text">${renderText(data.answer)}</div>` +
-      renderDownload(data) + renderSources(data.sources) +
-      renderChecked(data) + renderProfile(data.profile));
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail ? JSON.stringify(detail.detail) : `HTTP ${response.status}`);
+    }
+    let finished = false;
+    for await (const event of streamEvents(response)) {
+      if (event.type === "stage") {
+        thinking.stage(event.label);
+      } else if (event.type === "text") {
+        if (!node) {
+          thinking.remove();
+          node = addMessage("agent", `<div class="text"></div>`);
+        }
+        node.querySelector(".text").innerHTML = renderText(event.text);
+        node.scrollIntoView({ block: "end" });
+      } else if (event.type === "done") {
+        const data = event.response;
+        sessionId = data.session_id;
+        // Итог заменяет показанное целиком: к объяснению плана код
+        // дописывает стоимость и примечания, а сверху встаёт карточка.
+        if (node) node.querySelector(".bubble").innerHTML = renderAnswer(data);
+        else { thinking.remove(); node = addMessage("agent", renderAnswer(data)); }
+        finished = true;
+      } else if (event.type === "error") {
+        throw new Error(event.detail);
+      }
+    }
+    if (!finished) throw new Error("ответ оборвался — попробуйте ещё раз");
   } catch (error) {
-    done();
-    addMessage("agent", `<div class="text">Ошибка: ${escape(error.message)}</div>`);
+    thinking.remove();
+    const message = `<div class="text">Ошибка: ${escape(error.message)}</div>`;
+    if (node) node.querySelector(".bubble").innerHTML = message;
+    else addMessage("agent", message);
   } finally {
     $("send").disabled = false;
     $("q").focus();

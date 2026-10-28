@@ -22,18 +22,22 @@ HTTP-сервис поверх агента.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import queue
+import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path as FilePath
 from threading import Lock
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -45,6 +49,7 @@ from agent import (
     NutritionAgent,
     build_agent,
     for_reader,
+    for_reader_partial,
 )
 from chat_log import ChatLog, turn_record
 from export import menu_to_xlsx
@@ -480,6 +485,105 @@ def post_chat(
     из предыдущего ответа.
     """
     session_id, state = sessions.get_or_create(request.session_id)
+    return _run_turn(request, session_id, state, agent, menus, chat_log)
+
+
+@app.post("/chat/stream", tags=["разговор"])
+def post_chat_stream(
+    request: ChatRequest = Body(...),
+    agent: NutritionAgent = Depends(get_agent),
+    sessions: SessionStore = Depends(get_sessions),
+    menus: MenuStore = Depends(get_menus),
+    chat_log: ChatLog = Depends(get_chat_log),
+) -> StreamingResponse:
+    """То же, что ``/chat``, но ответ приходит по частям (Server-Sent Events).
+
+    События, по одному JSON в строке ``data:``:
+
+    * ``{"type": "stage", "label": "ищу в статьях"}`` — начался шаг;
+    * ``{"type": "text", "text": "..."}`` — ВЕСЬ показанный текст на сейчас,
+      уже без номеров PMID (не приращение: вырезание ссылки может убрать
+      и уже показанный предлог перед ней);
+    * ``{"type": "done", "response": {...}}`` — итог, ровно как ответ ``/chat``;
+      его текст заменяет показанный: в конец ответа с планом код дописывает
+      стоимость и примечания;
+    * ``{"type": "error", "detail": "..."}``.
+
+    Зачем. Ответ по статьям пишется моделью 4-6 с, объяснение плана 3-5 с,
+    и всё это время человек смотрел на «думаю…». Первый текст теперь
+    появляется, как только модель начала писать.
+    """
+    session_id, state = sessions.get_or_create(request.session_id)
+    events: queue.Queue[dict | None] = queue.Queue()
+
+    def work() -> None:
+        try:
+            response = _run_turn(request, session_id, state, agent, menus, chat_log,
+                                 on_event=events.put)
+            events.put({"type": "done", "response": response.model_dump(mode="json")})
+        except HTTPException as error:
+            events.put({"type": "error", "detail": str(error.detail)})
+        except Exception:
+            logger.exception("Сбой ответа по частям")
+            events.put({"type": "error", "detail": "Внутренняя ошибка, попробуйте ещё раз"})
+        finally:
+            events.put(None)
+
+    # Ответ — в своём потоке, а не в генераторе: человек может закрыть
+    # вкладку, генератор остановится, а реплика всё равно должна дойти
+    # до конца и попасть в журнал и историю разговора.
+    threading.Thread(target=work, daemon=True, name="chat-stream").start()
+    return StreamingResponse(
+        _sse(events), media_type="text/event-stream",
+        # no-transform/X-Accel-Buffering: прокси (nginx) иначе копит поток
+        # и отдаёт одним куском — стриминг молча перестаёт быть стримингом.
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+# Не чаще раза в 80 мс: модель шлёт куски по 1-3 токена, и перерисовка
+# на каждый — сотни событий в секунду без видимой разницы для глаза.
+TEXT_EVENT_INTERVAL = 0.08
+
+
+def _sse(events: queue.Queue) -> Iterator[str]:
+    """События агента → строки SSE. Текст — без PMID и не чаще интервала."""
+    def line(event: dict) -> str:
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    pending: str | None = None
+    shown = ""
+    sent_at = 0.0
+    while True:
+        try:
+            event = events.get(timeout=TEXT_EVENT_INTERVAL)
+        except queue.Empty:
+            event = {"type": "flush"}
+        if event is None:
+            return
+        if event["type"] == "text":
+            pending = for_reader_partial(event["raw"])
+        elif event["type"] != "flush":
+            pending = None  # итог или новый шаг: недосланный текст устарел
+        due = time.perf_counter() - sent_at >= TEXT_EVENT_INTERVAL
+        if pending is not None and pending != shown and (due or event["type"] == "flush"):
+            shown = pending
+            sent_at = time.perf_counter()
+            yield line({"type": "text", "text": shown})
+        if event["type"] not in ("text", "flush"):
+            yield line({k: v for k, v in event.items() if k != "raw"})
+
+
+def _run_turn(
+    request: ChatRequest,
+    session_id: str,
+    state: ConversationState,
+    agent: NutritionAgent,
+    menus: MenuStore,
+    chat_log: ChatLog,
+    on_event: Callable[[dict], None] | None = None,
+) -> ChatResponse:
+    """Реплика целиком: ответ агента, журнал, меню на скачивание."""
     started = time.perf_counter()
     # Номер реплики в разговоре — до ответа: при сбое история не растёт.
     turn = len(state.history) // 2 + 1
@@ -488,7 +592,7 @@ def post_chat(
         return int((time.perf_counter() - started) * 1000)
 
     try:
-        answer = agent.run(request.message, state=state)
+        answer = agent.run(request.message, state=state, on_event=on_event)
     except Exception as error:
         # Сбой пишется в журнал ВМЕСТЕ с репликой: по одной трассировке
         # в логе uvicorn не понять, на какой фразе агент упал.

@@ -74,9 +74,55 @@ class FakeCompletions:
         return FakeResponse(self._owner.default)
 
 
+class FakeStreamedResponse:
+    """Ответ как поток SSE: тот же текст, нарезанный на куски по 7 символов.
+
+    Куски нарочно мелкие — ссылка «[PMID 111]» рвётся посередине, как
+    у настоящей модели, и вырезание номеров на лету проверяется на деле.
+    """
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def __enter__(self) -> FakeStreamedResponse:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def iter_lines(self):
+        import json
+
+        for start in range(0, len(self._content), 7):
+            piece = self._content[start:start + 7]
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": piece}}]})
+            yield ""
+        yield "data: " + json.dumps({"choices": [], "usage": {
+            "prompt_tokens": 10, "completion_tokens": len(self._content) // 4}})
+        yield ""
+        yield "data: [DONE]"
+
+
+class FakeStreaming:
+    """``completions.with_streaming_response`` — через тот же ``create``.
+
+    Ответ берётся обычным ``create``, поэтому сценарий, отказы и подмены
+    ``create`` в тестах действуют и на потоковый вызов.
+    """
+
+    def __init__(self, completions: FakeCompletions) -> None:
+        self._completions = completions
+
+    def create(self, **kwargs: Any) -> FakeStreamedResponse:
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("stream", "stream_options")}
+        response = self._completions.create(**kwargs)
+        return FakeStreamedResponse(response.choices[0].message.content)
+
+
 class FakeChat:
     def __init__(self, owner: FakeLLMClient) -> None:
         self.completions = FakeCompletions(owner)
+        self.completions.with_streaming_response = FakeStreaming(self.completions)
 
 
 class FakeLLMClient:

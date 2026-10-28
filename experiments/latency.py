@@ -51,9 +51,18 @@ CASES = {
 }
 
 
-def run_case(agent, message: str) -> dict:
+def run_case(agent, message: str, stream: bool = True) -> dict:
+    # Первый текст — то, ради чего ответ идёт по частям: сколько человек
+    # смотрит на «думаю…». Без потока он совпадает с полным временем.
+    first_text: list[float] = []
+
+    def on_event(event: dict) -> None:
+        if event["type"] == "text" and not first_text:
+            first_text.append(time.perf_counter() - started)
+
     started = time.perf_counter()
-    answer = agent.run(message, state=ConversationState())
+    answer = agent.run(message, state=ConversationState(),
+                       on_event=on_event if stream else None)
     total = time.perf_counter() - started
 
     nodes: dict[str, float] = {}
@@ -68,6 +77,7 @@ def run_case(agent, message: str) -> dict:
                 completion_tokens.append(call["completion_tokens"])
     return {
         "seconds": round(total, 2),
+        "first_text": round(first_text[0], 2) if first_text else round(total, 2),
         "nodes": {name: round(sec, 2) for name, sec in nodes.items()},
         # None, если провайдер не вернул ни одного счётчика: «0» читалось бы
         # как бесплатный ответ.
@@ -88,6 +98,7 @@ def summarise(runs: dict[str, list[dict]]) -> dict[str, dict]:
         node_names = sorted({name for item in items for name in item["nodes"]})
         out[case] = {
             "seconds": med("seconds"),
+            "first_text": med("first_text"),
             "prompt_tokens": med("prompt_tokens"),
             "completion_tokens": med("completion_tokens"),
             "answer_chars": med("answer_chars"),
@@ -111,6 +122,7 @@ def print_report(summary: dict, baseline: dict | None) -> None:
         base = (baseline or {}).get(case)
         print(f"\n{case}  (маршрут: {', '.join(row['intents'])})")
         for key, label, unit in (("seconds", "всего", " с"),
+                                 ("first_text", "первый текст", " с"),
                                  ("prompt_tokens", "токенов вход", ""),
                                  ("completion_tokens", "токенов выход", ""),
                                  ("answer_chars", "символов ответа", "")):
@@ -133,6 +145,8 @@ def main() -> None:
     parser.add_argument("--cases", nargs="*", help="только эти случаи (по началу названия)")
     parser.add_argument("--no-speculate", action="store_true",
                         help="без вызовов наперёд — для сравнения с ними")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="без ответа по частям — для сравнения с ним")
     args = parser.parse_args()
 
     llm_client, model, embed_client = get_clients("polza")
@@ -147,7 +161,7 @@ def main() -> None:
     # провайдера за время прогона ложится на все случаи поровну.
     for repeat in range(args.repeats):
         for name, text in cases.items():
-            result = run_case(agent, text)
+            result = run_case(agent, text, stream=not args.no_stream)
             runs[name].append(result)
             print(f"[{repeat + 1}/{args.repeats}] {name}: {result['seconds']:.1f} с", flush=True)
 
