@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import FakeLLMClient, FakeRetriever
+from conftest import FakeLLMClient, FakeRetriever, consented
 from fastapi.testclient import TestClient
 
 import api
@@ -49,7 +49,7 @@ def client(catalog, fake_chunks):
     api._state["catalog"] = catalog
     api._state["storage"] = MemoryStorage()
 
-    yield TestClient(app)
+    yield consented(TestClient(app))
 
     api._state.clear()
 
@@ -182,7 +182,7 @@ class TestChatEndpoint:
         api._state["catalog"] = catalog
         api._state["storage"] = MemoryStorage()
 
-        response = TestClient(app).post("/chat", json={"message": "Привет"})
+        response = consented(TestClient(app)).post("/chat", json={"message": "Привет"})
         assert response.status_code == 502
         api._state.clear()
 
@@ -200,7 +200,7 @@ class TestSessions:
         return http.cookies[SESSION_COOKIE]
 
     def test_cookie_is_httponly_and_lax(self, client):
-        response = client.post("/chat", json={"message": "Привет"})
+        response = TestClient(app).post("/consent", json={"health_data": True})
         cookie = response.headers["set-cookie"].lower()
         assert "httponly" in cookie and "samesite=lax" in cookie
 
@@ -214,14 +214,16 @@ class TestSessions:
     def test_sessions_are_isolated(self, client):
         """Профиль одного пользователя не должен попасть другому."""
         client.post("/chat", json={"message": "Привет"})
-        TestClient(app).post("/chat", json={"message": "Привет"})
+        consented(TestClient(app)).post("/chat", json={"message": "Привет"})
         assert api._state["storage"].count_sessions() == 2
 
     def test_imposed_token_is_not_adopted(self, client):
-        """Неизвестный пропуск — новая сессия с НОВЫМ пропуском, не с этим."""
-        client.cookies.set(SESSION_COOKIE, "attacker-chosen-id")
-        response = client.post("/chat", json={"message": "Привет"})
-        assert response.status_code == 200
+        """Неизвестный пропуск не начинает разговор, а при согласии
+        сервер выдаёт НОВЫЙ пропуск, а не присланный."""
+        http = TestClient(app)
+        http.cookies.set(SESSION_COOKIE, "attacker-chosen-id")
+        assert http.post("/chat", json={"message": "Привет"}).status_code == 403
+        response = http.post("/consent", json={"health_data": True})
         issued = response.cookies.get(SESSION_COOKIE)
         assert issued and issued != "attacker-chosen-id"
         assert api._state["storage"].load_session("attacker-chosen-id") is None
@@ -255,7 +257,7 @@ class TestSessions:
         menu_id = self._menu_for(client, catalog)
 
         assert client.get(f"/menu/{menu_id}.xlsx").status_code == 200
-        stranger = TestClient(app)
+        stranger = consented(TestClient(app))
         stranger.post("/chat", json={"message": "Привет"})
         assert stranger.get(f"/menu/{menu_id}.xlsx").status_code == 404
         assert TestClient(app).get(f"/menu/{menu_id}.xlsx").status_code == 404
@@ -276,6 +278,7 @@ class TestSessions:
     def test_conversation_survives_restart(self, client, tmp_path):
         path = tmp_path / "state.sqlite3"
         api._state["storage"] = SqliteStorage(path)
+        client = consented(TestClient(app))
         client.post("/chat", json={"message": "Привет"})
 
         api._state["storage"] = SqliteStorage(path)  # «рестарт»: новый процесс, тот же том

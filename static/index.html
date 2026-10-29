@@ -274,6 +274,36 @@
   }
   .send:disabled { opacity: .4; cursor: default; }
   .hint { text-align: center; font-size: 11.5px; color: var(--muted); margin-top: 9px; }
+  .hint a { color: var(--muted); }
+
+  /* ── Согласие ───────────────────────────────────────────── */
+  /* До первой реплики: в разговоре — данные о здоровье (152-ФЗ, спец.
+     категория). Сервер без согласия всё равно ответит 403 — окно лишь
+     объясняет, зачем оно и что именно разрешается. */
+  .consent {
+    position: fixed; inset: 0; z-index: 10; display: none;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    align-items: center; justify-content: center; padding: 16px;
+  }
+  .consent.open { display: flex; }
+  .consent-box {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: var(--shadow); max-width: 480px; width: 100%; padding: 22px 22px 18px;
+  }
+  .consent-box h2 { margin: 0 0 8px; font-size: 18px; font-weight: 650; }
+  .consent-box p { margin: 0 0 14px; color: var(--muted); font-size: 13.5px; }
+  .consent-box label {
+    display: flex; gap: 10px; align-items: flex-start; font-size: 14px; margin-bottom: 12px;
+    cursor: pointer;
+  }
+  .consent-box input { margin-top: 4px; accent-color: var(--accent); }
+  .consent-box .optional { color: var(--muted); }
+  .consent-box a { color: var(--accent); }
+  .consent-go {
+    width: 100%; border: 0; border-radius: 10px; padding: 10px; margin-top: 4px;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .consent-go:disabled { opacity: .4; cursor: default; }
 </style>
 </head>
 <body>
@@ -286,7 +316,9 @@
   </div>
   <div class="spacer"></div>
   <span class="sub" id="status"></span>
-  <button class="icon-btn" id="reset" title="Забыть профиль и начать заново">Начать заново</button>
+  <button class="icon-btn" id="reset"
+          title="Удалить профиль, переписку, собранные меню и согласие — и начать заново">
+    Удалить мои данные</button>
 </header>
 
 <div class="layout">
@@ -309,8 +341,25 @@
       <textarea id="q" rows="1" placeholder="Напишите сообщение…" autocomplete="off"></textarea>
       <button class="send" id="send" title="Отправить">↑</button>
     </form>
-    <div class="hint">Справочный расчёт. При заболеваниях рацион подбирает врач.</div>
+    <div class="hint">Справочный расчёт. При заболеваниях рацион подбирает врач.
+      <a href="/privacy.html" target="_blank">Как обрабатываются данные</a></div>
   </div>
+</div>
+
+<div class="consent" id="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
+  <form class="consent-box" id="consent-form">
+    <h2 id="consent-title">Перед началом</h2>
+    <p>Чтобы посчитать норму и рацион, нужны ваши рост, вес, возраст и, если
+       вы о них расскажете, сведения о здоровье. Это особая категория
+       персональных данных, поэтому сначала — согласие.</p>
+    <label><input type="checkbox" id="consent-health" required>
+      <span>Даю согласие на обработку данных о моём здоровье для расчёта нормы
+      и рациона — <a href="/privacy.html" target="_blank">условия обработки</a>.</span></label>
+    <label class="optional"><input type="checkbox" id="consent-improve">
+      <span>Необязательно: разрешаю хранить переписку до 30 дней, чтобы
+      разработчики находили ошибки в ответах.</span></label>
+    <button class="consent-go" id="consent-go" disabled>Продолжить</button>
+  </form>
 </div>
 
 <script>
@@ -682,6 +731,9 @@ async function send(text) {
       body: JSON.stringify({ message: text }),
     });
     if (!response.ok) {
+      // Согласия нет (удалено, истекло вместе с сессией) — сервер не начнёт
+      // разговор; показываем окно вместо непонятной ошибки.
+      if (response.status === 403) showConsent();
       const detail = await response.json().catch(() => ({}));
       throw new Error(detail.detail ? JSON.stringify(detail.detail) : `HTTP ${response.status}`);
     }
@@ -753,6 +805,34 @@ $("reset").addEventListener("click", async () => {
   await fetch("/session", { method: "DELETE" }).catch(() => {});
   location.reload();
 });
+
+// ── Согласие ─────────────────────────────────────────────────
+function showConsent() {
+  $("consent").classList.add("open");
+  $("consent-health").focus();
+}
+
+$("consent-health").addEventListener("change", (event) => {
+  $("consent-go").disabled = !event.target.checked;
+});
+
+$("consent-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("consent-go").disabled = true;
+  try {
+    await api("/consent", {
+      method: "POST",
+      body: JSON.stringify({ health_data: true, improve_service: $("consent-improve").checked }),
+    });
+    $("consent").classList.remove("open");
+    $("q").focus();
+  } catch (error) {
+    $("consent-go").disabled = false;
+    $("consent-title").textContent = `Не получилось: ${error.message}`;
+  }
+});
+
+api("/session").then((s) => { if (!s.consented) showConsent(); }).catch(() => {});
 
 api("/health")
   .then(() => { $("status").textContent = ""; })

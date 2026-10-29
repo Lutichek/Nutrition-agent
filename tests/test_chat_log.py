@@ -12,7 +12,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from conftest import FakeLLMClient, FakeRetriever
+from conftest import FakeLLMClient, FakeRetriever, consented
 from fastapi.testclient import TestClient
 
 import agent as agent_module
@@ -44,7 +44,7 @@ def make_client(catalog, chunks, chat_log, llm=None):
     api._state.update(
         agent=agent, catalog=catalog, storage=MemoryStorage(), chat_log=chat_log,
     )
-    return TestClient(app, raise_server_exceptions=False)
+    return consented(TestClient(app, raise_server_exceptions=False), improve_service=True)
 
 
 def read_records(directory) -> list[dict]:

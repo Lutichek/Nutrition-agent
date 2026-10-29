@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import FakeLLMClient, FakeRetriever, FakeStreamedResponse
+from conftest import FakeLLMClient, FakeRetriever, FakeStreamedResponse, consented
 from fastapi.testclient import TestClient
 
 import agent as agent_module
@@ -147,7 +147,7 @@ def client(catalog, fake_chunks, tmp_path):
             agent=make_agent(catalog, script, fake_chunks, **kwargs), catalog=catalog,
             storage=MemoryStorage(), chat_log=ChatLog(tmp_path),
         )
-        return TestClient(app)
+        return consented(TestClient(app), improve_service=True)
     yield make
     api._state.clear()
 

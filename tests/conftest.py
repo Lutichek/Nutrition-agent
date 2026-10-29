@@ -147,6 +147,18 @@ class FakeLLMClient:
         self.chat = FakeChat(self)
 
 
+def consented(http: Any, improve_service: bool = False) -> Any:
+    """Клиент API с согласием: без него /chat отвечает 403 (ревью R4).
+
+    improve_service — отдельное согласие на журнал: без него реплики
+    в журнал не пишутся, и тесты журнала обязаны его давать.
+    """
+    response = http.post("/consent", json={"health_data": True,
+                                           "improve_service": improve_service})
+    assert response.status_code == 200, response.text
+    return http
+
+
 class FakeTable:
     """Подмена таблицы LanceDB — ровно тот кусок интерфейса, который читает API."""
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import FakeLLMClient, FakeRetriever
+from conftest import FakeLLMClient, FakeRetriever, consented
 from fastapi.testclient import TestClient
 
 import api
@@ -56,7 +56,7 @@ def ask(http: TestClient, path="/chat"):
 class TestRate:
     def test_session_limit_is_429_with_text(self, setup):
         setup(chat_per_minute_session=2)
-        http = TestClient(app)
+        http = consented(TestClient(app))
         assert [ask(http).status_code for _ in range(2)] == [200, 200]
 
         response = ask(http)
@@ -67,7 +67,7 @@ class TestRate:
     def test_script_without_cookies_hits_ip_limit(self, setup):
         """Без cookie каждый запрос — НОВАЯ сессия: держит только лимит по адресу."""
         setup(chat_per_minute_ip=3)
-        codes = [ask(TestClient(app)).status_code for _ in range(4)]
+        codes = [ask(consented(TestClient(app))).status_code for _ in range(4)]
         assert codes == [200, 200, 200, 429]
 
     def test_calc_and_menu_limited_separately(self, setup):
@@ -83,18 +83,18 @@ class TestRate:
     def test_concurrent_streams_per_ip(self, setup):
         setup(streams_per_ip=1)
         api._limiter().acquire("stream:testclient", 1)  # один ответ уже идёт
-        response = ask(TestClient(app), "/chat/stream")
+        response = ask(consented(TestClient(app)), "/chat/stream")
         assert response.status_code == 429
 
         api._limiter().release("stream:testclient")
-        assert ask(TestClient(app), "/chat/stream").status_code == 200
+        assert ask(consented(TestClient(app)), "/chat/stream").status_code == 200
         assert api._limiter()._active["stream:testclient"] == 0, "место освобождено"
 
 
 class TestDailyBudget:
     def test_exhausted_mid_reply_is_429_and_stops(self, setup):
         agent, storage = setup(per_day=2)  # вопрос стоит 4 вызова
-        response = ask(TestClient(app))
+        response = ask(consented(TestClient(app)))
 
         assert response.status_code == 429
         assert response.json()["detail"] == BUDGET_TEXT
@@ -104,7 +104,7 @@ class TestDailyBudget:
         agent, storage = setup(per_day=2)
         storage.add_usage(_today(), 2)
         for path in ("/chat", "/chat/stream"):
-            response = ask(TestClient(app), path)
+            response = ask(consented(TestClient(app)), path)
             assert response.status_code == 429, path
         assert agent.client.calls == []
 
@@ -112,7 +112,7 @@ class TestDailyBudget:
         """Вызовы наперёд (speculate) — тоже деньги: невостребованный
         extract_profile на вопросе обязан попасть в счётчик."""
         agent, storage = setup(speculate=True, per_day=1000)
-        assert ask(TestClient(app)).status_code == 200
+        assert ask(consented(TestClient(app))).status_code == 200
         used = storage.get_usage(_today())
         assert used == len(agent.client.calls) == 5
 

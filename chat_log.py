@@ -130,6 +130,35 @@ class ChatLog:
             except (ValueError, OSError):
                 logger.warning("Не удалось удалить старый журнал %s", path, exc_info=True)
 
+    def forget(self, session_id: str) -> int:
+        """Стереть из журнала все реплики разговора — «удалить мои данные».
+
+        Файлы суток переписываются без этих строк; переписка .md за те же
+        сутки удаляется целиком — она собрана из журнала и пересобирается
+        командой ``python chat_log.py``, а оставь её — удалённое осталось бы
+        на диске в читаемом виде. Возвращает, сколько реплик стёрто.
+        """
+        if self.directory is None or not self.directory.is_dir():
+            return 0
+        removed = 0
+        with self._lock:
+            for path in self.directory.glob("chat-*.jsonl"):
+                lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+                kept = []
+                for line in lines:
+                    try:
+                        mine = json.loads(line).get("session_id") == session_id
+                    except json.JSONDecodeError:
+                        mine = False
+                    if mine:
+                        removed += 1
+                    else:
+                        kept.append(line)
+                if len(kept) != len(lines):
+                    path.write_text("".join(kept), encoding="utf-8")
+                    path.with_suffix(".md").unlink(missing_ok=True)
+        return removed
+
 
 def replay_plan(agent: Any, trace: dict[str, Any]) -> list[list[int]] | None:
     """Пересобрать меню из записи журнала: fdc_id блюд по дням.

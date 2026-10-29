@@ -33,6 +33,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path as FilePath
 from typing import Any
 
@@ -98,18 +99,45 @@ class Session:
                 "consent": self.consent}
 
 
-def _open_session(request: Request, storage: Any) -> Session:
-    """Сессия по пропуску из cookie или заголовка; нет такой — новая."""
+def _find_session(request: Request, storage: Any) -> Session | None:
+    """Сессия по пропуску из cookie или заголовка — или None."""
     token = request.cookies.get(SESSION_COOKIE) or request.headers.get(SESSION_HEADER)
     data = storage.load_session(token) if token else None
-    if data is not None:
-        return Session(token=token, public_id=data["public_id"],
-                       state=ConversationState(**data["state"]),
-                       consent=data.get("consent") or {})
+    if data is None:
+        return None
+    return Session(token=token, public_id=data["public_id"],
+                   state=ConversationState(**data["state"]),
+                   consent=data.get("consent") or {})
+
+
+def _open_session(request: Request, storage: Any) -> Session:
+    """Сессия по пропуску; нет такой — новая, с НОВЫМ пропуском (не с присланным)."""
+    session = _find_session(request, storage)
+    if session is not None:
+        return session
     session = Session(token="", public_id=uuid.uuid4().hex, state=ConversationState(),
                       is_new=True)
     session.token = storage.create_session(session.dump())
-    _hit_session(session.token)  # первая реплика новой сессии — тоже в счёт
+    return session
+
+
+# Ревью R4: в разговоре — вес, возраст, диагнозы, то есть данные о здоровье
+# (специальная категория по 152-ФЗ). Без согласия разговор не начинается:
+# проверяет СЕРВЕР, а не только окно на странице — иначе любой клиент API
+# его обходит. Версия текста политики — рядом с согласием: поменяется
+# текст — видно, на какой из них человек соглашался.
+POLICY_VERSION = "2026-10-29-черновик"
+CONSENT_REQUIRED = (
+    "Сначала нужно согласие на обработку данных о здоровье — "
+    "см. /privacy.html и POST /consent."
+)
+
+
+def _consented_session(request: Request, storage: Any) -> Session:
+    """Сессия с согласием — иначе 403, и новая сессия НЕ заводится."""
+    session = _find_session(request, storage)
+    if session is None or not session.consent.get("health_data_at"):
+        raise HTTPException(status_code=403, detail=CONSENT_REQUIRED)
     return session
 
 
@@ -343,8 +371,8 @@ def _hit(key: str, limit: int, window: float, text: str) -> None:
 def limit_chat(http: Request) -> None:
     """Частота реплик: по адресу и по сессии.
 
-    По адресу — обязательно: скрипт без cookie каждый раз получает новую
-    сессию, и лимит по сессии его не держит.
+    По адресу — обязательно: лимит по сессии держит один разговор,
+    а скрипт может завести их сколько угодно через /consent.
     """
     limits, ip = _limits(), _client_ip(http)
     text = "Слишком много сообщений подряд — подождите {seconds} с и попробуйте снова."
@@ -356,9 +384,7 @@ def limit_chat(http: Request) -> None:
 
 
 def _hit_session(token: str) -> None:
-    """Засчитать реплику сессии. Зовётся и для НОВОЙ сессии после её
-    создания: без этого первая реплика (без cookie) в счёт не шла,
-    и лимит «2 в минуту» пропускал три."""
+    """Засчитать реплику сессии."""
     limits = _limits()
     text = "Слишком много сообщений подряд — подождите {seconds} с и попробуйте снова."
     _hit(f"chat-s-m:{token}", limits.chat_per_minute_session, 60, text)
@@ -544,7 +570,6 @@ def _reject_client_session_id(request: ChatRequest) -> None:
           dependencies=[Depends(limit_chat)])
 def post_chat(
     http: Request,
-    response: Response,
     request: ChatRequest = Body(...),
     agent: NutritionAgent = Depends(get_agent),
     storage: Any = Depends(get_storage),
@@ -553,12 +578,12 @@ def post_chat(
     """Реплика в разговоре с агентом.
 
     Профиль накапливается между репликами: человек редко называет все
-    параметры сразу. Разговор держит cookie, которую ставит сервер на первой
-    реплике; клиенту без cookie — тот же пропуск в заголовке X-Session-Token.
+    параметры сразу. Разговор держит cookie, которую ставит POST /consent;
+    клиенту без cookie — тот же пропуск в заголовке X-Session-Token.
+    Без согласия — 403, и разговор не начинается.
     """
     _reject_client_session_id(request)
-    session = _open_session(http, storage)
-    _set_session_cookie(response, session)
+    session = _consented_session(http, storage)
     return _run_turn(request, session, agent, storage, chat_log)
 
 
@@ -588,6 +613,7 @@ def post_chat_stream(
     появляется, как только модель начала писать.
     """
     _reject_client_session_id(request)
+    session = _consented_session(http, storage)
     # До потока, а не внутри: внутри отказ ушёл бы событием при статусе 200.
     if agent.budget is not None and agent.budget.exhausted():
         raise _budget_exhausted()
@@ -597,11 +623,6 @@ def post_chat_stream(
     if not _limiter().acquire(stream_key, _limits().streams_per_ip):
         raise HTTPException(status_code=429, detail=(
             "С вашего адреса уже идёт несколько ответов — дождитесь их."))
-    try:
-        session = _open_session(http, storage)
-    except Exception:
-        _limiter().release(stream_key)
-        raise
     events: queue.Queue[dict | None] = queue.Queue()
 
     def work() -> None:
@@ -628,7 +649,6 @@ def post_chat_stream(
         # и отдаёт одним куском — стриминг молча перестаёт быть стримингом.
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
-    _set_session_cookie(streaming, session)
     return streaming
 
 
@@ -676,6 +696,10 @@ def _run_turn(
     """Реплика целиком: ответ агента, журнал, меню на скачивание."""
     state = session.state
     session_id = session.public_id  # в журнал — не пропуск
+    # Журнал — только с ОТДЕЛЬНЫМ согласием «помогать улучшать сервис»:
+    # в нём текст реплик, то есть диагнозы и вес словами человека.
+    if not session.consent.get("improve_service"):
+        chat_log = ChatLog(None)
     started = time.perf_counter()
     # Номер реплики в разговоре — до ответа: при сбое история не растёт.
     turn = len(state.history) // 2 + 1
@@ -850,16 +874,58 @@ def post_menu_xlsx(request: MenuRequest, catalog=Depends(get_catalog)) -> Respon
     return _xlsx_response(menu, request.profile.model_dump())
 
 
+class ConsentRequest(BaseModel):
+    health_data: bool = Field(description=(
+        "Согласие на обработку данных о здоровье (вес, рост, возраст, заболевания) "
+        "для расчёта нормы и рациона. Без него разговор не начинается."))
+    improve_service: bool = Field(default=False, description=(
+        "Отдельно и необязательно: хранить переписку до 30 дней, чтобы находить ошибки."))
+
+
+@app.post("/consent", tags=["разговор"], dependencies=[Depends(limit_calc)])
+def post_consent(
+    http: Request,
+    response: Response,
+    request: ConsentRequest = Body(...),
+    storage: Any = Depends(get_storage),
+) -> dict[str, Any]:
+    """Дать согласие и начать разговор: сервер выдаёт пропуск в cookie."""
+    if not request.health_data:
+        raise HTTPException(status_code=400, detail=(
+            "Без согласия на обработку данных о здоровье посчитать норму "
+            "и рацион нельзя: для них нужны вес, рост и возраст."))
+    session = _open_session(http, storage)
+    session.consent = {
+        "health_data_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "improve_service": request.improve_service,
+        "policy": POLICY_VERSION,
+    }
+    storage.save_session(session.token, session.dump())
+    _set_session_cookie(response, session)
+    return {"consent": session.consent}
+
+
+@app.get("/session", tags=["разговор"], dependencies=[Depends(limit_calc)])
+def get_session(http: Request, storage: Any = Depends(get_storage)) -> dict[str, Any]:
+    """Есть ли согласие у текущего разговора — без самих данных."""
+    session = _find_session(http, storage)
+    consent = session.consent if session else {}
+    return {"consented": bool(consent.get("health_data_at")),
+            "improve_service": bool(consent.get("improve_service"))}
+
+
 @app.delete("/session", tags=["разговор"])
 def delete_session(
     http: Request,
     response: Response,
     storage: Any = Depends(get_storage),
+    chat_log: ChatLog = Depends(get_chat_log),
 ) -> dict[str, Any]:
-    """Удалить мои данные: разговор, профиль и собранные меню.
+    """Удалить мои данные: разговор, профиль, меню, записи журнала, согласие.
 
     Только СВОЮ сессию — по пропуску из cookie. Раньше была ручка
-    /sessions/{id}, и чужой разговор мог удалить любой, кто знает id.
+    /sessions/{id}: чужой разговор мог удалить любой, кто знает id,
+    а журнал и меню при этом не трогались вовсе.
     """
     token = http.cookies.get(SESSION_COOKIE) or http.headers.get(SESSION_HEADER)
     data = storage.delete_session(token) if token else None
@@ -867,7 +933,8 @@ def delete_session(
     if data is None:
         raise HTTPException(status_code=404, detail="Сессии нет — удалять нечего")
     menus = storage.delete_menus(data["public_id"])
-    return {"status": "deleted", "menus_deleted": menus}
+    journal = chat_log.forget(data["public_id"])
+    return {"status": "deleted", "menus_deleted": menus, "journal_deleted": journal}
 
 
 # ────────────────────────────────────────────────────────────
