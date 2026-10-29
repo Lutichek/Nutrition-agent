@@ -17,7 +17,8 @@
   (категории, «кроме», целиакия, «больше белка», манка и пшено);
 * ``hard`` — разговорные формы, халяль, арахис, нутриенты в паре;
 * ``mixed`` — смешанный знак в одной фразе: «ем / не ем / люблю»;
-* ``multi`` — реплика после уже названного: старое обязано остаться.
+* ``multi`` — реплика после уже названного: старое обязано остаться;
+* ``sweets`` — сладкое против сахара, в обе стороны (FORBID — лишнее).
 
 Режимы чередуются внутри прогона — дрейф провайдера ложится поровну.
 
@@ -130,7 +131,25 @@ MULTI = [
     ("Люблю курицу, но не ем грибы", {}, ["lactose", "mushroom"],
      [({"chicken"}, "куриц")], False, ("Молочку не ем", {"exclude": ["lactose"]})),
 ]
-SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED, "multi": MULTI}
+# Сладкое против сахара — в обе стороны. Модель путала словарь («Ещё без
+# сладкого» → sugar, выпечка в меню) и сама добавляла sweets там, где
+# сладкое разрешено. FORBID — чего НЕ должно быть в exclude.
+SWEETS = [
+    ("Без сладкого, пожалуйста", {}, ["sweets"], [], True),
+    ("Не ем сладкое и мучное", {}, ["sweets", "flour"], [], True),
+    ("Сладкое — нет", {}, ["sweets"], [], True),
+    ("Сладкое можно, но без шоколада", {}, ["chocolate"], [], False),
+    ("Не пью сладкие напитки", {}, ["sugar"], [], True),
+    ("Без сахара, пожалуйста", {}, ["sugar"], [], True),
+    ("Сахар не кладу, а сладкое ем", {}, [], [], False),
+]
+FORBID = {
+    "Сладкое можно, но без шоколада": ["sweets"],
+    "Не пью сладкие напитки": ["sweets"],
+    "Без сахара, пожалуйста": ["sweets"],
+    "Сахар не кладу, а сладкое ем": ["sweets"],
+}
+SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED, "multi": MULTI, "sweets": SWEETS}
 MODES = {"схема + разбор": True, "свободный JSON": False}
 
 
@@ -154,6 +173,9 @@ def problems(profile: dict, nums: dict, exclude: list, include: list, empty: boo
     leak = sorted(w for w in expand(exclude) if _norm(w) not in got)
     if leak:
         found.append(f"утечка {leak[:3]} (exclude={profile.get('exclude')})")
+    for category in FORBID.get(phrase, []):
+        if all(_norm(w) in got for w in expand([category])):
+            found.append(f"лишнее исключение {category} (exclude={profile.get('exclude')})")
     wanted = [t for t in profile.get("include") or [] if t.strip().lower() not in _NUTRIENT_WORDS]
     russian = " ".join((profile.get("include_ru") or {}).values()).lower()
     for variants, stem in include:

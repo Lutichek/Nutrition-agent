@@ -140,3 +140,29 @@ def test_exclusions_accumulate_across_turns(catalog):
     agent.run("Люблю курицу, но не ем грибы")
 
     assert agent.profile["exclude"] == ["lactose", "mushroom"]
+
+
+@pytest.mark.parametrize("phrase, word, expected", [
+    ("без сладкого", "sugar", "sweets"),
+    ("не ем сладости", "sugar", "sweets"),
+    ("без сахара", "sugar", "sugar"),
+    ("не пью сладкие напитки", "sugar", "sugar"),
+    ("без шоколада", "chocolate", "chocolate"),
+])
+def test_sweets_not_sugar(phrase, word, expected):
+    """«Ещё без сладкого» — живая модель, 3/3 в обоих режимах: sugar вместо
+    sweets, и выпечка оставалась в меню. Поправка — только у фразы, где
+    сказано «сладк…», а не «сахар» и не «напитки»."""
+    from agent import _category_fix
+    assert _category_fix(word, phrase) == expected
+
+
+def test_sweets_fixed_through_mentions(catalog):
+    answer = {**SCHEMA_ANSWER, "include": [], "include_ru": [],
+              "mentions": [{"phrase_ru": "без сладкого", "kind": "food_excluded",
+                            "english": "sugar"}],
+              "exclude": ["pork", "sugar"]}
+    agent = make_agent(catalog, answer)
+    agent._own_state.profile = {"exclude": ["pork"]}
+    agent.run("Ещё без сладкого")
+    assert "sweets" in agent.profile["exclude"]

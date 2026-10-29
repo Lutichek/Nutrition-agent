@@ -469,6 +469,8 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
     рыба и морепродукты            → "seafood"
     яйца                           → "eggs"
     сахар, сладкие напитки         → "sugar"
+  «Без сладкого», «не ем сладкое» — это "sweets" (десерты, выпечка,
+  конфеты). "sugar" — только сахар как продукт и сладкие напитки.
     алкоголь                       → "alcohol"
     халяль, только халяльное       → "halal"
   Диета или диагноз, названные утвердительно («только халяль», «я веган»,
@@ -644,6 +646,26 @@ def allergy_note(allergies: list[str]) -> str:
     )
 
 
+# «Без сладкого» — это sweets (десерты, выпечка, конфеты), а не sugar
+# (сахар, сироп, сладкие напитки). Наблюдалось на живой модели 3/3 в обоих
+# режимах: «Ещё без сладкого» → sugar, и выпечка оставалась в меню. Знак
+# (нельзя / можно) модель определяет верно — путает словарь, поэтому
+# категорию поправляет код, и только у той фразы-упоминания, где сказано
+# «сладк…»: вся реплика «Сахар не кладу, а сладкое ем» исключила бы
+# сладкое, которое человек ест.
+_SWEET_PHRASE = re.compile(r"сладк|сладост|десерт", re.IGNORECASE)
+_SUGAR_PHRASE = re.compile(r"сахар|напит", re.IGNORECASE)
+FIX_SWEETS = True
+
+
+def _category_fix(word: str, phrase_ru: str) -> str:
+    """Слово упоминания с поправленной категорией (sugar → sweets)."""
+    if (FIX_SWEETS and word.lower() == "sugar" and _SWEET_PHRASE.search(phrase_ru)
+            and not _SUGAR_PHRASE.search(phrase_ru)):
+        return "sweets"
+    return word
+
+
 # Какие разобранные упоминания (mentions) — в какие поля профиля.
 _MENTION_FIELDS = {"food_excluded": ("exclude",), "allergy": ("exclude", "allergies"),
                    "food_wanted": ("include",)}
@@ -667,7 +689,8 @@ def _from_structured(parsed: dict) -> dict:
     for mention in parsed.pop("mentions", None) or []:
         if not isinstance(mention, dict):
             continue
-        word = str(mention.get("english") or "").strip()
+        word = _category_fix(str(mention.get("english") or "").strip(),
+                             str(mention.get("phrase_ru") or ""))
         for field in _MENTION_FIELDS.get(mention.get("kind"), ()) if word else ():
             current = parsed.get(field)
             current = [current] if isinstance(current, str) else list(current or [])
