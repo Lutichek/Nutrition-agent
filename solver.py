@@ -1194,6 +1194,29 @@ def rebuild_rest(
 # которое еле проходит проверки. Пять — разнообразие без потери качества.
 SWAP_TOP = 5
 
+# Насколько замена может быть хуже лучшей (во сколько раз по невязке),
+# чтобы попасть в те пять. Без порога случайный выбор из пяти брал и
+# четвёртую: живой прогон — «замени завтрак» вместо греческого йогурта
+# дало швейцарский сыр (невязка 1.50 против 0.95 у лучшей, жиры +32%).
+SWAP_LOSS_MARGIN: float | None = 1.2
+
+# Во сколько раз лучшая замена БЕЗ подстройки порций может быть хуже
+# исходного дня, прежде чем подстроить порции остальных блюд. Раньше
+# подстраивали, только если иначе проверки не проходят, — а проверки
+# широкие (жиры ±35%), и каждая десятая замена делала день в 3.8 раза хуже.
+#
+# Замер experiments/swap_quality.py (252 замены, 6 профилей × 2 дня):
+#
+#     вариант                          в ±10%   рост невязки (медиана / 90%)
+#     без порога и подстройки (было)     88%        ×1.14 / ×3.76
+#     порог ×1.2                         90%        ×1.14 / ×3.75
+#     порог ×1.2, порции при ×1.5        94%        ×1.11 / ×2.56
+#     порог ×1.2, порции при ×1.2        95%        ×1.09 / ×2.56
+#
+# Проверки проходят все, разнообразие «замени ещё раз» то же (2.99 разных
+# из 3), время 0.20 → 0.21 с.
+SWAP_TUNE_ABOVE: float | None = 1.2
+
 
 def _records_by_id(catalog: pd.DataFrame) -> dict[int, dict[str, Any]]:
     columns = [c for c in ["fdc_id", "name", "name_ru", "role", "portion", "portion_ru",
@@ -1306,12 +1329,15 @@ def swap_item(
                 trials.append(trial)
 
     passing = ranked(trials)
-    if not passing:
+    worse = (SWAP_TUNE_ABOVE is not None and passing
+             and passing[0].loss > plan.loss * SWAP_TUNE_ABOVE)
+    if not passing or worse:
         # Блюдо меняется, порции остальных подстраиваются. Только для самых
         # близких к норме кандидатов: спуск по всем — секунды на запрос.
         closest = sorted(trials, key=lambda d: _assemble(d, plan.targets, None, template).loss)
-        passing = ranked([_tune_portions(d, index, records, plan.targets, template)
-                          for d in closest[:30]])
+        tuned = ranked([_tune_portions(d, index, records, plan.targets, template)
+                        for d in closest[:30]])
+        passing = sorted(passing + tuned, key=lambda p: (p.loss, p.items[index].fdc_id))
     if not passing:
         raise PlanNotFeasible(
             "Заменить это блюдо так, чтобы день остался в норме, не получилось: "
@@ -1321,6 +1347,8 @@ def swap_item(
     # блюдом в пяти размерах.
     unique: list[DayPlan] = []
     for candidate in passing:
+        if SWAP_LOSS_MARGIN is not None and candidate.loss > passing[0].loss * SWAP_LOSS_MARGIN:
+            break
         if candidate.items[index].fdc_id not in {p.items[index].fdc_id for p in unique}:
             unique.append(candidate)
         if len(unique) == SWAP_TOP:

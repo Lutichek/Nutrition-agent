@@ -170,6 +170,36 @@ class TestChatEndpoint:
     def test_empty_message_rejected(self, client):
         assert client.post("/chat", json={"message": ""}).status_code == 422
 
+    def test_plan_carries_the_code_verdict(self, client):
+        """Живой прогон: после замены завтрака текст говорил «все проверки
+        пройдены», а карточка красила жиры +32% и углеводы −19% — у неё
+        был свой порог ±10%, у кода ±35%. Теперь карточка получает вердикт
+        check_plan и судит по нему."""
+        from solver import DayPlan, check_plan
+
+        client.post("/consent", json={"health_data": True})
+        api._state["agent"].client.script.update({
+            "маршрутизатор": json.dumps({"intent": "plan", "red_flag": ""}),
+            "Извлеки параметры": json.dumps(PROFILE),
+            "Объясни человеку": "План готов.",
+        })
+        body = client.post("/chat", json={"message": "Мне 31, женщина, 168 см, 74 кг"}).json()
+        assert body["checks"] == check_plan(DayPlan(**body["plan"]))
+
+    def test_card_note_matches_the_code_tolerances(self):
+        """Пояснение под карточкой называет допуски числами — и обязано
+        совпадать с TOLERANCES, иначе карточка опять разойдётся с кодом."""
+        from pathlib import Path
+
+        from solver import MIN_FIBER_SHARE, TOLERANCES
+
+        page = (Path(api.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        note = page[page.index('class="checks-note"'):page.index("</div>", page.index('class="checks-note"'))]
+        assert f"±{round(TOLERANCES['fat_g'][1] * 100)}%" in note
+        assert TOLERANCES["fat_g"] == TOLERANCES["carb_g"]
+        assert f"{round((1 + TOLERANCES['protein_g'][0]) * 100)}% нормы" in note
+        assert f"{round(MIN_FIBER_SHARE * 100)}%" in note
+
     def test_provider_outage_is_502(self, catalog):
         """Внешний сбой — 502, а не 500: сервис-то исправен."""
         api._state["agent"] = NutritionAgent(

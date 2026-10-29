@@ -133,6 +133,8 @@
   .check-off { font-variant-numeric: tabular-nums; width: 52px; text-align: right; }
   .check-off.hit { color: var(--carb); }
   .check-off.miss { color: var(--fat); }
+  .check-off.near { color: var(--muted); }
+  .checks-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
   /* ── Приёмы пищи ────────────────────────────────────────── */
   .meals { padding: 8px 18px 16px; }
@@ -447,29 +449,46 @@ function renderSplit(totals) {
 
 // Попадание в норму — числами. Полоса тут не нужна: сравнивать белки
 // с жирами бессмысленно, а «сошлось или нет» читается по отклонению.
-function renderChecks(totals, targets) {
+//
+// Сошлось или нет — решает код (checks из check_plan), а не порог
+// страницы. Раньше здесь стояло своё «±10%», а код допускает жиры
+// и углеводы ±35%: текст говорил «все проверки пройдены», а карточка
+// красила три строки. Теперь: до 10% — «в норме», дальше, но в допуске
+// кода — процент приглушённо, цветом ошибки — только проваленная проверка.
+const CHECK_KEYS = {
+  protein_g: "protein_g_in_range", fat_g: "fat_g_in_range",
+  carb_g: "carb_g_in_range", fiber_g: "fiber_sufficient",
+};
+
+function renderChecks(totals, targets, checks) {
   const rows = [
     ["Белки", "protein_g"], ["Жиры", "fat_g"],
     ["Углеводы", "carb_g"], ["Клетчатка", "fiber_g"],
   ];
+  let widened = false;
+  const html = rows.map(([label, key]) => {
+    const fact = totals[key] || 0, target = targets[key] || 0;
+    if (!target) return "";
+    const off = (fact - target) / target;
+    const verdict = checks ? checks[CHECK_KEYS[key]] : undefined;
+    const close = Math.abs(off) <= 0.1;
+    const passed = verdict === undefined ? close : verdict;
+    const state = close && passed ? "hit" : passed ? "near" : "miss";
+    if (state === "near") widened = true;
+    const sign = off >= 0 ? "+" : "−";
+    return `
+      <div class="check">
+        <div class="check-name">${label}</div>
+        <div class="check-val"><b>${round(fact)}</b> / ${round(target)} г</div>
+        <div class="check-off ${state}"${state === "near" ? ' title="в допуске проверки"' : ""}>
+          ${state === "hit" ? "в норме" : sign + Math.round(Math.abs(off) * 100) + "%"}
+        </div>
+      </div>`;
+  }).join("");
   return `
-    <div class="checks">
-      ${rows.map(([label, key]) => {
-        const fact = totals[key] || 0, target = targets[key] || 0;
-        if (!target) return "";
-        const off = (fact - target) / target;
-        const hit = Math.abs(off) <= 0.1;
-        const sign = off >= 0 ? "+" : "−";
-        return `
-          <div class="check">
-            <div class="check-name">${label}</div>
-            <div class="check-val"><b>${round(fact)}</b> / ${round(target)} г</div>
-            <div class="check-off ${hit ? "hit" : "miss"}">
-              ${hit ? "в норме" : sign + Math.round(Math.abs(off) * 100) + "%"}
-            </div>
-          </div>`;
-      }).join("")}
-    </div>`;
+    <div class="checks">${html}</div>
+    ${widened ? `<div class="checks-note">Отклонение в допуске проверки: жиры и углеводы —
+      до ±35%, белка — не меньше 88% нормы, клетчатки — не меньше 60%.</div>` : ""}`;
 }
 
 function renderPlan(data) {
@@ -509,7 +528,7 @@ function renderPlan(data) {
         </div>
       </div>
       ${renderSplit(plan.totals)}
-      ${renderChecks(plan.totals, targets)}
+      ${renderChecks(plan.totals, targets, data.checks)}
       <div class="meals">${meals}</div>
       ${renderPlanFoot(data.sources)}
     </div>`;

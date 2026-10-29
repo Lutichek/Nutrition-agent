@@ -62,7 +62,30 @@ class TestSolverSwap:
         forged = plan.model_copy(deep=True)
         forged.items[2].kcal = 1.0
         new = swap_item(catalog, forged, 0, seed=0)
-        assert new.items[2].kcal == pytest.approx(plan.items[2].kcal)
+        # Порцию соседа замена вправе подстроить (SWAP_TUNE_ABOVE), поэтому
+        # сверка — с каталогом на ЕГО нынешнюю порцию, а не с исходным планом.
+        row = catalog[catalog["fdc_id"] == new.items[2].fdc_id].iloc[0]
+        assert new.items[2].kcal == pytest.approx(row["portion_kcal"] * new.items[2].servings)
+        assert new.items[2].kcal > 1.0
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_swap_does_not_drag_the_day_out_of_shape(self, catalog, seed):
+        """Живой прогон: «замени завтрак» в дне 35 лет / 80 кг / бюджет
+        400 ₽ вместо греческого йогурта с гранолой дало швейцарский сыр —
+        жиры +32%, углеводы −19%. Проверки (±35%) пройдены, карточка
+        показала три отклонения. Сыр был четвёртым из пяти лучших, а выбор
+        среди них случаен; теперь в пятёрку идёт только близкое к лучшей,
+        а слишком плохую замену выравнивают порции остальных."""
+        # Тот самый день: первый день недели с тренировкой, как его собрал агент.
+        agent = NutritionAgent(client=FakeLLMClient(script={}), model="fake",
+                               retriever=FakeRetriever([]), catalog=catalog)
+        day = agent._node_make_plan({"days": 7, "profile": {
+            "sex": "male", "age": 35, "height_cm": 180, "weight_kg": 80,
+            "activity": "moderate", "goal": "maintain", "budget_rub_per_day": 400}})["plan"]
+        assert "Yogurt, Greek" in day.items[0].name, "тот же исходный завтрак"
+        new = swap_item(catalog, day, 0, seed=seed)
+        assert abs(new.deviation["fat_g"]) <= 0.1 and abs(new.deviation["carb_g"]) <= 0.1, \
+            new.items[0].name
 
     def test_impossible_swap_is_said_not_hidden(self, catalog, plan):
         role = plan.items[5].role

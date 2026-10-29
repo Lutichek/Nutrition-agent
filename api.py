@@ -207,6 +207,12 @@ class ChatResponse(BaseModel):
     plan: DayPlan | None = None
     targets: Targets | None = None
 
+    # Вердикт check_plan по показанному дню. Карточка судит по нему, а не
+    # по своему порогу: раньше она красила всё, что дальше ±10%, а код
+    # допускает жиры и углеводы ±35% — после замены завтрака текст говорил
+    # «все проверки пройдены», а карточка показывала три отклонения.
+    checks: dict[str, bool] | None = None
+
     # Норма показанного дня. При циклировании первый день недели —
     # тренировочный, и сравнивать его с базовой нормой неверно.
     plan_targets: Targets | None = None
@@ -807,6 +813,7 @@ def _run_turn(
         menu_url=menu_url,
         menu_days=answer.menu_days,
         plan=answer.plan,
+        checks=check_plan(answer.plan) if answer.plan is not None else None,
         targets=answer.targets,
         plan_targets=answer.plan_targets or answer.targets,
         cycled=answer.cycled,
