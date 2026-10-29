@@ -73,8 +73,10 @@ from restrictions import expand, is_restriction_phrase, matches_terms
 from shopping import build_shopping_list
 from solver import (
     DayPlan,
+    MealItem,
     Menu,
     PlanNotFeasible,
+    _filter_catalog,
     check_plan,
     day_word,
     mean_targets,
@@ -82,6 +84,7 @@ from solver import (
     menu_targets,
     plan_cautions,
     preferred_ids,
+    swap_item,
 )
 from targets import (
     ACTIVITY_FACTORS,
@@ -304,6 +307,12 @@ class ConversationState(BaseModel):
     # дописывает во второй — и период не должен теряться по дороге.
     days: int = 1
 
+    # Последний показанный план и что в нём уже заменяли: на «замени
+    # творог» меняется ОДНО блюдо, а не собирается новый день (ревью R8).
+    last_plan: dict | None = None
+    swap_rejected: list[int] = Field(default_factory=list)
+    swap_index: int | None = None  # какой слот меняли последним — для «ещё раз»
+
 
 # ────────────────────────────────────────────────────────────
 # Состояние графа
@@ -348,6 +357,10 @@ class AgentState(TypedDict, total=False):
     menu_rest: Any         # Future[list[DayPlan]] — дни со второго, пока собираются
     speculative: Any       # _Speculation — вызовы модели, начатые в classify наперёд
     on_event: Any          # Callable[[dict], None] — события для ответа по частям
+    last_plan: dict        # последний показанный план — для «замени творог»
+    swap_rejected: list[int]  # что уже заменяли в этом плане: не предлагать снова
+    swap: dict             # {index, old} — эта реплика заменила одно блюдо
+    swap_index: int        # слот последней замены — «замени ещё раз» меняет его же
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -594,6 +607,52 @@ ALLERGY_NOTE = (
     "а состав продукта в магазине может отличаться. Сверяйтесь с этикеткой, "
     "а при тяжёлой аллергии согласуйте рацион с аллергологом.{ask}"
 )
+
+
+# ── Замена одного блюда (ревью R8) ─────────────────────────────────────
+_SWAP_RE = re.compile(
+    r"замен|помен|вместо|другое блюд|другим блюд|не хочу|не нрав|убер", re.IGNORECASE)
+# «Замени ещё раз», «другое» — без названия: тот же слот, что в прошлый раз.
+_AGAIN_RE = re.compile(r"ещё раз|еще раз|друго[ейм]|не то|опять", re.IGNORECASE)
+_SLOT_WORDS = {"завтрак": "Завтрак", "обед": "Обед — основное", "ужин": "Ужин — основное",
+               "гарнир": "Обед — гарнир", "перекус": "Перекус"}
+
+
+def _swap_index(question: str, plan: DayPlan) -> int | None:
+    """Какое блюдо плана человек просит заменить — или None.
+
+    Сначала по названию (основа первых слов русского названия блюда:
+    «творог» → «Творог, нежирный»), потом по приёму пищи («замени ужин»).
+    Название важнее: в «замени творог на завтрак» речь о твороге.
+    """
+    text = question.lower()
+    for index, item in enumerate(plan.items):
+        words = re.findall(r"[а-яё]{4,}", item.title.lower())[:2]
+        if any(word[:5] in text for word in words):
+            return index
+    for word, slot in _SLOT_WORDS.items():
+        if word in text:
+            for index, item in enumerate(plan.items):
+                if item.slot == slot:
+                    return index
+    return None
+
+
+def swap_note(old: MealItem, plan: DayPlan, before: DayPlan) -> str:
+    """Ответ на замену — шаблон кода: числа плана модель не пересказывает."""
+    index = next(i for i, it in enumerate(before.items) if it.fdc_id == old.fdc_id)
+    new = plan.items[index]
+    text = (f"Заменил «{old.title}» на «{new.title}» — {new.grams:.0f} г, "
+            f"{new.kcal:.0f} ккал.")
+    tuned = [f"{after.title} — {after.grams:.0f} г" for j, (was, after)
+             in enumerate(zip(before.items, plan.items, strict=True))
+             if j != index and was.servings != after.servings]
+    if tuned:
+        text += " Чтобы день остался в норме, подправил порции: " + "; ".join(tuned) + "."
+    text += (f"\n\nИтого за день {plan.totals['kcal']:.0f} ккал из "
+             f"{plan.targets['kcal']:.0f} — все проверки нормы пройдены. "
+             "Если и это не подходит — скажите «замени ещё раз».")
+    return text
 
 
 def _merge_allergies(question: str, known: list, named: Any, exclude: list,
@@ -1963,6 +2022,12 @@ class NutritionAgent:
         # 10%» там, где день сошёлся со своей целью с точностью 0.1%.
         shown_targets = per_day[0] if cycled else targets
 
+        swapped = self._try_swap(state, profile)
+        if swapped is not None:
+            return {"profile": profile.model_dump(), "targets": targets,
+                    "plan_targets": shown_targets, "cycled": cycled, "days": days,
+                    **swapped}
+
         all_targets = menu_targets(per_day, days)
         day_plans = menu_days(
             self.catalog,
@@ -2001,6 +2066,43 @@ class NutritionAgent:
             result["menu"] = Menu(days=[first, *rest], targets=mean_targets(all_targets))
         return result
 
+    def _try_swap(self, state: AgentState, profile: Profile) -> AgentState | None:
+        """«Замени творог на что-нибудь» — заменить ОДНО блюдо последнего плана.
+
+        None — это не просьба о замене (или заменять не во что), и день
+        собирается заново, как раньше. Блюдо ищет код — по русскому названию
+        в плане или по приёму пищи; промпт маршрутизатора не меняется.
+
+        Если в той же реплике появилось ограничение, под которое не подходят
+        ДРУГИЕ блюда плана («замени творог, и я не ем молочное»), одной
+        заменой не обойтись — день собирается заново.
+        """
+        last = state.get("last_plan")
+        if not last or not _SWAP_RE.search(state["question"]):
+            return None
+        plan = DayPlan(**last)
+        index = _swap_index(state["question"], plan)
+        if index is None and _AGAIN_RE.search(state["question"]):
+            index = state.get("swap_index")
+        if index is None:
+            return None
+        allowed = set(_filter_catalog(self.catalog, profile.exclude)["fdc_id"].astype(int))
+        if any(item.fdc_id not in allowed for j, item in enumerate(plan.items) if j != index):
+            return None
+
+        rejected = [int(i) for i in state.get("swap_rejected") or []]
+        old = plan.items[index]
+        try:
+            new = swap_item(self.catalog, plan, index, exclude=profile.exclude,
+                            seed=self.seed + len(rejected), avoid_ids=set(rejected))
+        except PlanNotFeasible as error:
+            return {"plan": plan, "checks": check_plan(plan), "answer": (
+                f"Не получилось заменить «{old.title}»: {error} План оставил прежним — "
+                "можно попросить заменить другое блюдо или собрать день заново.")}
+        return {"plan": new, "checks": check_plan(new),
+                "menu": Menu(days=[new], targets=dict(new.targets)),
+                "swap": {"index": index, "old": old.fdc_id}}
+
     def _node_make_plan_in_graph(self, state: AgentState) -> AgentState:
         return self._node_make_plan(state, defer_rest=True)
 
@@ -2035,12 +2137,9 @@ class NutritionAgent:
         # Если make_plan упёрся в кривой профиль — он уже написал ответ.
         return END if state.get("answer") else "explain_plan"
 
-    def _node_explain_plan(self, state: AgentState) -> AgentState:
-        """Показать план и объяснить цифры, подкрепив их литературой."""
-        targets: Targets = state["targets"]
-        plan: DayPlan = state["plan"]
-        days = int(state.get("days") or 1)
-        profile = Profile(**state["profile"])
+    def _explain_with_model(self, state: AgentState, plan: DayPlan, targets: Targets,
+                            profile: Profile, days: int) -> tuple[str, list, str]:
+        """Объяснение плана моделью: (текст, фрагменты статей, поисковый запрос)."""
 
         # Ищем обоснование норм — но провал поиска не должен ломать выдачу
         # плана: план посчитан детерминированно и верен сам по себе.
@@ -2084,7 +2183,24 @@ class NutritionAgent:
             on_text=self._text_sink(state),
         )
 
-        text = answer.strip()
+        return answer.strip(), chunks, query
+
+    def _node_explain_plan(self, state: AgentState) -> AgentState:
+        """Показать план и объяснить цифры, подкрепив их литературой."""
+        targets: Targets = state["targets"]
+        plan: DayPlan = state["plan"]
+        days = int(state.get("days") or 1)
+        profile = Profile(**state["profile"])
+
+        # Замена одного блюда — ответ шаблоном кода, без модели: план тот же,
+        # кроме одного блюда, и пересказывать его незачем (ревью R8).
+        swap = state.get("swap")
+        if swap:
+            before = DayPlan(**state["last_plan"])
+            text = swap_note(before.items[swap["index"]], plan, before)
+            chunks, query = [], None
+        else:
+            text, chunks, query = self._explain_with_model(state, plan, targets, profile, days)
 
         # Дни со второго собирались, пока модель писала объяснение.
         # Не собрались — ответ тот же, что раньше давал make_plan: объяснение
@@ -2541,6 +2657,9 @@ class NutritionAgent:
                 "profile": dict(memory.profile) if remember else {},
                 "days": memory.days if remember else 1,
                 "on_event": on_event,
+                "last_plan": memory.last_plan if remember else None,
+                "swap_rejected": list(memory.swap_rejected) if remember else [],
+                "swap_index": memory.swap_index if remember else None,
             }
         )
 
@@ -2549,6 +2668,15 @@ class NutritionAgent:
         if remember:
             memory.profile = final_state.get("profile") or memory.profile
             memory.days = int(final_state.get("days") or memory.days)
+            shown = final_state.get("plan")
+            if shown is not None:
+                swap = final_state.get("swap")
+                # Новый день — заменять в нём ещё нечего; замена — копим
+                # отвергнутые блюда, чтобы «замени ещё раз» их не вернуло.
+                memory.swap_rejected = (
+                    [*memory.swap_rejected, swap["old"]] if swap else [])
+                memory.swap_index = swap["index"] if swap else None
+                memory.last_plan = shown.model_dump(mode="json")
             memory.history.append({"role": "user", "content": question})
             memory.history.append({"role": "assistant", "content": answer})
 

@@ -59,7 +59,15 @@ from foods import load_catalog
 from limits import BudgetExhausted, Limits, LLMBudget, RateLimiter, seconds_to_utc_midnight
 from providers import get_clients
 from shopping import ShoppingList, build_shopping_list
-from solver import DayPlan, Menu, PlanNotFeasible, build_day, build_menu, check_plan
+from solver import (
+    DayPlan,
+    Menu,
+    PlanNotFeasible,
+    build_day,
+    build_menu,
+    check_plan,
+    swap_item,
+)
 from storage import open_storage
 from targets import CycledTargets, Profile, Targets, compute_targets, explain
 
@@ -497,6 +505,46 @@ def post_plan(request: PlanRequest, catalog=Depends(get_catalog)) -> PlanRespons
     checks = check_plan(plan)
     return PlanResponse(
         targets=targets, plan=plan, checks=checks, checks_passed=all(checks.values())
+    )
+
+
+class SwapRequest(BaseModel):
+    profile: Profile
+    plan: DayPlan = Field(description="План из ответа /plan (или прошлого /plan/swap)")
+    index: int = Field(ge=0, description="Номер позиции в plan.items, с нуля")
+    seed: int = Field(default=0, description="Один seed — одна и та же замена.")
+    avoid_ids: list[int] = Field(default_factory=list, description=(
+        "fdc_id блюд, которые в этот слот уже предлагались и не подошли"))
+
+
+class SwapResponse(PlanResponse):
+    replaced: dict[str, Any]
+
+
+@app.post("/plan/swap", response_model=SwapResponse, tags=["расчёт без LLM"],
+          dependencies=[Depends(limit_calc)])
+def post_plan_swap(request: SwapRequest, catalog=Depends(get_catalog)) -> SwapResponse:
+    """Заменить одно блюдо плана другим той же роли (ревью R8).
+
+    Без LLM и детерминированно по ``seed``. Новый план проходит все
+    проверки ``check_plan`` — иначе 422. Числа блюд и нормы сервер
+    пересчитывает сам (каталог и профиль), а не берёт из присланного плана.
+    """
+    targets = compute_targets(request.profile)
+    plan = request.plan.model_copy(update={"targets": targets.as_dict()})
+    try:
+        swapped = swap_item(catalog, plan, request.index, exclude=request.profile.exclude,
+                            seed=request.seed, avoid_ids=set(request.avoid_ids))
+    except PlanNotFeasible as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    old, new = plan.items[request.index], swapped.items[request.index]
+    checks = check_plan(swapped)
+    return SwapResponse(
+        targets=targets, plan=swapped, checks=checks, checks_passed=all(checks.values()),
+        replaced={"index": request.index,
+                  "from": {"fdc_id": old.fdc_id, "name": old.title},
+                  "to": {"fdc_id": new.fdc_id, "name": new.title}},
     )
 
 

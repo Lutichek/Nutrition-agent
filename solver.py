@@ -1112,6 +1112,149 @@ def _nutrition_wins_over_budget(
 
 
 # ────────────────────────────────────────────────────────────
+# Замена одного блюда (ревью R8)
+# ────────────────────────────────────────────────────────────
+
+# Из скольких лучших замен выбирать по seed. Одна лучшая на каждый план
+# давала бы на «замени ещё раз» то же блюдо, а случайная из всех — блюдо,
+# которое еле проходит проверки. Пять — разнообразие без потери качества.
+SWAP_TOP = 5
+
+
+def _records_by_id(catalog: pd.DataFrame) -> dict[int, dict[str, Any]]:
+    columns = [c for c in ["fdc_id", "name", "name_ru", "role", "portion", "portion_ru",
+                           "portion_g"] + [f"portion_{n}" for n in NUTRIENT_COLUMNS]
+               if c in catalog.columns]
+    return {int(r["fdc_id"]): r for r in catalog[columns].to_dict("records")}
+
+
+def _assemble(items: list[MealItem], targets: dict[str, float], budget: float | None,
+              template: list[tuple[str, str, float]] | None) -> DayPlan:
+    """День из готовых позиций: итоги, отклонения и невязка — как у build_day."""
+    totals = _totals(items)
+    loss = _loss(totals, targets)
+    if template is not None:
+        loss += _slot_penalty(items, template, targets.get("kcal", 0.0))
+    return DayPlan(
+        items=items,
+        totals={name: round(value, 1) for name, value in totals.items()},
+        targets=targets,
+        deviation={name: round((totals[name] - value) / value, 4)
+                   for name, value in targets.items() if value > 0},
+        budget=budget,
+        loss=round(loss, 4),
+    )
+
+
+def _tune_portions(items: list[MealItem], keep: int, records: dict[int, dict[str, Any]],
+                   targets: dict[str, float], template: list[tuple[str, str, float]] | None,
+                   passes: int = 3) -> list[MealItem]:
+    """Подправить ПОРЦИИ остальных блюд (сами блюда не меняются), чтобы
+    день с новым блюдом снова сошёлся. Покоординатный спуск — детерминирован."""
+    best = list(items)
+    best_loss = _assemble(best, targets, None, template).loss
+    for _ in range(passes):
+        improved = False
+        for index, item in enumerate(best):
+            if index == keep:
+                continue
+            for servings in SERVING_OPTIONS:
+                if servings == item.servings:
+                    continue
+                candidate = _make_item(item.slot, records[item.fdc_id], servings)
+                if not (MIN_PORTION_G <= candidate.grams <= MAX_PORTION_G):
+                    continue
+                trial = list(best)
+                trial[index] = candidate
+                loss = _assemble(trial, targets, None, template).loss
+                if loss < best_loss:
+                    best, best_loss, improved = trial, loss, True
+            item = best[index]
+        if not improved:
+            break
+    return best
+
+
+def swap_item(
+    catalog: pd.DataFrame,
+    plan: DayPlan,
+    index: int,
+    exclude: list[str] | None = None,
+    seed: int = 0,
+    avoid_ids: set[int] | None = None,
+) -> DayPlan:
+    """Заменить блюдо на позиции ``index`` другим той же роли.
+
+    Результат обязан пройти все проверки ``check_plan`` — иначе
+    ``PlanNotFeasible``: человек должен услышать «не получилось», а не
+    получить день, который тихо вышел из нормы.
+
+    Числа блюд берутся из каталога по fdc_id и множителю порции, а не из
+    присланного плана: ни одно число не приходит снаружи (через API план
+    присылает клиент). При одном seed — одна и та же замена.
+
+    Сначала остальные блюда не трогаются вовсе; если ни одна замена так
+    не проходит проверки — подправляются их порции (но не сами блюда).
+
+    Args:
+        avoid_ids: какие блюда в этот слот уже предлагались и отвергнуты —
+            чтобы «замени ещё раз» не вернуло прежнее.
+    """
+    records = _records_by_id(catalog)
+    try:
+        items = [_make_item(it.slot, records[it.fdc_id], it.servings) for it in plan.items]
+    except KeyError as error:
+        raise PlanNotFeasible(f"В справочнике нет блюда {error} из плана") from error
+    if not 0 <= index < len(items):
+        raise PlanNotFeasible(f"В плане нет позиции {index}")
+
+    old = items[index]
+    template = DAY_TEMPLATE if len(items) == len(DAY_TEMPLATE) else None
+    share = template[index][2] if template else old.kcal / max(plan.targets.get("kcal", 1), 1)
+    cap = share * plan.targets.get("kcal", 0.0) * SLOT_TOLERANCE_RELAXED
+    taken = {it.fdc_id for it in items} | set(avoid_ids or ())
+    usable = _filter_catalog(catalog, exclude)
+    pool = [r for r in usable[usable["role"] == old.role].to_dict("records")
+            if int(r["fdc_id"]) not in taken]
+
+    def ranked(day_items: list[list[MealItem]]) -> list[DayPlan]:
+        plans = [_assemble(d, plan.targets, plan.budget, template) for d in day_items]
+        return sorted((p for p in plans if all(check_plan(p).values())),
+                      key=lambda p: (p.loss, p.items[index].fdc_id))
+
+    trials = []
+    for record in pool:
+        for servings in SERVING_OPTIONS:
+            item = _make_item(old.slot, record, servings)
+            if MIN_PORTION_G <= item.grams <= MAX_PORTION_G and item.kcal <= cap:
+                trial = list(items)
+                trial[index] = item
+                trials.append(trial)
+
+    passing = ranked(trials)
+    if not passing:
+        # Блюдо меняется, порции остальных подстраиваются. Только для самых
+        # близких к норме кандидатов: спуск по всем — секунды на запрос.
+        closest = sorted(trials, key=lambda d: _assemble(d, plan.targets, None, template).loss)
+        passing = ranked([_tune_portions(d, index, records, plan.targets, template)
+                          for d in closest[:30]])
+    if not passing:
+        raise PlanNotFeasible(
+            "Заменить это блюдо так, чтобы день остался в норме, не получилось: "
+            "подходящих по составу блюд этой роли не нашлось.", role=old.role)
+
+    # Одно блюдо — одна лучшая порция: иначе «пять лучших» были бы одним
+    # блюдом в пяти размерах.
+    unique: list[DayPlan] = []
+    for candidate in passing:
+        if candidate.items[index].fdc_id not in {p.items[index].fdc_id for p in unique}:
+            unique.append(candidate)
+        if len(unique) == SWAP_TOP:
+            break
+    return random.Random(seed).choice(unique)
+
+
+# ────────────────────────────────────────────────────────────
 # Меню на несколько дней
 # ────────────────────────────────────────────────────────────
 
