@@ -309,7 +309,7 @@ def _pick_portions(survey_dir: Path) -> pd.DataFrame:
 
 def build_catalog(verbose: bool = True) -> pd.DataFrame:
     """Собрать каталог блюд из CSV-выгрузки FNDDS."""
-    # Импорт внутри функции — см. пояснение в data_preporation.prepare_chunks.
+    # Импорт внутри функции — см. пояснение в data_preparation.prepare_chunks.
     # Рантайм зовёт только load_catalog, которая читает готовый parquet.
     from data_sources import download_usda
 

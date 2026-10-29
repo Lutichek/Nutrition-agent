@@ -58,7 +58,7 @@ import pandas as pd
 
 from agent import Chunk, RAGAgentAnswer
 from build_qrels import QRELS_PATH
-from data_preporation import prepare_chunks
+from data_preparation import prepare_chunks
 from embedder import Embedder
 from evaluation import (
     _average_precision,

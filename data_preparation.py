@@ -17,9 +17,9 @@
 
 Флоу::
 
-    python data_preporation.py           # собрать и показать статистику
+    python data_preparation.py           # собрать и показать статистику
 
-    from data_preporation import prepare_chunks
+    from data_preparation import prepare_chunks
     chunks = prepare_chunks()            # список Document, готовых к заливке
 
 Учебный проект. Ответы на его основе не заменяют консультацию врача.

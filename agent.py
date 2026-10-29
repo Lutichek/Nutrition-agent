@@ -70,7 +70,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 import food_search
 from adaptive import adapted_tdee
-from data_preporation import load_corpus_index
+from data_preparation import load_corpus_index
 from foods import load_catalog
 from portions import eaten_grams
 from restrictions import expand, is_restriction_phrase, matches_terms, matches_words, to_pattern

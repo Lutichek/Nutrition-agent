@@ -74,7 +74,7 @@ def chunks_to_records(chunks: list[Document], embedder: Any, verbose: bool = Tru
             {
                 "chunk_id": int(meta.get("chunk_id", 0)),
                 "text": chunk.page_content,
-                # doc_id — идентификатор статьи-источника (см. комментарий в data_preporation.py)
+                # doc_id — идентификатор статьи-источника (см. комментарий в data_preparation.py)
                 "doc_id": int(meta.get("doc_id", 0)),
                 "title": str(meta.get("title", "")),
                 "section": str(meta.get("section", "")),
@@ -96,7 +96,7 @@ def build_vectorstore(
     """Создать таблицу и залить в неё чанки.
 
     Args:
-        chunks: список Document из data_preporation.prepare_chunks().
+        chunks: список Document из data_preparation.prepare_chunks().
         embedder: объект Embedder.
         overwrite: True — пересоздать таблицу с нуля, False — добавить к существующей.
     """

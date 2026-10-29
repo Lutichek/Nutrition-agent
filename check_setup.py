@@ -119,7 +119,7 @@ def check_index() -> bool:
     rows = table.count_rows()
     ok = report(rows > 100, f"Индекс собран: {rows} фрагментов")
 
-    from data_preporation import CORPUS_INDEX_PATH
+    from data_preparation import CORPUS_INDEX_PATH
     ok &= report(CORPUS_INDEX_PATH.exists(), "Справочник источников на месте",
                  fix="python build_index.py")
     return ok

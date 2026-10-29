@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from data_preporation import prepare_chunks
+from data_preparation import prepare_chunks
 from embedder import Embedder
 from lance_db import build_vectorstore, read_all
 from providers import get_polza_client

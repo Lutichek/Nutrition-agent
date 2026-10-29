@@ -194,7 +194,7 @@ def corpus_doc_ids() -> list[int]:
     и правильно сделал. Чтобы фикстура не устаревала при следующей смене
     схемы, идентификаторы берутся из самого справочника.
     """
-    from data_preporation import load_corpus_index
+    from data_preparation import load_corpus_index
 
     index = load_corpus_index()
     if len(index) < 2:

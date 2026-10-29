@@ -368,7 +368,7 @@ retriever.py         поиск: векторный, плюс отключённ
 embedder.py          векторизация текста
 lance_db.py          векторное хранилище
 chunking.py          нарезка статей на фрагменты
-data_preporation.py  подготовка корпуса
+data_preparation.py  подготовка корпуса
 
 config.py            настройки и ключи
 providers.py         клиенты моделей
