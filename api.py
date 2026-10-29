@@ -953,6 +953,42 @@ def post_consent(
     return {"consent": session.consent}
 
 
+class WeightRequest(BaseModel):
+    weight_kg: float = Field(ge=35, le=250)
+    day: str | None = Field(default=None, description="ГГГГ-ММ-ДД; не задана — сегодня (UTC)")
+
+
+@app.post("/weight", tags=["разговор"], dependencies=[Depends(limit_calc)])
+def post_weight(
+    http: Request,
+    request: WeightRequest = Body(...),
+    storage: Any = Depends(get_storage),
+) -> dict[str, Any]:
+    """Записать взвешивание (ревью R9) — для адаптивной нормы.
+
+    Только в свою сессию с согласием: вес — данные о здоровье. Взвешивание
+    за сегодня обновляет и вес в профиле: от него считается норма.
+    """
+    from adaptive import MIN_SPAN_DAYS, MIN_WEIGHINS
+
+    session = _consented_session(http, storage)
+    today = datetime.now(UTC).date().isoformat()
+    day = request.day or today
+    try:
+        if datetime.fromisoformat(day).date().isoformat() > today:
+            raise ValueError
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="Дата взвешивания — не позже сегодня") from error
+    session.state.weighins[day] = request.weight_kg
+    if day == today:
+        session.state.profile["weight_kg"] = request.weight_kg
+    storage.save_session(session.token, session.dump())
+    days = sorted(session.state.weighins)
+    span = (datetime.fromisoformat(days[-1]) - datetime.fromisoformat(days[0])).days
+    return {"weighins": len(days),
+            "adaptive_ready": len(days) >= MIN_WEIGHINS and span >= MIN_SPAN_DAYS}
+
+
 @app.get("/session", tags=["разговор"], dependencies=[Depends(limit_calc)])
 def get_session(http: Request, storage: Any = Depends(get_storage)) -> dict[str, Any]:
     """Есть ли согласие у текущего разговора — без самих данных."""

@@ -61,6 +61,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, TypedDict
 
 import pandas as pd
@@ -68,6 +69,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
 import food_search
+from adaptive import adapted_tdee
 from data_preporation import load_corpus_index
 from foods import load_catalog
 from portions import eaten_grams
@@ -100,6 +102,7 @@ from targets import (
     compute_targets,
     cycle_targets,
     explain,
+    total_expenditure,
 )
 
 logger = logging.getLogger(__name__)
@@ -323,6 +326,12 @@ class ConversationState(BaseModel):
     eaten: list[dict] = Field(default_factory=list)
     eaten_date: str | None = None
 
+    # Для адаптивной нормы (adaptive.py, ревью R9): взвешивания и съеденное
+    # по дням (дата ISO → кг / ккал) и последняя оценка расхода {tdee, at}.
+    weighins: dict[str, float] = Field(default_factory=dict)
+    intake: dict[str, float] = Field(default_factory=dict)
+    adaptive: dict | None = None
+
 
 # ────────────────────────────────────────────────────────────
 # Состояние графа
@@ -376,6 +385,9 @@ class AgentState(TypedDict, total=False):
     eaten_before: list[dict]  # съеденное сегодня в ПРОШЛЫХ репликах (вход)
     eaten_all: list[dict]  # всё съеденное за сегодня — только если был пересчёт (выход)
     eaten_shown: list      # MealItem съеденного из этой реплики — для ответа
+    weighins: dict         # дата → вес, кг (вход)
+    intake: dict           # дата → съедено, ккал (вход)
+    adaptive: dict         # {tdee, at} — оценка расхода по динамике веса
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -750,6 +762,11 @@ def eaten_note(new: list[MealItem], plan: DayPlan, checks: dict[str, bool]) -> s
 
 def _today_utc() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+# Число, похожее на вес в реплике: «вешу 79,4», «79.4 кг».
+_WEIGHT_RE = re.compile(r"(\d{2,3}(?:[.,]\d{1,2})?)\s*(?:кг|kg)|вешу\s*(?:около\s*)?(\d{2,3}(?:[.,]\d)?)",
+                        re.IGNORECASE)
 
 
 def _merge_allergies(question: str, known: list, named: Any, exclude: list,
@@ -2191,7 +2208,14 @@ class NutritionAgent:
 
             return {"profile": raw_profile, "missing": bad_fields or ["profile"], "answer": message}
 
-        targets = compute_targets(profile)
+        # Расход — по динамике веса, когда данных хватает (adaptive.py),
+        # иначе формула. Предохранители нормы действуют в обоих случаях.
+        adaptive = adapted_tdee(
+            state.get("weighins") or {}, state.get("intake") or {},
+            formula_tdee=total_expenditure(profile),
+            fallback_kcal=compute_targets(profile).kcal,
+            previous=state.get("adaptive"), today=datetime.now(UTC).date())
+        targets = compute_targets(profile, tdee_override=adaptive["tdee"] if adaptive else None)
 
         # Период запрашивают в реплике («на месяц»); по умолчанию — один день.
         days = int(state.get("days") or 1)
@@ -2211,13 +2235,14 @@ class NutritionAgent:
         if state.get("eaten_new"):
             return {"profile": profile.model_dump(), "targets": targets,
                     "plan_targets": shown_targets, "cycled": cycled, "days": days,
+                    "adaptive": adaptive,
                     **self._rebuild_after_eaten(state, profile, shown_targets)}
 
         swapped = self._try_swap(state, profile)
         if swapped is not None:
             return {"profile": profile.model_dump(), "targets": targets,
                     "plan_targets": shown_targets, "cycled": cycled, "days": days,
-                    **swapped}
+                    "adaptive": adaptive, **swapped}
 
         all_targets = menu_targets(per_day, days)
         day_plans = menu_days(
@@ -2250,6 +2275,7 @@ class NutritionAgent:
             "plan": first,
             "days": days,
             "checks": check_plan(first),
+            "adaptive": adaptive,
         }
         if isinstance(rest, Future):
             result["menu_rest"] = (rest, all_targets)
@@ -2724,13 +2750,14 @@ class NutritionAgent:
             question=state["question"],
             context=self._format_context(state.get("chunks") or []),
         )
-        personal = self._personal_norms(state.get("profile"))
+        personal = self._personal_norms(state.get("profile"),
+                                        (state.get("adaptive") or {}).get("tdee"))
         if personal:
             prompt = prompt.replace(FRAGMENTS_HEADER, personal + FRAGMENTS_HEADER, 1)
         answer = self._complete(prompt, temperature=0.2, on_text=self._text_sink(state))
         return {"answer": answer.strip()}
 
-    def _personal_norms(self, raw_profile: dict | None) -> str:
+    def _personal_norms(self, raw_profile: dict | None, tdee: float | None = None) -> str:
         """Расчёт нормы человека для ветки вопросов — или пусто.
 
         Наблюдалось: после плана «А почему так мало углеводов?» уходило
@@ -2749,7 +2776,8 @@ class NutritionAgent:
             return ""
         return PERSONAL_NORMS_BLOCK.format(
             profile=self._describe_profile(profile),
-            targets_explained=explain(profile, compute_targets(profile)),
+            # Та же норма, что в плане: с фактическим расходом, если он есть.
+            targets_explained=explain(profile, compute_targets(profile, tdee_override=tdee)),
         )
 
     def _node_cannot_answer(self, state: AgentState) -> AgentState:
@@ -2896,6 +2924,9 @@ class NutritionAgent:
                 # Вчерашнее съеденное к сегодняшнему дню отношения не имеет.
                 "eaten_before": (list(memory.eaten)
                                  if remember and memory.eaten_date == _today_utc() else []),
+                "weighins": dict(memory.weighins) if remember else {},
+                "intake": dict(memory.intake) if remember else {},
+                "adaptive": memory.adaptive if remember else None,
             }
         )
 
@@ -2919,6 +2950,7 @@ class NutritionAgent:
                 memory.eaten, memory.eaten_date = final_state["eaten_all"], _today_utc()
             elif shown is not None and not final_state.get("swap"):
                 memory.eaten, memory.eaten_date = [], None
+            self._remember_progress(memory, question, final_state)
             memory.history.append({"role": "user", "content": question})
             memory.history.append({"role": "assistant", "content": answer})
 
@@ -2986,6 +3018,30 @@ class NutritionAgent:
             menu_days=len(menu.days) if menu is not None else 0,
             trace=trace,
         )
+
+    @staticmethod
+    def _remember_progress(memory: ConversationState, question: str, final_state: dict) -> None:
+        """Взвешивание и съеденное за сегодня — для адаптивной нормы (adaptive.py).
+
+        Вес записывается, только если число из ЭТОЙ реплики совпало с весом
+        профиля: вопрос «сколько белка при весе 80 кг?» про другого человека
+        в журнал взвешиваний не попадёт. Съеденное — калорийность показанного
+        дня (после «съел не по плану» — с поправкой). Хранится 90 дней.
+        """
+        today = _today_utc()
+        weight = (final_state.get("profile") or {}).get("weight_kg")
+        said = [float((m.group(1) or m.group(2)).replace(",", "."))
+                for m in _WEIGHT_RE.finditer(question)]
+        if weight and any(abs(n - float(weight)) < 0.05 for n in said):
+            memory.weighins[today] = float(weight)
+        plan = final_state.get("plan")
+        if plan is not None:
+            memory.intake[today] = float(plan.totals["kcal"])
+        if final_state.get("adaptive"):
+            memory.adaptive = final_state["adaptive"]
+        border = (datetime.now(UTC).date() - timedelta(days=90)).isoformat()
+        memory.weighins = {d: w for d, w in memory.weighins.items() if d >= border}
+        memory.intake = {d: k for d, k in memory.intake.items() if d >= border}
 
     def reset(self) -> None:
         """Забыть разговор и профиль по умолчанию — начать с чистого листа."""

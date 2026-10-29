@@ -220,6 +220,10 @@ class Targets(BaseModel):
     goal: Goal
     rate_kg_per_week: float
 
+    # Расход по формуле, если норма посчитана от ФАКТИЧЕСКОГО расхода
+    # по динамике веса (adaptive.py). None — расход и есть формула.
+    tdee_formula: float | None = None
+
     # Что сработало из предохранителей — агент обязан это проговорить.
     adjustments: list[str] = Field(default_factory=list)
 
@@ -286,17 +290,23 @@ def _apply_safety_floor(profile: Profile, kcal: float, adjustments: list[str]) -
     return kcal
 
 
-def compute_targets(profile: Profile) -> Targets:
+def compute_targets(profile: Profile, tdee_override: float | None = None) -> Targets:
     """Посчитать целевые КБЖУ на день по профилю.
 
     Порядок важен: сначала считаем «чего хочет пользователь», затем прогоняем
     результат через предохранители и записываем каждое срабатывание
     в ``adjustments`` — чтобы агент не выдал урезанную цифру молча.
+
+    ``tdee_override`` — фактический расход по динамике веса (adaptive.py).
+    Подставляется ВМЕСТО формулы на входе, поэтому все предохранители ниже
+    (темп ≤1% массы в неделю, нижняя граница калорийности, потолок белка)
+    действуют и для адаптивной нормы — их не надо повторять отдельно.
     """
     adjustments: list[str] = []
 
     bmr = mifflin_st_jeor(profile)
-    tdee = total_expenditure(profile)
+    formula = total_expenditure(profile)
+    tdee = tdee_override if tdee_override else formula
 
     rate = profile.rate_kg_per_week
     if rate is None:
@@ -365,17 +375,22 @@ def compute_targets(profile: Profile) -> Targets:
         tdee=round(tdee),
         goal=profile.goal,
         rate_kg_per_week=rate,
+        tdee_formula=round(formula) if tdee_override else None,
         adjustments=adjustments,
     )
 
 
 def explain(profile: Profile, targets: Targets) -> str:
     """Человекочитаемое объяснение расчёта — для ответа агента."""
-    lines = [
-        f"Базовый обмен (Миффлин–Сан Жеор): {targets.bmr:.0f} ккал",
-        f"С учётом активности — {ACTIVITY_LABELS[profile.activity]} "
-        f"(×{ACTIVITY_FACTORS[profile.activity]}): {targets.tdee:.0f} ккал",
-    ]
+    lines = [f"Базовый обмен (Миффлин–Сан Жеор): {targets.bmr:.0f} ккал"]
+    if targets.tdee_formula:
+        lines.append(
+            f"По формуле с учётом активности расход был бы {targets.tdee_formula:.0f} ккал, "
+            f"но по динамике вашего веса и съеденному фактический расход — "
+            f"{targets.tdee:.0f} ккал. Норма считается от него")
+    else:
+        lines.append(f"С учётом активности — {ACTIVITY_LABELS[profile.activity]} "
+                     f"(×{ACTIVITY_FACTORS[profile.activity]}): {targets.tdee:.0f} ккал")
 
     if profile.goal == "lose":
         lines.append(f"Цель — снижение веса на {targets.rate_kg_per_week:.2f} кг/нед")
