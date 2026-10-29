@@ -139,8 +139,14 @@ def _norm(word: str) -> str:
     return word.lower().removesuffix("s")
 
 
-def problems(profile: dict, nums: dict, exclude: list, include: list, empty: bool) -> list[str]:
+def problems(profile: dict, nums: dict, exclude: list, include: list, empty: bool,
+             phrase: str = "") -> list[str]:
     found = []
+    # Аллергия (ревью R5): сказано «аллергия» — отмечена; не сказано — нет.
+    said, marked = "аллерг" in phrase.lower(), bool(profile.get("allergies"))
+    if said != marked:
+        found.append(f"аллергия {'не отмечена' if said else 'лишняя'}: "
+                     f"{profile.get('allergies')}")
     for field, value in nums.items():
         if profile.get(field) != value:
             found.append(f"{field}={profile.get(field)}")
@@ -197,7 +203,7 @@ def main() -> None:
                     agent.structured_extract = structured
                     profile, seconds, tokens_in, tokens_out = run_once(
                         agent, phrase, prior[0] if prior else None)
-                    found = problems(profile, nums, exclude, include, empty)
+                    found = problems(profile, nums, exclude, include, empty, phrase)
                     s = stats[mode]
                     s["n"] += 1
                     s["ok"] += not found

@@ -437,6 +437,7 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   "rate_kg_per_week": число,
   "days": на сколько дней просят меню (1, 7, 30 и т.п.),
   "exclude": ["английские названия продуктов, которые человек НЕ ест"],
+  "allergies": ["те из exclude, на которые у человека АЛЛЕРГИЯ"],
   "include": ["английские названия продуктов, которые человек ХОЧЕТ видеть"],
   "include_ru": {{"слово из include": "оно же по-русски"}}}}
 
@@ -472,6 +473,9 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
     халяль, только халяльное       → "halal"
   Диета или диагноз, названные утвердительно («только халяль», «я веган»,
   «у меня целиакия»), — это exclude, а не include.
+- allergies — только то, что человек назвал АЛЛЕРГИЕЙ («аллергия на арахис»
+  → exclude ["peanut"], allergies ["peanut"]). «Не ем», «не люблю»,
+  «непереносимость лактозы» — это НЕ аллергия: только exclude.
   Отдельный продукт называй как есть: «не ем свинину» → ["pork"],
   «без грибов» → ["mushroom"].
   «Не ем свинину, сладости, мучное и аллергия на лактозу» →
@@ -525,7 +529,8 @@ _EXTRACT_FIELDS: dict[str, Any] = {
         "items": {"type": "object", "additionalProperties": False, "properties": {
             "phrase_ru": {"type": "string"},
             "kind": {"type": "string", "enum": [
-                "food_excluded", "food_wanted", "nutrient", "diet_or_condition", "other"]},
+                "food_excluded", "allergy", "food_wanted", "nutrient",
+                "diet_or_condition", "other"]},
             "english": {"type": "string",
                         "description": "английское слово или слово-категория из правил"},
         }, "required": ["phrase_ru", "kind", "english"]},
@@ -540,6 +545,7 @@ _EXTRACT_FIELDS: dict[str, Any] = {
     "rate_kg_per_week": _NULLABLE["number"],
     "days": _NULLABLE["integer"],
     "exclude": {"type": "array", "items": {"type": "string"}},
+    "allergies": {"type": "array", "items": {"type": "string"}},
     "include": {"type": "array", "items": {"type": "string"}},
     # Список пар, а не словарь: строгая схема не допускает произвольных ключей.
     "include_ru": {"type": "array", "items": {
@@ -562,8 +568,85 @@ EXTRACT_PROFILE_PROMPT_SGR = EXTRACT_PROFILE_PROMPT.replace(
 )
 
 
-# Какие разобранные упоминания (mentions) — в какое поле профиля.
-_MENTION_FIELDS = {"food_excluded": "exclude", "allergy": "exclude", "food_wanted": "include"}
+# ── Аллергия: не то же, что «не ем» (ревью R5) ─────────────────────────
+#
+# Фильтр одинаков для обоих: аллерген отсекает exclude по названию,
+# разделу и полному составу. Но для аллергии этого мало, и человек должен
+# это услышать: справочник не знает о следах и перекрёстном загрязнении,
+# а состав в магазине бывает другим. Текст — шаблон кода, не модели.
+_ALLERGY_RE = re.compile(r"аллерг|анафилак", re.IGNORECASE)
+UNSPECIFIED_ALLERGY = "unspecified"
+_ALLERGEN_RU = {
+    "peanut": "арахис", "peanuts": "арахис", "nuts": "орехи", "nut": "орехи",
+    "tree nuts": "орехи", "eggs": "яйца", "egg": "яйца", "lactose": "молочное",
+    "milk": "молоко", "dairy": "молочное", "seafood": "рыбу и морепродукты",
+    "fish": "рыбу", "shellfish": "моллюсков и ракообразных", "shrimp": "креветки",
+    "gluten": "глютен", "wheat": "пшеницу", "soy": "сою", "sesame": "кунжут",
+    "honey": "мёд", "chocolate": "шоколад", "strawberry": "клубнику",
+    "citrus": "цитрусовые",
+}
+ALLERGY_NOTE = (
+    "\n\n⚠️ Про аллергию{names}: блюда подобраны так, чтобы аллергена не было "
+    "ни в названии, ни в составе по справочнику USDA. Это не гарантия: справочник "
+    "не знает о следовых количествах и перекрёстном загрязнении на производстве, "
+    "а состав продукта в магазине может отличаться. Сверяйтесь с этикеткой, "
+    "а при тяжёлой аллергии согласуйте рацион с аллергологом.{ask}"
+)
+
+
+def _merge_allergies(question: str, known: list, named: Any,
+                     exclude: list) -> tuple[list[str], list[str]]:
+    """Аллергии профиля после реплики и exclude, в котором есть каждая из них.
+
+    Три источника, потому что ни одному нельзя верить в одиночку:
+    модель (поле allergies), формулировка в exclude («peanut allergy» —
+    это уже аллергия) и сам текст («аллергия», а модель не отметила
+    ничего — тогда UNSPECIFIED, предупреждение без названия аллергена).
+
+    Аллергии копятся, а не заменяются: молча потерять аллергию из-за того,
+    что модель в следующей реплике её не повторила, нельзя. И каждая
+    обязана стоять в exclude — по той же причине.
+    """
+    allergies = [str(a).strip().lower() for a in known if str(a).strip()]
+    new = [str(a).strip().lower() for a in named or [] if isinstance(a, str) and a.strip()]
+    new += [t.strip().lower() for t in exclude
+            if isinstance(t, str) and "allergy" in t.lower()]
+    for item in new:
+        if item not in allergies:
+            allergies.append(item)
+    if not allergies and _ALLERGY_RE.search(question):
+        allergies = [UNSPECIFIED_ALLERGY]
+    if len(allergies) > 1 and UNSPECIFIED_ALLERGY in allergies:
+        allergies.remove(UNSPECIFIED_ALLERGY)
+
+    exclude = list(exclude)
+    lowered = {t.strip().lower() for t in exclude if isinstance(t, str)}
+    for item in allergies:
+        if item != UNSPECIFIED_ALLERGY and item not in lowered:
+            exclude.append(item)
+    return allergies, exclude
+
+
+def allergy_note(allergies: list[str]) -> str:
+    """Предупреждение для ответа с планом — или пусто, если аллергии нет."""
+    if not allergies:
+        return ""
+    names = []
+    for item in allergies:
+        if item == UNSPECIFIED_ALLERGY:
+            continue
+        name = _ALLERGEN_RU.get(item.removesuffix(" allergy"), item)
+        if name not in names:
+            names.append(name)
+    return ALLERGY_NOTE.format(
+        names=f" ({', '.join(names)})" if names else "",
+        ask="" if names else " Напишите, на что именно аллергия, — исключу эти продукты.",
+    )
+
+
+# Какие разобранные упоминания (mentions) — в какие поля профиля.
+_MENTION_FIELDS = {"food_excluded": ("exclude",), "allergy": ("exclude", "allergies"),
+                   "food_wanted": ("include",)}
 
 
 def _from_structured(parsed: dict) -> dict:
@@ -584,9 +667,8 @@ def _from_structured(parsed: dict) -> dict:
     for mention in parsed.pop("mentions", None) or []:
         if not isinstance(mention, dict):
             continue
-        field = _MENTION_FIELDS.get(mention.get("kind"))
         word = str(mention.get("english") or "").strip()
-        if field and word:
+        for field in _MENTION_FIELDS.get(mention.get("kind"), ()) if word else ():
             current = parsed.get(field)
             current = [current] if isinstance(current, str) else list(current or [])
             if word.lower() not in {str(t).lower() for t in current}:
@@ -1743,6 +1825,8 @@ class NutritionAgent:
             if pairs:
                 extracted["include_ru"] = {**known.get("include_ru", {}), **pairs}
 
+        named_allergies = extracted.pop("allergies", None)
+
         # Модель возвращает только явно названное, поэтому просто накладываем
         # новое поверх старого. Кроме exclude: его — копить.
         #
@@ -1760,6 +1844,12 @@ class NutritionAgent:
                 seen = {str(t).lower() for t in before}
                 value = before + [t for t in value if str(t).lower() not in seen]
             known[field] = value
+
+        allergies, exclude = _merge_allergies(
+            state["question"], known.get("allergies") or [], named_allergies,
+            known.get("exclude") or [])
+        if allergies:
+            known["allergies"], known["exclude"] = allergies, exclude
 
         missing = [field for field in REQUIRED_PROFILE_FIELDS if field not in known]
 
@@ -1986,6 +2076,10 @@ class NutritionAgent:
         caution = self._caution_note(profile, menu, plan)
         if caution:
             text += caution
+
+        # В КАЖДОМ ответе с планом, пока в профиле есть аллергия: новый
+        # план — новые блюда, и про этикетку надо сказать для них тоже.
+        text += allergy_note(profile.allergies)
 
         # Сначала — о непонятых пожеланиях, потом предложение назвать новые.
         # Обратный порядок выглядел бы издевательством: «назовите любимые
