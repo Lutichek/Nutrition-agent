@@ -80,6 +80,9 @@ class ConversationState(BaseModel):
     # и сбрасывается новым планом или новыми сутками.
     eaten: list[dict] = Field(default_factory=list)
     eaten_date: str | None = None
+    # Съеденное, которое ждёт ответа «на какой приём пищи?»: {items, date}.
+    # Живёт одну реплику — следующая либо отвечает, либо о другом.
+    eaten_pending: dict | None = None
 
     # Для адаптивной нормы (adaptive.py, ревью R9): взвешивания и съеденное
     # по дням (дата ISO → кг / ккал) и последняя оценка расхода {tdee, at}.
@@ -137,6 +140,8 @@ class AgentState(TypedDict, total=False):
     eaten_before: list[dict]  # съеденное сегодня в ПРОШЛЫХ репликах (вход)
     eaten_all: list[dict]  # всё съеденное за сегодня — только если был пересчёт (выход)
     eaten_shown: list      # MealItem съеденного из этой реплики — для ответа
+    eaten_pending: dict    # съеденное, ждущее ответа «какой приём пищи» (вход)
+    eaten_pending_new: dict  # то же, если эта реплика задала уточнение (выход)
     weighins: dict         # дата → вес, кг (вход)
     intake: dict           # дата → съедено, ккал (вход)
     adaptive: dict         # {tdee, at} — оценка расхода по динамике веса

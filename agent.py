@@ -75,7 +75,7 @@ from llm_io import _LLM_CALLS, parse_json_response
 from nodes_plan import PlanNodes
 from nodes_question import QuestionNodes
 from profile_rules import _NUTRIENT_WORDS as _NUTRIENT_WORDS
-from profile_rules import _WEIGHT_RE, _today_utc
+from profile_rules import _WEIGHT_RE, _today_utc, meal_from_answer
 from profile_rules import REQUIRED_PROFILE_FIELDS as REQUIRED_PROFILE_FIELDS
 from profile_rules import _category_fix as _category_fix
 from profile_rules import _from_structured as _from_structured
@@ -620,6 +620,12 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
         вопросов из 80 в тестовом прогоне — просто потому, что в вопросе
         упоминалась болезнь. Это не осторожность, а бесполезность.
         """
+        # «На обед» в ответ на «на какой приём пищи было?» — по одной
+        # реплике модель не поймёт, что это про рацион. Решает код.
+        resumes_eaten = meal_from_answer(state["question"], state.get("eaten_pending"))
+        if resumes_eaten and not state.get("red_flag"):
+            return "extract_profile"
+
         if state.get("intent") == "off_topic":
             return "off_topic"
 
@@ -679,6 +685,8 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                 # Вчерашнее съеденное к сегодняшнему дню отношения не имеет.
                 "eaten_before": (list(memory.eaten)
                                  if remember and memory.eaten_date == _today_utc() else []),
+                "eaten_pending": (memory.eaten_pending if remember and memory.eaten_pending
+                                  and memory.eaten_pending.get("date") == _today_utc() else None),
                 "weighins": dict(memory.weighins) if remember else {},
                 "intake": dict(memory.intake) if remember else {},
                 "adaptive": memory.adaptive if remember else None,
@@ -705,6 +713,9 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                 memory.eaten, memory.eaten_date = final_state["eaten_all"], _today_utc()
             elif shown is not None and not final_state.get("swap"):
                 memory.eaten, memory.eaten_date = [], None
+            # Ждёт ответа «на какой приём пищи» ровно одну реплику.
+            pending = final_state.get("eaten_pending_new")
+            memory.eaten_pending = {**pending, "date": _today_utc()} if pending else None
             self._remember_progress(memory, question, final_state)
             memory.history.append({"role": "user", "content": question})
             memory.history.append({"role": "assistant", "content": answer})

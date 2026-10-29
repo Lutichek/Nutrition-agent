@@ -148,6 +148,72 @@ class TestInConversation:
         eaten = [it for it in answer.plan.items if it.slot.endswith("(съедено)")]
         assert len(eaten) == 1
 
+    def test_meal_answer_finishes_the_recount(self, catalog):
+        """Живой прогон: на уточнение человек ответил «на обед», и реплика
+        ушла в обычную сборку плана — пицца и кола потерялись, а новый день
+        затёр прежний вместе с заменённым завтраком. Ответ на уточнение
+        дописывает приём пищи к уже выписанному, модель второй раз не зовут.
+        """
+        agent = make_agent(catalog, [{**PIZZA, "meal": "unknown"}], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        assert "на какой приём пищи" in agent.run("Съел пиццу, 300 г").answer
+
+        answer = agent.run("на обед")
+
+        assert answer.answer.startswith("Учёл съеденное")
+        eaten = [it for it in answer.plan.items if it.slot.endswith("(съедено)")]
+        assert len(eaten) == 1 and eaten[0].slot.startswith("Обед")
+        assert sum("Человек рассказывает, что съел" in c for c in agent.client.calls) == 1
+        assert agent._own_state.eaten_pending is None, "уточнение закрыто"
+
+    def test_meal_answer_wins_over_the_router(self, catalog):
+        """По одному «на ужин» модель не поймёт, что речь о рационе."""
+        agent = make_agent(catalog, [{**PIZZA, "meal": "unknown"}], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("Съел пиццу, 300 г")
+        agent.client.script["маршрутизатор"] = json.dumps({"intent": "off_topic", "red_flag": ""})
+        assert agent.run("Это был ужин").answer.startswith("Учёл съеденное")
+
+    def test_pending_lives_one_turn(self, catalog):
+        """Не ответил на уточнение — через реплику «обед» уже ни к чему не относится."""
+        agent = make_agent(catalog, [{**PIZZA, "meal": "unknown"}], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("Съел пиццу, 300 г")
+        assert agent._own_state.eaten_pending is not None
+        agent.run("Составь план заново")
+        assert agent._own_state.eaten_pending is None
+
+    def test_eaten_food_is_not_a_restriction_or_a_wish(self, catalog):
+        """Живой прогон: на «…съел пиццу и выпил колу» модель дописала
+        exclude ["sugar"], а на следующей реплике — include ["pizza","cola"].
+        Исключения копятся и репликой не снимаются: сахар оставался
+        исключённым навсегда, а в ответе стояло «cola противоречит sugar»."""
+        agent = make_agent(catalog, [PIZZA], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.client.script["Извлеки параметры"] = json.dumps(
+            {**PROFILE, "exclude": ["sugar"], "include": ["pizza", "cola"]})
+        agent.run("На обед съел пиццу и выпил колу")
+        profile = agent._own_state.profile
+        assert not profile.get("exclude") and not profile.get("include")
+
+    def test_restriction_said_while_reporting_food_is_kept(self, catalog):
+        """Обратная сторона: названное прямо — аллерген, его терять нельзя."""
+        agent = make_agent(catalog, [PIZZA], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.client.script["Извлеки параметры"] = json.dumps({**PROFILE, "exclude": ["mushroom"]})
+        agent.run("На обед съел пиццу, а грибы я вообще не ем")
+        assert agent._own_state.profile["exclude"] == ["mushroom"]
+
+    def test_generic_entry_goes_first(self, catalog):
+        """«На обед был суп»: двенадцать конкретных супов, и модель, не зная
+        какой, отвечала «ничего не подходит». Обобщённая запись FNDDS
+        («Soup, NFS») — первой, если она есть в каталоге."""
+        agent = make_agent(catalog, [PIZZA], [1])
+        found = [{"fdc_id": -1, "name": "Soup, chicken", "name_ru": "", "portion_g": 250.0}]
+        first = agent._generic_first(found, {"query_en": "soup"})[0]
+        assert first["name"] == "Soup, NFS"
+        assert agent._generic_first(found, {"query_en": "pizza"}) == found, "нет «Pizza, NFS»"
+
     def test_without_a_plan_it_is_a_normal_turn(self, catalog):
         """«Съел» без показанного плана пересчитывать нечего."""
         agent = make_agent(catalog, [PIZZA], [1])

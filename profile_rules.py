@@ -107,9 +107,69 @@ _EATEN_RE = re.compile(
     r"|на (?:завтрак|обед|ужин) (?:был|была|были)", re.IGNORECASE)
 
 
+# Съеденное — не пожелание и не ограничение. Живой прогон: на «На обед
+# съел две куски пиццы и выпил колу» модель дописала в exclude "sugar"
+# (разбор упоминаний при этом пустой), а на следующей реплике о той же
+# пицце — include ["pizza","cola"]. Исключения копятся и репликой не
+# снимаются: сахар оставался исключённым до «удалить мои данные».
+#
+# Подтверждать разбором упоминаний нельзя — он бывает пустым и при верном
+# исключении (то самое отклонённое правило про sweets/flour/fried). Поэтому
+# признак — в тексте: в реплике о съеденном новое ограничение берётся, если
+# человек его СКАЗАЛ («не ем», «без», «аллергия»…), пожелание — если сказал
+# «хочу», «добавь», «люблю».
+_RESTRICTION_MARKER = re.compile(
+    r"\bне\s+(?:ем|ест|пью|употребля|переношу|люблю|хочу|могу)|\bбез\b|нельзя|аллерг"
+    r"|непереносим|исключ|\bубер", re.IGNORECASE)
+_WISH_MARKER = re.compile(
+    r"(?<!не )(?:хочу|хотел|хотела|люблю|нравит)|\bдобав|побольше|почаще|в план",
+    re.IGNORECASE)
+
+
+def _eaten_turn_filter(extracted: dict, question: str, about_eaten: bool | None = None) -> dict:
+    """В реплике о съеденном — только явно сказанные ограничения и пожелания.
+
+    about_eaten — реплика о съеденном, хотя слов «съел» в ней нет: ответ
+    «на обед» на уточнение. Модель видит пиццу в истории и снова клала
+    её в include.
+    """
+    if not (about_eaten or _EATEN_RE.search(question)):
+        return extracted
+    extracted = dict(extracted)
+    if not _RESTRICTION_MARKER.search(question):
+        extracted.pop("exclude", None)
+        extracted.pop("allergies", None)
+    if not _WISH_MARKER.search(question):
+        extracted.pop("include", None)
+        extracted.pop("include_ru", None)
+    return extracted
+
+
 # Приём пищи → какие слоты DAY_TEMPLATE он закрывает. Обед и ужин — оба
 # слота (основное и гарнир): «на обед съел пиццу» — это весь обед.
 _MEAL_SLOTS = {"breakfast": [0], "lunch": [1, 2], "dinner": [3, 4], "snack": [5, 6]}
+
+
+# Ответ на «на какой приём пищи было?». Живой прогон: «на обед» после
+# уточнения ушло в обычную сборку плана — пицца и кола потерялись, а новый
+# день затёр прежний вместе с заменённым завтраком. Поэтому съеденное,
+# которое ждёт ответа, хранится (ConversationState.eaten_pending) ровно
+# одну реплику, а ответ разбирает код: слово приёма пищи — без модели.
+_MEAL_ANSWER = (("завтрак", "breakfast"), ("обед", "lunch"), ("ужин", "dinner"),
+                ("перекус", "snack"), ("полдник", "snack"))
+
+
+def meal_from_answer(question: str, pending: dict | None) -> str | None:
+    """Приём пищи из ответа на уточнение — или None, если это не ответ.
+
+    Новая реплика о съеденном («съел ещё и торт») — не ответ: её разбирают
+    заново, а ждавшее уточнения забывается.
+    """
+    if not pending or _EATEN_RE.search(question):
+        return None
+    lowered = question.lower()
+    found = [meal for word, meal in _MEAL_ANSWER if word in lowered]
+    return found[0] if len(set(found)) == 1 else None
 
 
 CHECK_RU = {

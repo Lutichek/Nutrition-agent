@@ -42,6 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import agent as agent_module  # noqa: E402
+import nodes_plan  # noqa: E402
 from agent import _NUTRIENT_WORDS, NutritionAgent  # noqa: E402
 from providers import get_clients  # noqa: E402
 from restrictions import expand  # noqa: E402
@@ -149,8 +150,41 @@ FORBID = {
     "Без сахара, пожалуйста": ["sweets"],
     "Сахар не кладу, а сладкое ем": ["sweets"],
 }
-SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED, "multi": MULTI, "sweets": SWEETS}
+# Реплика о съеденном: ничего не исключать и не желать, если человек сам
+# этого не сказал. Живой прогон: «…съел пиццу и выпил колу» → exclude
+# ["sugar"] навсегда, а следующая реплика о пицце → include ["pizza","cola"].
+# Здесь лишнее исключение — промах (EXACT), как и лишнее пожелание.
+#
+# Замер (--variants, 3 прогона): без страховки кодом 9/36 по схеме и 15/36
+# свободным JSON — «выпила вина» → alcohol, «пицца и кола» → sweets и sugar;
+# с ней 33/36 и 33/36. Правило о съеденном В ПРОМПТЕ проверено и отклонено:
+# одно 15/36 и 12/36, вместе с кодом 33/36 и 35/36 — в пределах шума за
+# ~100 токенов на каждую реплику. Остаток — «кофе без сахара и круассан»:
+# «без» пропускает ограничение, и модель кладёт sweets/flour. Не трогаем:
+# «без» в реплике о съеденном бывает и настоящим ограничением.
+EATEN = [
+    ("На обед съел две куски пиццы и выпил колу", {}, [], [], True),
+    ("Съел 2 куска пиццы (примерно 250 гр) и выпил колу", {}, [], [], True),
+    ("На завтрак съел шоколадку и выпил кофе с сахаром", {}, [], [], True),
+    ("Поел жареной картошки с салом на ужин", {}, [], [], True),
+    ("Перекусил чипсами и выпил пиво", {}, [], [], True),
+    ("Выпила бокал вина за ужином", {}, [], [], True),
+    ("На обед был борщ со сметаной", {}, [], [], True),
+    ("Выпил кофе без сахара и съел круассан", {}, [], [], True),
+    ("Съел на обед борщ. Кстати, грибы я не ем", {}, ["mushroom"], [], True),
+    ("Съел шаурму, а свинину я вообще не ем", {}, ["pork"], [], True),
+    ("Съела творог на завтрак, и добавь в план гречку", {}, [],
+     [({"buckwheat"}, "греч")], False),
+    ("Съел на обед курицу с рисом", {}, ["pork"], [], True, _PORK),
+]
+EXACT = {phrase for phrase, *_ in EATEN}
+SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED, "multi": MULTI, "sweets": SWEETS,
+        "eaten": EATEN}
 MODES = {"схема + разбор": True, "свободный JSON": False}
+
+# Страховка «съеденное — не ограничение» (--variants): с ней и без неё.
+GUARDS = {"с кодом": nodes_plan._eaten_turn_filter,
+          "без кода": lambda extracted, question, about_eaten=None: extracted}
 
 
 def _norm(word: str) -> str:
@@ -173,6 +207,11 @@ def problems(profile: dict, nums: dict, exclude: list, include: list, empty: boo
     leak = sorted(w for w in expand(exclude) if _norm(w) not in got)
     if leak:
         found.append(f"утечка {leak[:3]} (exclude={profile.get('exclude')})")
+    if phrase in EXACT:
+        allowed = {_norm(w) for w in expand(exclude)}
+        extra = sorted(w for w in got if w not in allowed)
+        if extra:
+            found.append(f"лишнее исключение {extra[:3]} (exclude={profile.get('exclude')})")
     for category in FORBID.get(phrase, []):
         if all(_norm(w) in got for w in expand([category])):
             found.append(f"лишнее исключение {category} (exclude={profile.get('exclude')})")
@@ -211,17 +250,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--sets", nargs="*", default=list(SETS), choices=list(SETS))
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--variants", action="store_true",
+                        help="сравнить со страховкой «съеденное — не ограничение» и без неё")
+    parser.add_argument("--modes", nargs="*", default=list(MODES), choices=list(MODES))
     args = parser.parse_args()
 
     client, model, _ = get_clients("polza")
     agent = NutritionAgent(client=client, model=model, retriever=None)
+    guards = list(GUARDS) if args.variants else ["с кодом"]
+    runs = {(f"{mode} | {g}" if args.variants else mode): (MODES[mode], g)
+            for mode in args.modes for g in guards}
 
     for set_name in args.sets:
         cases = SETS[set_name]
-        stats = {mode: {"ok": 0, "n": 0, "sec": [], "in": [], "out": []} for mode in MODES}
+        stats = {name: {"ok": 0, "n": 0, "sec": [], "in": [], "out": []} for name in runs}
         for repeat in range(args.repeats):
             for phrase, nums, exclude, include, empty, *prior in cases:
-                for mode, structured in MODES.items():
+                for mode, (structured, guard_name) in runs.items():
+                    nodes_plan._eaten_turn_filter = GUARDS[guard_name]
                     agent.structured_extract = structured
                     profile, seconds, tokens_in, tokens_out = run_once(
                         agent, phrase, prior[0] if prior else None)

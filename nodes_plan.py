@@ -35,6 +35,7 @@ from profile_rules import (
     _SWAP_RE,
     FIELD_NAMES_RU,
     REQUIRED_PROFILE_FIELDS,
+    _eaten_turn_filter,
     _from_structured,
     _merge_allergies,
     _resolve_preferences,
@@ -42,6 +43,7 @@ from profile_rules import (
     _with_russian_fallback,
     allergy_note,
     eaten_note,
+    meal_from_answer,
     swap_note,
 )
 from prompts import (
@@ -100,6 +102,22 @@ logger = logging.getLogger("agent")
 # а не плодят потоки.
 _MENU_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="menu")
 
+# Обобщённая запись («Soup, NFS») первой в кандидатах на съеденное —
+# см. _generic_first; флаг для замера experiments/eaten_match.py.
+#
+# Живой прогон: на «две куски пиццы» поиск дал 12 видов пиццы, модель
+# ответила «ничего не подходит» — вид не назван. Замер (2 прогона):
+#
+#     подсказка выбора                 вид назван   вид не назван
+#     прежняя                            12/16          4/16
+#     прежняя + строка «выбери обычный»  12/16          4/16
+#     прежняя + «X, NFS» первым          12/16          8/16
+#     переписанная + «X, NFS» первым     12/16         14/16
+#
+# Одной строки в подсказке мало: запрет «ставь 0» перевешивал. Помогло
+# поставить «вид не назван — любой обычный» ПЕРВЫМ правилом, с примерами.
+GENERIC_FIRST = True
+
 
 class PlanNodes:
     """Узлы ветки «рацион»."""
@@ -112,7 +130,9 @@ class PlanNodes:
         known = dict(state.get("profile") or {})
 
         raw = self._ask(state, "extract_profile", self._extract_prompt(state))
-        extracted = _from_structured(parse_json_response(raw))
+        extracted = _eaten_turn_filter(
+            _from_structured(parse_json_response(raw)), state["question"],
+            about_eaten=meal_from_answer(state["question"], state.get("eaten_pending")) is not None)
 
         # days — это параметр запроса, а не свойство человека, поэтому
         # в профиль он не кладётся: иначе Profile не прошёл бы валидацию.
@@ -210,7 +230,11 @@ class PlanNodes:
         if state.get("missing"):
             return "ask_profile"
         # «Съел не по плану» имеет смысл, только когда план уже был.
-        if state.get("last_plan") and _EATEN_RE.search(state["question"]):
+        # «На обед» — ответ на уточнение о съеденном, а не просьба о плане.
+        question = state["question"]
+        if state.get("last_plan") and (
+                _EATEN_RE.search(question)
+                or meal_from_answer(question, state.get("eaten_pending"))):
             return "match_eaten"
         return "make_plan"
 
@@ -231,8 +255,9 @@ class PlanNodes:
             text = f"{item.get('phrase_ru', '')} | {item.get('query_en', '')}"
             ids = food_search.nearest(text, embedder)
             rows = catalog.set_index("fdc_id", drop=False)
-            return rows.loc[[i for i in ids if i in rows.index],
-                            ["fdc_id", "name", "name_ru", "portion_g"]].to_dict("records")
+            found = rows.loc[[i for i in ids if i in rows.index],
+                             ["fdc_id", "name", "name_ru", "portion_g"]].to_dict("records")
+            return self._generic_first(found, item) if GENERIC_FIRST else found
         hits = pd.Series(False, index=catalog.index)
         query = str(item.get("query_en") or "").strip()
         if query and (pattern := to_pattern([query])):
@@ -258,11 +283,35 @@ class PlanNodes:
         ).sort_values(["_ru", "_en", "_len", "fdc_id"])
         return found.head(12)[["fdc_id", "name", "name_ru", "portion_g"]].to_dict("records")
 
+    def _generic_first(self, found: list[dict], item: dict) -> list[dict]:
+        """Обобщённая запись каталога («Soup, NFS») — первой, если она есть.
+
+        «На обед был суп»: смысловой поиск дал двенадцать конкретных супов,
+        а модель, не зная какой, отвечала «ничего не подходит».
+        """
+        query = str(item.get("query_en") or "").strip()
+        if not query:
+            return found
+        generic = self.catalog[self.catalog["name"].str.lower() == f"{query.lower()}, nfs"]
+        if generic.empty:
+            return found
+        record = generic.iloc[0][["fdc_id", "name", "name_ru", "portion_g"]].to_dict()
+        rest = [r for r in found if int(r["fdc_id"]) != int(record["fdc_id"])]
+        return [record, *rest][:12]
+
     def _node_match_eaten(self, state: AgentState) -> AgentState:
         """Сопоставить съеденное с каталогом. Модель выписывает и выбирает;
         ищет кандидатов и считает граммы код."""
-        raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True)
-        items = [i for i in parse_json_response(raw).get("items") or [] if isinstance(i, dict)]
+        pending = state.get("eaten_pending")
+        meal = meal_from_answer(state["question"], pending)
+        if meal:
+            # Ответ на уточнение: позиции уже выписаны в прошлой реплике,
+            # модель второй раз не спрашиваем — подставляем приём пищи.
+            items = [{**i, "meal": i.get("meal") if i.get("meal") in _MEAL_SLOTS else meal}
+                     for i in pending["items"]]
+        else:
+            raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True)
+            items = [i for i in parse_json_response(raw).get("items") or [] if isinstance(i, dict)]
         if not items:
             return {"answer": "Не понял, что именно съедено. Напишите, например: "
                               "«на обед съел пиццу, 300 г»."}
@@ -270,7 +319,8 @@ class PlanNodes:
                    if i.get("meal") not in _MEAL_SLOTS]
         if unknown:
             return {"answer": (f"Уточните, на какой приём пищи было: {', '.join(unknown)} — "
-                               "завтрак, обед, ужин или перекус? Тогда пересчитаю остаток дня.")}
+                               "завтрак, обед, ужин или перекус? Тогда пересчитаю остаток дня."),
+                    "eaten_pending_new": {"items": items}}
 
         candidates = [self._eaten_candidates(item) for item in items]
         blocks = "\n\n".join(
