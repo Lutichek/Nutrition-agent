@@ -15,7 +15,7 @@ import threading
 
 from conftest import FakeLLMClient, FakeRetriever
 
-import agent as agent_module
+import nodes_plan
 from agent import NutritionAgent
 from chat_log import replay_plan
 from solver import PlanNotFeasible
@@ -61,7 +61,7 @@ def test_model_called_before_rest_of_menu(catalog, monkeypatch):
     """Ради этого всё и делалось: объяснение не ждёт дней со второго."""
     explained = threading.Event()
     seen: list[bool] = []
-    real = agent_module.menu_days
+    real = nodes_plan.menu_days
 
     def slow_rest(*args, **kwargs):
         days = real(*args, **kwargs)
@@ -71,7 +71,7 @@ def test_model_called_before_rest_of_menu(catalog, monkeypatch):
         seen.append(explained.wait(timeout=10))
         yield from days
 
-    monkeypatch.setattr(agent_module, "menu_days", slow_rest)
+    monkeypatch.setattr(nodes_plan, "menu_days", slow_rest)
     agent = make_agent(catalog)
     create = agent.client.chat.completions.create
 
@@ -93,14 +93,14 @@ def test_late_day_failure_is_still_reported(catalog, monkeypatch):
     В фоне ошибка всплывает уже после объяснения первого дня, и без
     отдельной ветки человек получил бы план недели, которой нет.
     """
-    real = agent_module.menu_days
+    real = nodes_plan.menu_days
 
     def fails_on_day_two(*args, **kwargs):
         days = real(*args, **kwargs)
         yield next(days)
         raise PlanNotFeasible("Подходящих блюд не хватило.")
 
-    monkeypatch.setattr(agent_module, "menu_days", fails_on_day_two)
+    monkeypatch.setattr(nodes_plan, "menu_days", fails_on_day_two)
     answer = make_agent(catalog).run("Мне 35, мужчина, 180 см, 85 кг, 3 тренировки, на неделю")
 
     assert "Не получилось собрать рацион" in answer.answer
