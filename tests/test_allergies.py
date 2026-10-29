@@ -106,3 +106,19 @@ def test_note_is_code_template():
     note = allergy_note(["eggs", "eggs", "lactose"])
     assert note == ALLERGY_NOTE.format(names=" (яйца, молочное)", ask="")
     assert allergy_note([]) == ""
+
+
+def test_model_allergy_needs_the_word():
+    """«Хочу творог, но у меня непереносимость лактозы» — живая модель
+    отмечала аллергией 3/3. Без слова «аллергия» её отметку не берём."""
+    allergies, exclude = _merge_allergies(
+        "Хочу творог, но у меня непереносимость лактозы", [], ["lactose"], ["lactose"])
+    assert allergies == []
+    assert exclude == ["lactose"], "исключение остаётся — меняется только предупреждение"
+
+
+def test_allergy_word_said_earlier_counts():
+    """«И на кунжут тоже» после «аллергия на арахис» — слово было раньше."""
+    allergies, _ = _merge_allergies("И на кунжут тоже", ["peanut"], ["sesame"],
+                                    ["peanut", "sesame"], said_before=True)
+    assert allergies == ["peanut", "sesame"]

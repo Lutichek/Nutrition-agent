@@ -596,8 +596,8 @@ ALLERGY_NOTE = (
 )
 
 
-def _merge_allergies(question: str, known: list, named: Any,
-                     exclude: list) -> tuple[list[str], list[str]]:
+def _merge_allergies(question: str, known: list, named: Any, exclude: list,
+                     said_before: bool = False) -> tuple[list[str], list[str]]:
     """Аллергии профиля после реплики и exclude, в котором есть каждая из них.
 
     Три источника, потому что ни одному нельзя верить в одиночку:
@@ -608,8 +608,16 @@ def _merge_allergies(question: str, known: list, named: Any,
     Аллергии копятся, а не заменяются: молча потерять аллергию из-за того,
     что модель в следующей реплике её не повторила, нельзя. И каждая
     обязана стоять в exclude — по той же причине.
+
+    Аллергию, отмеченную моделью, верим, только если слово «аллергия»
+    звучало — в этой реплике или раньше (``said_before``). Наблюдалось
+    (experiments/extract_profile.py): «Хочу творог, но у меня непереносимость
+    лактозы» модель 3/3 отмечала аллергией. «И на кунжут тоже» после
+    «аллергия на арахис» при этом проходит — слово было раньше.
     """
     allergies = [str(a).strip().lower() for a in known if str(a).strip()]
+    if not (said_before or _ALLERGY_RE.search(question)):
+        named = []
     new = [str(a).strip().lower() for a in named or [] if isinstance(a, str) and a.strip()]
     new += [t.strip().lower() for t in exclude
             if isinstance(t, str) and "allergy" in t.lower()]
@@ -1868,9 +1876,12 @@ class NutritionAgent:
                 value = before + [t for t in value if str(t).lower() not in seen]
             known[field] = value
 
+        said_before = any(
+            item.get("role") == "user" and _ALLERGY_RE.search(str(item.get("content", "")))
+            for item in state.get("history") or [])
         allergies, exclude = _merge_allergies(
             state["question"], known.get("allergies") or [], named_allergies,
-            known.get("exclude") or [])
+            known.get("exclude") or [], said_before=said_before)
         if allergies:
             known["allergies"], known["exclude"] = allergies, exclude
 
