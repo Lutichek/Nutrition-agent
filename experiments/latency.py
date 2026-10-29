@@ -147,12 +147,15 @@ def main() -> None:
                         help="без вызовов наперёд — для сравнения с ними")
     parser.add_argument("--no-stream", action="store_true",
                         help="без ответа по частям — для сравнения с ним")
+    parser.add_argument("--free-json-extract", action="store_true",
+                        help="извлечение профиля свободным JSON, а не по схеме")
     args = parser.parse_args()
 
     llm_client, model, embed_client = get_clients("polza")
     # Как в сервисе (api.py): меряется то, что ждёт человек.
     agent = build_agent(llm_client, model=model, embed_client=embed_client,
-                        speculate=not args.no_speculate)
+                        speculate=not args.no_speculate,
+                        structured_extract=not args.free_json_extract)
 
     cases = {name: text for name, text in CASES.items()
              if not args.cases or any(name.startswith(c) for c in args.cases)}

@@ -491,6 +491,93 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
   не включай поле.
 - Уже известные значения переписывай только если человек их явно поправил."""
 
+# ── Извлечение профиля по схеме (Schema-Guided Reasoning) ──────────────
+#
+# Модель сначала разбирает КАЖДОЕ упоминание в реплике со знаком (mentions:
+# не ест / хочет / нутриент / диета), и только потом заполняет поля. Строгая
+# схема держит типы и перечисления.
+#
+# Замер на живой модели (experiments/extract_profile.py, 38 фраз × 3 прогона,
+# итог ПОСЛЕ кода агента, промпт уже с правилом про диеты):
+#
+#     набор                    свободный JSON   схема + разбор
+#     простые (18)                 54/54            54/54
+#     трудные (11)                 33/33            32/33   (не нашёл пожелание)
+#     смешанный знак (9)           22/27            25/27
+#     утечек ограничений             5                2
+#     время шага                 1.5-1.7 с        2.1-2.8 с
+#
+# Выигрыш — на смешанном знаке: «…а свинину и колбасу не ем» теряло колбасу
+# 2/3, с разбором 0/3. Пилот до правила про диеты: та же картина плюс
+# «Молочку не ем, мясо ем, но не свинину» (свинина 3/3 → 0/3). Строгая
+# схема БЕЗ разбора не дала ничего и сама потеряла мёд у «я веган»: дело
+# в разборе, а не в схеме. Время шага на ответ не легло: шаг идёт наперёд,
+# параллельно classify, и первый текст плана — 4.2-4.6 с в обоих режимах
+# (latency.py --free-json-extract, попеременно).
+_NULLABLE = {"integer": {"type": ["integer", "null"]}, "number": {"type": ["number", "null"]}}
+_EXTRACT_FIELDS: dict[str, Any] = {
+    "mentions": {
+        "type": "array",
+        "description": "Сначала разбери КАЖДОЕ упоминание еды, нутриента, диеты "
+                       "или состояния в новой реплике",
+        "items": {"type": "object", "additionalProperties": False, "properties": {
+            "phrase_ru": {"type": "string"},
+            "kind": {"type": "string", "enum": [
+                "food_excluded", "food_wanted", "nutrient", "diet_or_condition", "other"]},
+            "english": {"type": "string",
+                        "description": "английское слово или слово-категория из правил"},
+        }, "required": ["phrase_ru", "kind", "english"]},
+    },
+    "sex": {"type": ["string", "null"], "enum": ["female", "male", None]},
+    "age": _NULLABLE["integer"],
+    "height_cm": _NULLABLE["number"],
+    "weight_kg": _NULLABLE["number"],
+    "activity": {"type": ["string", "null"],
+                 "enum": ["sedentary", "light", "moderate", "high", "athlete", None]},
+    "goal": {"type": ["string", "null"], "enum": ["lose", "maintain", "gain", "recomp", None]},
+    "rate_kg_per_week": _NULLABLE["number"],
+    "days": _NULLABLE["integer"],
+    "exclude": {"type": "array", "items": {"type": "string"}},
+    "include": {"type": "array", "items": {"type": "string"}},
+    # Список пар, а не словарь: строгая схема не допускает произвольных ключей.
+    "include_ru": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"en": {"type": "string"}, "ru": {"type": "string"}},
+        "required": ["en", "ru"]}},
+}
+EXTRACT_PROFILE_SCHEMA = {
+    "name": "profile",
+    "strict": True,
+    "schema": {"type": "object", "additionalProperties": False,
+               "properties": _EXTRACT_FIELDS, "required": list(_EXTRACT_FIELDS)},
+}
+_FREE_JSON_LINE = "Верни ТОЛЬКО JSON с теми полями, которые ЯВНО названы (остальные не включай):"
+assert _FREE_JSON_LINE in EXTRACT_PROFILE_PROMPT
+# Тот же промпт: меняется одна строка о формате, правила те же.
+EXTRACT_PROFILE_PROMPT_SGR = EXTRACT_PROFILE_PROMPT.replace(
+    _FREE_JSON_LINE,
+    "Заполни поля. Чего ЯВНО нет в разговоре — null или пустой список. Смысл полей:",
+)
+
+
+def _from_structured(parsed: dict) -> dict:
+    """Ответ по схеме → прежний вид профиля; свободный JSON проходит как есть.
+
+    Разбор упоминаний отбрасывается (он остаётся в trace), пары include_ru
+    снова становятся словарём, а null и пустое — «не названо», как раньше
+    отсутствие поля: иначе пустой exclude затёр бы известные ограничения.
+    """
+    parsed = dict(parsed)
+    parsed.pop("mentions", None)
+    pairs = parsed.get("include_ru")
+    if isinstance(pairs, list):
+        parsed["include_ru"] = {
+            pair["en"]: pair["ru"] for pair in pairs
+            if isinstance(pair, dict) and pair.get("en") and pair.get("ru")
+        }
+    return {key: value for key, value in parsed.items() if value not in (None, [], {}, "")}
+
+
 REWRITE_PROMPT = """Преврати вопрос пользователя в короткий поисковый запрос
 НА АНГЛИЙСКОМ языке для базы научных абстрактов по нутрициологии.
 
@@ -1207,6 +1294,7 @@ class NutritionAgent:
         strict_grade: bool = True,
         answer_style: str = "full",
         speculate: bool = False,
+        structured_extract: bool = True,
     ) -> None:
         self.client = client
         # Опережение (см. _Speculation) включает сервис: там ждёт человек.
@@ -1214,6 +1302,10 @@ class NutritionAgent:
         # не держит, а невостребованный вызов на каждом вопросе стоил бы
         # денег без пользы.
         self.speculate = speculate
+        # Извлечение профиля по схеме с разбором упоминаний (SGR) —
+        # см. EXTRACT_PROFILE_SCHEMA. False — прежний свободный JSON: для
+        # провайдера без строгих схем и для замера «до/после».
+        self.structured_extract = structured_extract
         self.model = model
         self.retriever = retriever
         self.catalog = catalog if catalog is not None else load_catalog()
@@ -1256,6 +1348,7 @@ class NutritionAgent:
         temperature: float = 0.0,
         json_mode: bool = False,
         on_text: Callable[[str], None] | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> str:
         """Один вызов модели с повторами при сетевых сбоях.
 
@@ -1272,7 +1365,9 @@ class NutritionAgent:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
         }
-        if json_mode:
+        if schema is not None:
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": schema}
+        elif json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
         last_error: Exception | None = None
@@ -1379,7 +1474,18 @@ class NutritionAgent:
                         on_text(text)
         return text, usage
 
-    def _call_in_background(self, prompt: str, json_mode: bool):
+    def _call_options(self, name: str) -> dict[str, Any]:
+        """Параметры вызова модели для шага — одни на сам шаг и на вызов наперёд.
+
+        Одно место, а не два: разойдись они — ответ наперёд был бы получен
+        в другом режиме и всё равно подставился бы (сверяется только промпт).
+        """
+        if name == "extract_profile":
+            return ({"schema": EXTRACT_PROFILE_SCHEMA} if self.structured_extract
+                    else {"json_mode": True})
+        return {}
+
+    def _call_in_background(self, prompt: str, options: dict[str, Any]):
         """Вызов модели в потоке пула. Возвращает (ответ, вызовы, ошибка).
 
         Вызовы для trace копятся в СВОЁМ списке: ContextVar в поток пула
@@ -1390,18 +1496,18 @@ class NutritionAgent:
         token = _LLM_CALLS.set([])
         try:
             try:
-                return self._complete(prompt, json_mode=json_mode), _LLM_CALLS.get(), None
+                return self._complete(prompt, **options), _LLM_CALLS.get(), None
             except Exception as error:
                 return None, _LLM_CALLS.get(), error
         finally:
             _LLM_CALLS.reset(token)
 
-    def _ask(self, state: AgentState, name: str, prompt: str, json_mode: bool = False) -> str:
+    def _ask(self, state: AgentState, name: str, prompt: str) -> str:
         """Ответ модели для узла: готовый из опережения или новый вызов."""
         speculation: _Speculation | None = state.get("speculative")
         ready = speculation.take(name, prompt) if speculation is not None else None
         if ready is None:
-            return self._complete(prompt, json_mode=json_mode)
+            return self._complete(prompt, **self._call_options(name))
         raw, calls = ready
         current = _LLM_CALLS.get()
         if current is not None:
@@ -1410,7 +1516,9 @@ class NutritionAgent:
 
     def _extract_prompt(self, state: AgentState) -> str:
         known = dict(state.get("profile") or {})
-        return EXTRACT_PROFILE_PROMPT.format(
+        template = (EXTRACT_PROFILE_PROMPT_SGR if self.structured_extract
+                    else EXTRACT_PROFILE_PROMPT)
+        return template.format(
             known=json.dumps(known, ensure_ascii=False) if known else "(ничего)",
             question=state["question"],
             history=self._format_history(state.get("history")),
@@ -1481,12 +1589,12 @@ class NutritionAgent:
         speculation = None
         if self.speculate:
             speculation = _Speculation()
-            for name, prompt, json_mode in (
-                ("extract_profile", self._extract_prompt(state), True),
-                ("rewrite", self._rewrite_prompt(state), False),
+            for name, prompt in (
+                ("extract_profile", self._extract_prompt(state)),
+                ("rewrite", self._rewrite_prompt(state)),
             ):
-                speculation.start(name, prompt, lambda p=prompt, j=json_mode:
-                                  self._call_in_background(p, j))
+                speculation.start(name, prompt, lambda p=prompt, o=self._call_options(name):
+                                  self._call_in_background(p, o))
 
         raw = self._complete(
             CLASSIFY_PROMPT.format(
@@ -1546,8 +1654,8 @@ class NutritionAgent:
         """Достать из разговора параметры человека и дополнить ими профиль."""
         known = dict(state.get("profile") or {})
 
-        raw = self._ask(state, "extract_profile", self._extract_prompt(state), json_mode=True)
-        extracted = parse_json_response(raw)
+        raw = self._ask(state, "extract_profile", self._extract_prompt(state))
+        extracted = _from_structured(parse_json_response(raw))
 
         # days — это параметр запроса, а не свойство человека, поэтому
         # в профиль он не кладётся: иначе Profile не прошёл бы валидацию.
@@ -2443,6 +2551,10 @@ def build_agent(
     answer_style: str = "full",
     # Вызовы модели наперёд — для сервиса (см. NutritionAgent.speculate).
     speculate: bool = False,
+    # Извлечение профиля по схеме (EXTRACT_PROFILE_SCHEMA). None — по модели:
+    # строгие схемы проверены у polza (gpt-4o-mini), у GigaChat — нет,
+    # и там остаётся прежний свободный JSON.
+    structured_extract: bool | None = None,
 ) -> NutritionAgent:
     """Собрать готового агента: БД → эмбеддер → ретривер → каталог → граф.
 
@@ -2478,4 +2590,6 @@ def build_agent(
         strict_grade=strict_grade,
         answer_style=answer_style,
         speculate=speculate,
+        structured_extract=(structured_extract if structured_extract is not None
+                            else not model.lower().startswith("gigachat")),
     )
