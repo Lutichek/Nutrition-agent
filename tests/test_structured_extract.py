@@ -114,3 +114,29 @@ def test_free_json_mode_keeps_old_prompt(catalog):
     assert seen[0]["response_format"] == {"type": "json_object"}
     assert "Верни ТОЛЬКО JSON" in seen[0]["messages"][0]["content"]
     assert EXTRACT_PROFILE_PROMPT.split("{known}")[0] in seen[0]["messages"][0]["content"]
+
+
+def test_new_exclusion_taken_from_mentions(catalog):
+    """«Ещё не ем грибы» после «Не ем свинину» — живая модель, 3/3:
+    разбор верный (mushroom, food_excluded), а в exclude модель переписала
+    только известное ["pork"]. Грибы молча оставались в каталоге."""
+    answer = {**SCHEMA_ANSWER, "include": [], "include_ru": [],
+              "mentions": [{"phrase_ru": "не ем грибы", "kind": "food_excluded",
+                            "english": "mushroom"}],
+              "exclude": ["pork"]}
+    agent = make_agent(catalog, answer)
+    agent._own_state.profile = {"exclude": ["pork"]}
+    agent.run("Ещё не ем грибы")
+
+    assert agent.profile["exclude"] == ["pork", "mushroom"]
+
+
+def test_exclusions_accumulate_across_turns(catalog):
+    """Свободный JSON на «Люблю курицу, но не ем грибы» после «Молочку не ем»
+    возвращал exclude ["mushroom"] (3/3), и замена списка снимала молочное."""
+    agent = make_agent(catalog, {"exclude": ["mushroom"], "include": ["chicken"]})
+    agent.structured_extract = False
+    agent._own_state.profile = {"exclude": ["lactose"]}
+    agent.run("Люблю курицу, но не ем грибы")
+
+    assert agent.profile["exclude"] == ["lactose", "mushroom"]

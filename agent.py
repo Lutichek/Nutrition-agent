@@ -505,6 +505,8 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
 #     трудные (11)                 33/33            32/33   (не нашёл пожелание)
 #     смешанный знак (9)           22/27            25/27
 #     утечек ограничений             5                2
+#     после уже названного (6)     13/18            15/18   (после правок ниже;
+#                                                             до них 12/18 и 12/18)
 #     время шага                 1.5-1.7 с        2.1-2.8 с
 #
 # Выигрыш — на смешанном знаке: «…а свинину и колбасу не ем» теряло колбасу
@@ -560,15 +562,36 @@ EXTRACT_PROFILE_PROMPT_SGR = EXTRACT_PROFILE_PROMPT.replace(
 )
 
 
+# Какие разобранные упоминания (mentions) — в какое поле профиля.
+_MENTION_FIELDS = {"food_excluded": "exclude", "allergy": "exclude", "food_wanted": "include"}
+
+
 def _from_structured(parsed: dict) -> dict:
     """Ответ по схеме → прежний вид профиля; свободный JSON проходит как есть.
 
-    Разбор упоминаний отбрасывается (он остаётся в trace), пары include_ru
-    снова становятся словарём, а null и пустое — «не названо», как раньше
-    отсутствие поля: иначе пустой exclude затёр бы известные ограничения.
+    Исключения и пожелания ДОПОЛНЯЮТСЯ из разобранных упоминаний.
+    Наблюдалось на живой модели, 3 прогона из 3: на «Ещё не ем грибы»
+    после «Не ем свинину» разбор верный — mushroom, food_excluded, — а в
+    поле exclude модель переписала только известное ["pork"], и грибы
+    молча оставались в каталоге. Разбор фактов верен, ошибается сборка
+    итога — значит, собирает код. Свободный JSON так не ошибался.
+
+    Пары include_ru снова становятся словарём, а null и пустое — «не
+    названо», как раньше отсутствие поля: иначе пустой exclude затёр бы
+    известные ограничения.
     """
     parsed = dict(parsed)
-    parsed.pop("mentions", None)
+    for mention in parsed.pop("mentions", None) or []:
+        if not isinstance(mention, dict):
+            continue
+        field = _MENTION_FIELDS.get(mention.get("kind"))
+        word = str(mention.get("english") or "").strip()
+        if field and word:
+            current = parsed.get(field)
+            current = [current] if isinstance(current, str) else list(current or [])
+            if word.lower() not in {str(t).lower() for t in current}:
+                current.append(word)
+            parsed[field] = current
     pairs = parsed.get("include_ru")
     if isinstance(pairs, list):
         parsed["include_ru"] = {
@@ -1721,10 +1744,22 @@ class NutritionAgent:
                 extracted["include_ru"] = {**known.get("include_ru", {}), **pairs}
 
         # Модель возвращает только явно названное, поэтому просто накладываем
-        # новое поверх старого.
+        # новое поверх старого. Кроме exclude: его — копить.
+        #
+        # Наблюдалось (experiments/extract_profile.py, набор multi): на
+        # «Люблю курицу, но не ем грибы» после «Молочку не ем» свободный JSON
+        # 3/3 возвращал exclude ["mushroom"] — и замена списка молча снимала
+        # молочное. Снять исключение репликой («теперь ем свинину») поэтому
+        # нельзя — только «удалить мои данные»; аллерген в тарелке дороже.
         for field, value in extracted.items():
-            if value not in (None, "", []):
-                known[field] = value
+            if value in (None, "", []):
+                continue
+            if field == "exclude":
+                value = [value] if isinstance(value, str) else list(value)
+                before = list(known.get("exclude") or [])
+                seen = {str(t).lower() for t in before}
+                value = before + [t for t in value if str(t).lower() not in seen]
+            known[field] = value
 
         missing = [field for field in REQUIRED_PROFILE_FIELDS if field not in known]
 

@@ -16,7 +16,8 @@
 * ``easy`` — случаи из CLAUDE.md, на которых модель уже ошибалась
   (категории, «кроме», целиакия, «больше белка», манка и пшено);
 * ``hard`` — разговорные формы, халяль, арахис, нутриенты в паре;
-* ``mixed`` — смешанный знак в одной фразе: «ем / не ем / люблю».
+* ``mixed`` — смешанный знак в одной фразе: «ем / не ем / люблю»;
+* ``multi`` — реплика после уже названного: старое обязано остаться.
 
 Режимы чередуются внутри прогона — дрейф провайдера ложится поровну.
 
@@ -114,7 +115,22 @@ MIXED = [
     ("Сладкое можно, но без шоколада; молочку ем; глютен нельзя", {},
      ["chocolate", "gluten"], [], False),
 ]
-SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED}
+# Реплика ПОСЛЕ уже названного: (что сказано раньше, профиль после него).
+# Ожидаемое — старое вместе с новым. Одиночные фразы этого не ловят:
+# схема с разбором на «Ещё не ем грибы» после «Не ем свинину» 3/3 теряла
+# грибы — разбор был верный, а в exclude модель переписывала только известное.
+_PORK = ("Не ем свинину", {"exclude": ["pork"]})
+MULTI = [
+    ("Ещё не ем грибы", {}, ["pork", "mushroom"], [], True, _PORK),
+    ("И аллергия на арахис", {}, ["pork", "peanut"], [], True, _PORK),
+    ("Хочу гречку", {}, ["pork"], [({"buckwheat"}, "греч")], False, _PORK),
+    ("Мне 30, мужчина, 180 см, 80 кг",
+     {"sex": "male", "age": 30, "height_cm": 180, "weight_kg": 80}, ["pork"], [], True, _PORK),
+    ("Ещё без сладкого", {}, ["pork", "sweets"], [], True, _PORK),
+    ("Люблю курицу, но не ем грибы", {}, ["lactose", "mushroom"],
+     [({"chicken"}, "куриц")], False, ("Молочку не ем", {"exclude": ["lactose"]})),
+]
+SETS = {"easy": EASY, "hard": HARD, "mixed": MIXED, "multi": MULTI}
 MODES = {"схема + разбор": True, "свободный JSON": False}
 
 
@@ -142,12 +158,18 @@ def problems(profile: dict, nums: dict, exclude: list, include: list, empty: boo
     return found
 
 
-def run_once(agent: NutritionAgent, phrase: str) -> tuple[dict, float, int | None, int | None]:
+def run_once(agent: NutritionAgent, phrase: str,
+             prior: tuple[str, dict] | None = None) -> tuple[dict, float, int | None, int | None]:
+    history, known = [], {}
+    if prior:
+        history = [{"role": "user", "content": prior[0]},
+                   {"role": "assistant", "content": "Учту."}]
+        known = dict(prior[1])
     calls_token = agent_module._LLM_CALLS.set([])
     started = time.perf_counter()
     try:
         profile = agent._node_extract_profile(
-            {"question": phrase, "history": [], "profile": {}})["profile"]
+            {"question": phrase, "history": history, "profile": known})["profile"]
         calls = agent_module._LLM_CALLS.get() or []
     finally:
         agent_module._LLM_CALLS.reset(calls_token)
@@ -170,10 +192,11 @@ def main() -> None:
         cases = SETS[set_name]
         stats = {mode: {"ok": 0, "n": 0, "sec": [], "in": [], "out": []} for mode in MODES}
         for repeat in range(args.repeats):
-            for phrase, nums, exclude, include, empty in cases:
+            for phrase, nums, exclude, include, empty, *prior in cases:
                 for mode, structured in MODES.items():
                     agent.structured_extract = structured
-                    profile, seconds, tokens_in, tokens_out = run_once(agent, phrase)
+                    profile, seconds, tokens_in, tokens_out = run_once(
+                        agent, phrase, prior[0] if prior else None)
                     found = problems(profile, nums, exclude, include, empty)
                     s = stats[mode]
                     s["n"] += 1
