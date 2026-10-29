@@ -177,7 +177,7 @@ class TestUnpricedIsNotFree:
 
         note = NutritionAgent._budget_note(self._plan_with_unpriced(catalog, targets), 1)
         assert "посчитать" in note or "не получилось" in note
-        assert "уложился" not in note
+        assert "уложился" not in note.lower()
 
 
 class TestPricesTheOptimiserExploited:
@@ -289,7 +289,7 @@ class TestBudgetNote:
     def test_says_it_fits(self, catalog, targets) -> None:
         plan = build_day(catalog, targets, seed=0, budget=900)
         note = NutritionAgent._budget_note(plan, 1)
-        assert "уложил" in note
+        assert "уложил" in note.lower()
         assert "900" in note
 
     def test_says_it_does_not_fit(self, catalog) -> None:

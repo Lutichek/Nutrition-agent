@@ -65,9 +65,14 @@ def flags_for(record: dict, catalog, names, leaves, agent) -> list[str]:
                     why = f" — в составе: {', '.join(hit[:2])}" if len(hit) else ""
                 flags.append(f"день {day}: «{names.get(fdc_id, fdc_id)}» сейчас не прошло бы "
                              f"фильтр (exclude={exclude}){why}")
+        # Замена блюда и пересчёт после съеденного — не сборка дня с нуля,
+        # повтор make_plan даст другое меню по построению. Старые записи
+        # поля swap/eaten не несут — там узнаём по началу ответа.
+        rebuilt = (trace.get("swap") or trace.get("eaten")
+                   or shown.startswith(("Заменил", "Учёл съеденное")))
         try:
-            again = replay_plan(agent, trace)
-            if again != plan_days:
+            again = None if rebuilt else replay_plan(agent, trace)
+            if not rebuilt and again != plan_days:
                 flags.append("повтор плана даёт другое меню: солвер или каталог изменились "
                              "после этой записи")
         except Exception as error:  # noqa: BLE001

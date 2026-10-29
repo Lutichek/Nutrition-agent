@@ -765,6 +765,10 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                 for c in chunks
             ] or None,
             "checks": final_state.get("checks"),
+            # План этой реплики — замена блюда или пересчёт после съеденного,
+            # а не обычная сборка дня: replay_plan его не повторит.
+            "swap": final_state.get("swap"),
+            "eaten": final_state.get("eaten_new") or None,
             "plan_days": [[item.fdc_id for item in day.items] for day in menu.days]
             if menu is not None else None,
             "nodes": (final_state.get("trace") or []) + (

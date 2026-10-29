@@ -711,7 +711,7 @@ class PlanNodes:
 
         if plan.within_budget:
             left = budget - plan.cost
-            text = f"В ваш бюджет уложился: {plan.cost:.0f} ₽ из {budget:.0f} ₽ в день"
+            text = f"Уложился в ваш бюджет: {plan.cost:.0f} ₽ из {budget:.0f} ₽ в день"
             if left >= budget * 0.1:
                 text += f" — остаётся ещё около {left:.0f} ₽"
             return text + "."
