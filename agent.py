@@ -67,11 +67,14 @@ import pandas as pd
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
+import food_search
 from data_preporation import load_corpus_index
 from foods import load_catalog
-from restrictions import expand, is_restriction_phrase, matches_terms
+from portions import eaten_grams
+from restrictions import expand, is_restriction_phrase, matches_terms, matches_words, to_pattern
 from shopping import build_shopping_list
 from solver import (
+    DAY_TEMPLATE,
     DayPlan,
     MealItem,
     Menu,
@@ -79,11 +82,13 @@ from solver import (
     _filter_catalog,
     check_plan,
     day_word,
+    eaten_item,
     mean_targets,
     menu_days,
     menu_targets,
     plan_cautions,
     preferred_ids,
+    rebuild_rest,
     swap_item,
 )
 from targets import (
@@ -313,6 +318,11 @@ class ConversationState(BaseModel):
     swap_rejected: list[int] = Field(default_factory=list)
     swap_index: int | None = None  # какой слот меняли последним — для «ещё раз»
 
+    # Съеденное не по плану за день (этап 2): копится между репликами дня
+    # и сбрасывается новым планом или новыми сутками.
+    eaten: list[dict] = Field(default_factory=list)
+    eaten_date: str | None = None
+
 
 # ────────────────────────────────────────────────────────────
 # Состояние графа
@@ -334,6 +344,7 @@ STAGE_LABELS = {
     "grade": "отбираю фрагменты",
     "refine": "ищу другими словами",
     "generate": "пишу ответ",
+    "match_eaten": "ищу съеденное в справочнике",
 }
 
 
@@ -361,6 +372,10 @@ class AgentState(TypedDict, total=False):
     swap_rejected: list[int]  # что уже заменяли в этом плане: не предлагать снова
     swap: dict             # {index, old} — эта реплика заменила одно блюдо
     swap_index: int        # слот последней замены — «замени ещё раз» меняет его же
+    eaten_new: list[dict]  # съеденное из этой реплики: {fdc_id, grams, meal}
+    eaten_before: list[dict]  # съеденное сегодня в ПРОШЛЫХ репликах (вход)
+    eaten_all: list[dict]  # всё съеденное за сегодня — только если был пересчёт (выход)
+    eaten_shown: list      # MealItem съеденного из этой реплики — для ответа
     days: int              # на сколько дней просили меню
     checks: dict[str, bool]
 
@@ -627,6 +642,8 @@ def _swap_index(question: str, plan: DayPlan) -> int | None:
     """
     text = question.lower()
     for index, item in enumerate(plan.items):
+        if item.slot.endswith("(съедено)"):
+            continue  # съеденное уже не заменить
         words = re.findall(r"[а-яё]{4,}", item.title.lower())[:2]
         if any(word[:5] in text for word in words):
             return index
@@ -653,6 +670,86 @@ def swap_note(old: MealItem, plan: DayPlan, before: DayPlan) -> str:
              f"{plan.targets['kcal']:.0f} — все проверки нормы пройдены. "
              "Если и это не подходит — скажите «замени ещё раз».")
     return text
+
+
+# ── «Съел не по плану — пересчитай день» (этап 2) ──────────────────────
+#
+# Модель здесь только СОПОСТАВЛЯЕТ: выписывает, что съедено, и выбирает
+# блюдо из найденных кодом кандидатов. Граммы не оценивает: не названы —
+# справочная порция × названное количество. Числа дня — солвер.
+_EATEN_RE = re.compile(
+    r"\bсъел|\bсъела|\bпоел|\bпоела|перекусил|\bвыпил|\bвыпила|не по плану"
+    r"|на (?:завтрак|обед|ужин) (?:был|была|были)", re.IGNORECASE)
+
+EATEN_PROMPT = """Человек рассказывает, что съел. Выпиши каждую съеденную позицию.
+
+Реплика: {question}
+
+Верни ТОЛЬКО JSON:
+{{"items": [{{"phrase_ru": "как сказал человек",
+  "query_en": "1-3 английских слова для поиска в справочнике USDA (pizza, cheese pancake)",
+  "grams": число граммов — ТОЛЬКО если человек его назвал, иначе null,
+  "count": сколько штук или порций — ТОЛЬКО если назвал, иначе null,
+  "unit": "piece"|"slice"|"bar"|"cup"|"small"|"medium"|"large"|null — какую
+    единицу НАЗВАЛ человек («кусок» → slice, «батончик» → bar, «стакан» → cup),
+  "meal": "breakfast"|"lunch"|"dinner"|"snack"|"unknown"}}]}}
+
+Правила:
+- НЕ оценивай граммы и калории сам: не названо — null.
+- Составное разбивай на продукты: «блины со сметаной» → блины и сметана,
+  «гречка с курицей» → гречка и курица. Готовое блюдо (пицца, борщ,
+  сэндвич, котлета) — одна позиция.
+- «Два куска», «три блина», «батончик» — это count (2, 3, 1), не grams.
+- meal — только если назван приём пищи (завтрак, обед, ужин, перекус);
+  иначе "unknown"."""
+
+EATEN_PICK_PROMPT = """Сопоставь съеденное с блюдами справочника. Для каждой позиции
+выбери номер самого похожего блюда из ЕЁ списка или 0, если подходящего нет.
+
+Выбирай то, что И ЕСТЬ названный продукт или блюдо. Если в варианте он лишь
+ингредиент («сметана» → «картофель со сметаной») или это его часть
+(«курица» → «куриная кожа»), это не подходит — ставь 0.
+
+{blocks}
+
+Верни ТОЛЬКО JSON: {{"choices": [номер для позиции 1, номер для позиции 2, ...]}}"""
+
+# Приём пищи → какие слоты DAY_TEMPLATE он закрывает. Обед и ужин — оба
+# слота (основное и гарнир): «на обед съел пиццу» — это весь обед.
+_MEAL_SLOTS = {"breakfast": [0], "lunch": [1, 2], "dinner": [3, 4], "snack": [5, 6]}
+
+CHECK_RU = {
+    "kcal_in_range": "калорийность дня вне нормы",
+    "protein_g_in_range": "белок вне нормы",
+    "fat_g_in_range": "жиры вне нормы",
+    "carb_g_in_range": "углеводы вне нормы",
+    "fiber_sufficient": "клетчатки мало",
+    "sodium_within_limit": "соли больше суточного предела",
+    "no_duplicates": "блюда повторяются",
+    "portions_sane": "порции вне разумных границ",
+}
+
+
+def eaten_note(new: list[MealItem], plan: DayPlan, checks: dict[str, bool]) -> str:
+    """Ответ на «съел не по плану» — шаблон кода, числа только из солвера."""
+    eaten = "; ".join(f"{it.title} — {it.grams:.0f} г, {it.kcal:.0f} ккал" for it in new)
+    # Сопоставление со справочником — работа модели, и она ошибается
+    # («сметана» → «картофель со сметаной» на живом прогоне). Поэтому
+    # человек видит, ЧТО учтено и сколько граммов, и может поправить.
+    text = (f"Учёл съеденное: {eaten}. Если я понял не так — напишите, что именно "
+            f"было и сколько, и пересчитаю.\n\nПересобрал остаток дня под оставшуюся "
+            f"норму: итого за день {plan.totals['kcal']:.0f} ккал из "
+            f"{plan.targets['kcal']:.0f}.")
+    failed = [CHECK_RU.get(name, name) for name, ok in checks.items() if not ok]
+    if failed:
+        text += (" Честно: из-за съеденного день целиком в норму не уложился — "
+                 + ", ".join(failed) + ". Остальные приёмы пищи я подобрал так, "
+                 "чтобы отклонение было как можно меньше.")
+    return text
+
+
+def _today_utc() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def _merge_allergies(question: str, known: list, named: Any, exclude: list,
@@ -1953,7 +2050,96 @@ class NutritionAgent:
         return update
 
     def _route_after_profile(self, state: AgentState) -> str:
-        return "ask_profile" if state.get("missing") else "make_plan"
+        if state.get("missing"):
+            return "ask_profile"
+        # «Съел не по плану» имеет смысл, только когда план уже был.
+        if state.get("last_plan") and _EATEN_RE.search(state["question"]):
+            return "match_eaten"
+        return "make_plan"
+
+    def _route_after_eaten(self, state: AgentState) -> str:
+        # Уточнение («на какой приём пищи?») уже написано — дальше не идём.
+        return END if state.get("answer") else "make_plan"
+
+    def _eaten_candidates(self, item: dict) -> list[dict]:
+        """До двенадцати блюд каталога для одной съеденной позиции — ищет КОД.
+
+        По смыслу (food_search), если есть векторы названий и эмбеддер:
+        на живых фразах это 10/16 верных против 7/16 у поиска по словам
+        и одно неверное блюдо против четырёх. Иначе — по словам.
+        """
+        catalog = self.catalog
+        embedder = getattr(self.retriever, "embedder", None)
+        if embedder is not None and food_search.available():
+            text = f"{item.get('phrase_ru', '')} | {item.get('query_en', '')}"
+            ids = food_search.nearest(text, embedder)
+            rows = catalog.set_index("fdc_id", drop=False)
+            return rows.loc[[i for i in ids if i in rows.index],
+                            ["fdc_id", "name", "name_ru", "portion_g"]].to_dict("records")
+        hits = pd.Series(False, index=catalog.index)
+        query = str(item.get("query_en") or "").strip()
+        if query and (pattern := to_pattern([query])):
+            hits |= matches_words(catalog["name"], pattern)
+        # Основа — 4 буквы: «куриц» из «курица» не находил «Куриная грудка».
+        stems = [w[:4] for w in re.findall(r"[а-яё]{4,}", str(item.get("phrase_ru", "")).lower())]
+        if stems and "name_ru" in catalog.columns:
+            names = catalog["name_ru"].fillna("").astype(str).str.lower()
+            hits |= names.map(lambda name: any(stem in name for stem in stems)).astype(bool)
+        found = catalog[hits]
+        # Выше — названия, которые НАЧИНАЮТСЯ со слова человека (по-русски,
+        # потом по-английски), затем короткие. Живой прогон: при сортировке
+        # только по длине на «курицу» восемь мест заняли кожа, лапки и хвост,
+        # а на «гречку с курицей» первым шёл «Soup, chicken».
+        first = query.split()[0].lower() if query else "\0"
+        ru_first = stems[0] if stems else "\0"
+        ru_names = (found["name_ru"].fillna("").astype(str).str.lower()
+                    if "name_ru" in found.columns else pd.Series("", index=found.index))
+        found = found.assign(
+            _ru=~ru_names.str.startswith(ru_first),
+            _en=~found["name"].str.lower().str.startswith(first),
+            _len=found["name"].str.len(),
+        ).sort_values(["_ru", "_en", "_len", "fdc_id"])
+        return found.head(12)[["fdc_id", "name", "name_ru", "portion_g"]].to_dict("records")
+
+    def _node_match_eaten(self, state: AgentState) -> AgentState:
+        """Сопоставить съеденное с каталогом. Модель выписывает и выбирает;
+        ищет кандидатов и считает граммы код."""
+        raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True)
+        items = [i for i in parse_json_response(raw).get("items") or [] if isinstance(i, dict)]
+        if not items:
+            return {"answer": "Не понял, что именно съедено. Напишите, например: "
+                              "«на обед съел пиццу, 300 г»."}
+        unknown = [str(i.get("phrase_ru") or "?") for i in items
+                   if i.get("meal") not in _MEAL_SLOTS]
+        if unknown:
+            return {"answer": (f"Уточните, на какой приём пищи было: {', '.join(unknown)} — "
+                               "завтрак, обед, ужин или перекус? Тогда пересчитаю остаток дня.")}
+
+        candidates = [self._eaten_candidates(item) for item in items]
+        blocks = "\n\n".join(
+            f"Позиция {n}: «{item.get('phrase_ru')}»\n" + "\n".join(
+                f"  {k}. {c['name']} ({c.get('name_ru') or ''})" for k, c in enumerate(found, 1))
+            for n, (item, found) in enumerate(zip(items, candidates, strict=True), 1))
+        picked = parse_json_response(self._complete(
+            EATEN_PICK_PROMPT.format(blocks=blocks), json_mode=True)).get("choices") or []
+
+        eaten, missing = [], []
+        for n, (item, found) in enumerate(zip(items, candidates, strict=True)):
+            choice = picked[n] if n < len(picked) else 0
+            if not isinstance(choice, int) or not 1 <= choice <= len(found):
+                missing.append(str(item.get("phrase_ru") or "?"))
+                continue
+            record = found[choice - 1]
+            # Граммы — по словам человека и таблице порций USDA (portions.py),
+            # не справочная порция каталога: та — «1 cup» или целая пицца.
+            grams = eaten_grams(int(record["fdc_id"]), item.get("grams"), item.get("count"),
+                                float(record["portion_g"]), unit=item.get("unit"))
+            eaten.append({"fdc_id": int(record["fdc_id"]), "grams": float(grams),
+                          "meal": item["meal"]})
+        if missing:
+            return {"answer": (f"Не нашёл в справочнике: {', '.join(missing)}. Назовите проще "
+                               "(например, «пицца с сыром») — и пересчитаю остаток дня.")}
+        return {"eaten_new": eaten}
 
     def _node_ask_profile(self, state: AgentState) -> AgentState:
         """Спросить недостающие параметры."""
@@ -2022,6 +2208,11 @@ class NutritionAgent:
         # 10%» там, где день сошёлся со своей целью с точностью 0.1%.
         shown_targets = per_day[0] if cycled else targets
 
+        if state.get("eaten_new"):
+            return {"profile": profile.model_dump(), "targets": targets,
+                    "plan_targets": shown_targets, "cycled": cycled, "days": days,
+                    **self._rebuild_after_eaten(state, profile, shown_targets)}
+
         swapped = self._try_swap(state, profile)
         if swapped is not None:
             return {"profile": profile.model_dump(), "targets": targets,
@@ -2065,6 +2256,37 @@ class NutritionAgent:
         else:
             result["menu"] = Menu(days=[first, *rest], targets=mean_targets(all_targets))
         return result
+
+    def _rebuild_after_eaten(self, state: AgentState, profile: Profile,
+                             targets: Targets) -> AgentState:
+        """Съеденное за день зафиксировать, остаток дня собрать под остаток нормы."""
+        everything = [*(state.get("eaten_before") or []), *state["eaten_new"]]
+        covered: set[int] = set()
+        slots: list[int] = []
+        for entry in everything:
+            options = _MEAL_SLOTS[entry["meal"]]
+            if entry["meal"] == "snack":
+                # Перекусов два слота: второй перекус — во второй.
+                options = [next((i for i in options if i not in covered), options[-1])]
+            covered.update(options)
+            slots.append(options[0])
+        items = [eaten_item(self.catalog, e["fdc_id"], e["grams"], DAY_TEMPLATE[slot][0])
+                 for e, slot in zip(everything, slots, strict=True)]
+        shown = items[len(everything) - len(state["eaten_new"]):]
+        try:
+            plan = rebuild_rest(
+                self.catalog, targets, items, covered, exclude=profile.exclude,
+                include=_with_russian_fallback(
+                    _resolve_preferences(profile), profile, self.catalog),
+                budget=profile.budget_rub_per_day, seed=self.seed)
+        except PlanNotFeasible as error:
+            # Съеденное всё равно запоминается: оно было, и для адаптивной
+            # нормы важно, сколько человек на самом деле съел.
+            return {"eaten_all": everything, "plan": None, "answer": (
+                f"Учёл съеденное. {error} На сегодня норма набрана — новых приёмов "
+                "пищи я не добавляю.")}
+        return {"plan": plan, "checks": check_plan(plan), "eaten_all": everything,
+                "eaten_shown": shown, "menu": Menu(days=[plan], targets=dict(plan.targets))}
 
     def _try_swap(self, state: AgentState, profile: Profile) -> AgentState | None:
         """«Замени творог на что-нибудь» — заменить ОДНО блюдо последнего плана.
@@ -2198,6 +2420,10 @@ class NutritionAgent:
         if swap:
             before = DayPlan(**state["last_plan"])
             text = swap_note(before.items[swap["index"]], plan, before)
+            chunks, query = [], None
+        elif state.get("eaten_shown"):
+            # Съеденное — тоже шаблоном: числа дня только из солвера.
+            text = eaten_note(state["eaten_shown"], plan, state.get("checks") or {})
             chunks, query = [], None
         else:
             text, chunks, query = self._explain_with_model(state, plan, targets, profile, days)
@@ -2565,6 +2791,7 @@ class NutritionAgent:
             "red_flag": self._node_red_flag,
 
             "extract_profile": self._node_extract_profile,
+            "match_eaten": self._node_match_eaten,
             "ask_profile": self._node_ask_profile,
             "make_plan": self._node_make_plan_in_graph,
             "explain_plan": self._node_explain_plan,
@@ -2595,7 +2822,13 @@ class NutritionAgent:
         builder.add_conditional_edges(
             "extract_profile",
             self._route_after_profile,
-            {"ask_profile": "ask_profile", "make_plan": "make_plan"},
+            {"ask_profile": "ask_profile", "make_plan": "make_plan",
+             "match_eaten": "match_eaten"},
+        )
+        builder.add_conditional_edges(
+            "match_eaten",
+            self._route_after_eaten,
+            {"make_plan": "make_plan", END: END},
         )
         builder.add_conditional_edges(
             "make_plan",
@@ -2660,6 +2893,9 @@ class NutritionAgent:
                 "last_plan": memory.last_plan if remember else None,
                 "swap_rejected": list(memory.swap_rejected) if remember else [],
                 "swap_index": memory.swap_index if remember else None,
+                # Вчерашнее съеденное к сегодняшнему дню отношения не имеет.
+                "eaten_before": (list(memory.eaten)
+                                 if remember and memory.eaten_date == _today_utc() else []),
             }
         )
 
@@ -2677,6 +2913,12 @@ class NutritionAgent:
                     [*memory.swap_rejected, swap["old"]] if swap else [])
                 memory.swap_index = swap["index"] if swap else None
                 memory.last_plan = shown.model_dump(mode="json")
+            # Съеденное: копится в пределах суток; новый день целиком
+            # (не замена и не пересчёт после съеденного) его сбрасывает.
+            if final_state.get("eaten_all") is not None:
+                memory.eaten, memory.eaten_date = final_state["eaten_all"], _today_utc()
+            elif shown is not None and not final_state.get("swap"):
+                memory.eaten, memory.eaten_date = [], None
             memory.history.append({"role": "user", "content": question})
             memory.history.append({"role": "assistant", "content": answer})
 

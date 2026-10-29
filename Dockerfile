@@ -54,6 +54,14 @@ RUN test -f data/processed/ingredients.parquet \
 # поднимется, а свинина во вложенных рецептурах пройдёт молча.
 RUN test -f data/processed/ingredient_leaves.parquet \
       || (echo "НЕТ ПОЛНОГО СОСТАВА: выполните python ingredients.py --rebuild-leaves" && exit 1)
+# Веса единиц USDA для «съел не по плану»: без них «два куска пиццы»
+# считались как две целых пиццы (portions.py).
+RUN test -f data/processed/unit_portions.parquet \
+      || (echo "НЕТ ВЕСОВ ПОРЦИЙ: выполните python portions.py --rebuild" && exit 1)
+# Поиск съеденного по смыслу. Без файла сервис работает — ищет по словам,
+# но заметно хуже (food_search.py), поэтому тоже обязателен.
+RUN test -f lance_db/catalog_names.npz \
+      || (echo "НЕТ ВЕКТОРОВ НАЗВАНИЙ: выполните python food_search.py --rebuild" && exit 1)
 
 # ── Права ─────────────────────────────────────────────────────
 # Сервис смотрит наружу портом, поэтому работает не от root. Вместе

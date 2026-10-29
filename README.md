@@ -218,6 +218,7 @@ cp .env.example .env        # и вписать POLZA_AI_API_KEY
 ```bash
 uv run python data_sources.py      # сырьё, ~30 МБ, бесплатно
 uv run python build_index.py       # векторный индекс
+uv run python food_search.py --rebuild  # векторы названий блюд (13 МБ, доли цента)
 uv run python check_setup.py       # проверка по слоям: что готово, чего нет
 uv run uvicorn api:app
 ```

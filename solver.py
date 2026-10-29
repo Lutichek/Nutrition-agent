@@ -1112,6 +1112,80 @@ def _nutrition_wins_over_budget(
 
 
 # ────────────────────────────────────────────────────────────
+# «Съел не по плану — пересчитай день»
+# ────────────────────────────────────────────────────────────
+
+# Ниже этого остатка калорий пересобирать нечего: оставшиеся приёмы пищи
+# пришлось бы собирать из крошечных порций или выходить за норму.
+# 150 ккал — это один лёгкий перекус; честнее сказать «на сегодня всё»,
+# чем натягивать три приёма пищи на остаток в 120 ккал.
+MIN_REST_KCAL = 150.0
+
+
+def eaten_item(catalog: pd.DataFrame, fdc_id: int, grams: float, slot: str) -> MealItem:
+    """Съеденное как позиция дня: числа — из каталога по граммам, не от модели."""
+    record = _records_by_id(catalog)[int(fdc_id)]
+    servings = grams / float(record["portion_g"])
+    return _make_item(f"{slot} (съедено)", record, servings)
+
+
+def rebuild_rest(
+    catalog: pd.DataFrame,
+    targets: Targets,
+    eaten: list[MealItem],
+    covered: set[int],
+    exclude: list[str] | None = None,
+    include: list[str] | None = None,
+    budget: float | None = None,
+    seed: int = 0,
+) -> DayPlan:
+    """День, где съеденное зафиксировано, а остальные слоты собраны под остаток.
+
+    ``covered`` — какие слоты DAY_TEMPLATE уже закрыты съеденным. Оставшиеся
+    собираются обычным ``build_day``: под остаток нормы, с долями слотов,
+    пересчитанными на этот остаток. Проверки — по всему дню: план обязан
+    быть честным про весь день, а не про его хвост.
+
+    Остатка меньше MIN_REST_KCAL — ``PlanNotFeasible`` с числами: натягивать
+    оставшиеся приёмы пищи на крохи или выходить за норму нельзя, человек
+    должен услышать это прямо.
+    """
+    full = targets.as_dict()
+    eaten_totals = _totals(eaten)
+    rest = [(slot, role, share) for i, (slot, role, share) in enumerate(DAY_TEMPLATE)
+            if i not in covered]
+
+    if rest:
+        residual = {k: max(0.0, v - eaten_totals.get(k, 0.0)) for k, v in full.items()}
+        if residual["kcal"] < MIN_REST_KCAL:
+            raise PlanNotFeasible(
+                f"Съедено уже {eaten_totals['kcal']:.0f} ккал из {full['kcal']:.0f}: "
+                f"на оставшиеся приёмы пищи остаётся {residual['kcal']:.0f} ккал — "
+                "собирать из этого ещё приёмы пищи значит выйти за норму.")
+        total_share = sum(share for *_, share in rest)
+        template = [(slot, role, share / total_share) for slot, role, share in rest]
+        rest_targets = targets.model_copy(update=residual)
+        rest_plan = build_day(catalog, rest_targets, exclude=exclude, seed=seed,
+                              template=template, include=include, budget=budget,
+                              avoid_ids={item.fdc_id for item in eaten})
+        rest_items = iter(rest_plan.items)
+    else:
+        rest_items = iter(())
+
+    # Позиции — в порядке дня: съеденное на месте своих слотов.
+    by_slot: dict[int, list[MealItem]] = {}
+    for item in eaten:
+        base = item.slot.removesuffix(" (съедено)")
+        index = next((i for i, (slot, *_) in enumerate(DAY_TEMPLATE)
+                      if slot == base and i in covered), min(covered, default=0))
+        by_slot.setdefault(index, []).append(item)
+    items: list[MealItem] = []
+    for i in range(len(DAY_TEMPLATE)):
+        items += by_slot.get(i, []) if i in covered else [next(rest_items)]
+    return _assemble(items, full, budget, template=None)
+
+
+# ────────────────────────────────────────────────────────────
 # Замена одного блюда (ревью R8)
 # ────────────────────────────────────────────────────────────
 
