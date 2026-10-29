@@ -55,6 +55,7 @@ from chat_log import ChatLog, turn_record
 from config import settings
 from export import menu_to_xlsx
 from foods import load_catalog
+from limits import BudgetExhausted, Limits, LLMBudget, RateLimiter, seconds_to_utc_midnight
 from providers import get_clients
 from shopping import ShoppingList, build_shopping_list
 from solver import DayPlan, Menu, PlanNotFeasible, build_day, build_menu, check_plan
@@ -108,6 +109,7 @@ def _open_session(request: Request, storage: Any) -> Session:
     session = Session(token="", public_id=uuid.uuid4().hex, state=ConversationState(),
                       is_new=True)
     session.token = storage.create_session(session.dump())
+    _hit_session(session.token)  # первая реплика новой сессии — тоже в счёт
     return session
 
 
@@ -268,6 +270,10 @@ async def lifespan(app: FastAPI):
         menu_ttl_days=settings.menu_ttl_days,
     )
     _state["chat_log"] = ChatLog.from_env()
+    _state["limits"] = Limits.from_settings(settings)
+    _state["limiter"] = RateLimiter()
+    # Потолок — у агента: списывается на каждый вызов модели (limits.py).
+    _state["agent"].budget = LLMBudget(_state["storage"], _state["limits"].llm_calls_per_day)
 
     chat_log = _state["chat_log"]
     logger.info(
@@ -305,6 +311,82 @@ def get_agent() -> NutritionAgent:
 
 def get_storage() -> Any:
     return _state["storage"]
+
+
+# ── Ограничения (ревью R1, limits.py) ──
+def _limits() -> Limits:
+    return _state.get("limits") or Limits.from_settings(settings)
+
+
+def _limiter() -> RateLimiter:
+    return _state.setdefault("limiter", RateLimiter())
+
+
+def _client_ip(http: Request) -> str:
+    # За обратным прокси адрес клиента даёт uvicorn --proxy-headers;
+    # без него здесь окажется адрес прокси, и лимит станет общим на всех.
+    return http.client.host if http.client else "unknown"
+
+
+def _too_many(seconds: float, text: str) -> HTTPException:
+    seconds = int(seconds + 0.999)
+    return HTTPException(status_code=429, detail=text.format(seconds=seconds),
+                         headers={"Retry-After": str(seconds)})
+
+
+def _hit(key: str, limit: int, window: float, text: str) -> None:
+    wait = _limiter().hit(key, limit, window)
+    if wait is not None:
+        raise _too_many(wait, text)
+
+
+def limit_chat(http: Request) -> None:
+    """Частота реплик: по адресу и по сессии.
+
+    По адресу — обязательно: скрипт без cookie каждый раз получает новую
+    сессию, и лимит по сессии его не держит.
+    """
+    limits, ip = _limits(), _client_ip(http)
+    text = "Слишком много сообщений подряд — подождите {seconds} с и попробуйте снова."
+    _hit(f"chat-ip-m:{ip}", limits.chat_per_minute_ip, 60, text)
+    _hit(f"chat-ip-h:{ip}", limits.chat_per_hour_ip, 3600, text)
+    token = http.cookies.get(SESSION_COOKIE) or http.headers.get(SESSION_HEADER)
+    if token:
+        _hit_session(token)
+
+
+def _hit_session(token: str) -> None:
+    """Засчитать реплику сессии. Зовётся и для НОВОЙ сессии после её
+    создания: без этого первая реплика (без cookie) в счёт не шла,
+    и лимит «2 в минуту» пропускал три."""
+    limits = _limits()
+    text = "Слишком много сообщений подряд — подождите {seconds} с и попробуйте снова."
+    _hit(f"chat-s-m:{token}", limits.chat_per_minute_session, 60, text)
+    _hit(f"chat-s-h:{token}", limits.chat_per_hour_session, 3600, text)
+
+
+def limit_calc(http: Request) -> None:
+    """Ручки без модели — мягко: они дешёвые, но не бесплатные."""
+    _hit(f"calc:{_client_ip(http)}", _limits().calc_per_minute_ip, 60,
+         "Слишком много запросов — подождите {seconds} с.")
+
+
+def limit_menu(http: Request) -> None:
+    """Меню на месяц — 15 с процессора: десяток параллельных кладут сервис."""
+    _hit(f"menu:{_client_ip(http)}", _limits().menu_per_minute_ip, 60,
+         "Меню собирается долго, поэтому их не больше нескольких в минуту — "
+         "подождите {seconds} с.")
+
+
+BUDGET_TEXT = (
+    "Сегодня сервис исчерпал дневной лимит ответов. Попробуйте завтра — "
+    "норму КБЖУ и рацион без разговора можно посчитать и сейчас."
+)
+
+
+def _budget_exhausted() -> HTTPException:
+    return HTTPException(status_code=429, detail=BUDGET_TEXT,
+                         headers={"Retry-After": str(seconds_to_utc_midnight())})
 
 
 def get_catalog():
@@ -355,7 +437,8 @@ def health(agent: NutritionAgent = Depends(get_agent)) -> HealthResponse:
 # ────────────────────────────────────────────────────────────
 
 
-@app.post("/targets", response_model=TargetsResponse, tags=["расчёт без LLM"])
+@app.post("/targets", response_model=TargetsResponse, tags=["расчёт без LLM"],
+          dependencies=[Depends(limit_calc)])
 def post_targets(profile: Profile) -> TargetsResponse:
     """Посчитать норму КБЖУ по профилю.
 
@@ -367,7 +450,8 @@ def post_targets(profile: Profile) -> TargetsResponse:
     return TargetsResponse(targets=targets, explanation=explain(profile, targets))
 
 
-@app.post("/plan", response_model=PlanResponse, tags=["расчёт без LLM"])
+@app.post("/plan", response_model=PlanResponse, tags=["расчёт без LLM"],
+          dependencies=[Depends(limit_calc)])
 def post_plan(request: PlanRequest, catalog=Depends(get_catalog)) -> PlanResponse:
     """Собрать рацион на день под норму профиля.
 
@@ -390,7 +474,8 @@ def post_plan(request: PlanRequest, catalog=Depends(get_catalog)) -> PlanRespons
     )
 
 
-@app.post("/menu", response_model=MenuResponse, tags=["расчёт без LLM"])
+@app.post("/menu", response_model=MenuResponse, tags=["расчёт без LLM"],
+          dependencies=[Depends(limit_menu)])
 def post_menu(request: MenuRequest, catalog=Depends(get_catalog)) -> MenuResponse:
     """Собрать меню на несколько дней.
 
@@ -426,7 +511,8 @@ def post_menu(request: MenuRequest, catalog=Depends(get_catalog)) -> MenuRespons
     )
 
 
-@app.get("/foods", response_model=list[FoodOut], tags=["расчёт без LLM"])
+@app.get("/foods", response_model=list[FoodOut], tags=["расчёт без LLM"],
+         dependencies=[Depends(limit_calc)])
 def get_foods(
     q: str = Query(min_length=2, description="Часть названия блюда"),
     role: str | None = Query(default=None, description="breakfast / main / side / snack / drink"),
@@ -454,7 +540,8 @@ def _reject_client_session_id(request: ChatRequest) -> None:
             f"ставит сервер (для клиентов без cookie — заголовок {SESSION_HEADER})."))
 
 
-@app.post("/chat", response_model=ChatResponse, tags=["разговор"])
+@app.post("/chat", response_model=ChatResponse, tags=["разговор"],
+          dependencies=[Depends(limit_chat)])
 def post_chat(
     http: Request,
     response: Response,
@@ -475,7 +562,7 @@ def post_chat(
     return _run_turn(request, session, agent, storage, chat_log)
 
 
-@app.post("/chat/stream", tags=["разговор"])
+@app.post("/chat/stream", tags=["разговор"], dependencies=[Depends(limit_chat)])
 def post_chat_stream(
     http: Request,
     request: ChatRequest = Body(...),
@@ -501,7 +588,20 @@ def post_chat_stream(
     появляется, как только модель начала писать.
     """
     _reject_client_session_id(request)
-    session = _open_session(http, storage)
+    # До потока, а не внутри: внутри отказ ушёл бы событием при статусе 200.
+    if agent.budget is not None and agent.budget.exhausted():
+        raise _budget_exhausted()
+    # Каждый ответ по частям — свой поток процесса. Без потолка на адрес
+    # десяток параллельных запросов держал бы десяток потоков с моделью.
+    stream_key = f"stream:{_client_ip(http)}"
+    if not _limiter().acquire(stream_key, _limits().streams_per_ip):
+        raise HTTPException(status_code=429, detail=(
+            "С вашего адреса уже идёт несколько ответов — дождитесь их."))
+    try:
+        session = _open_session(http, storage)
+    except Exception:
+        _limiter().release(stream_key)
+        raise
     events: queue.Queue[dict | None] = queue.Queue()
 
     def work() -> None:
@@ -515,6 +615,7 @@ def post_chat_stream(
             logger.exception("Сбой ответа по частям")
             events.put({"type": "error", "detail": "Внутренняя ошибка, попробуйте ещё раз"})
         finally:
+            _limiter().release(stream_key)
             events.put(None)
 
     # Ответ — в своём потоке, а не в генераторе: человек может закрыть
@@ -582,6 +683,11 @@ def _run_turn(
     def elapsed_ms() -> int:
         return int((time.perf_counter() - started) * 1000)
 
+    # Потолок исчерпан — отвечаем сразу, не начиная: иначе каждая реплика
+    # ещё успевала бы до отказа потратить пару вызовов наперёд.
+    if agent.budget is not None and agent.budget.exhausted():
+        raise _budget_exhausted()
+
     try:
         answer = agent.run(request.message, state=state, on_event=on_event)
     except Exception as error:
@@ -591,6 +697,10 @@ def _run_turn(
             session_id=session_id, turn=turn, message=request.message,
             elapsed_ms=elapsed_ms(), error=error,
         ))
+        if isinstance(error, BudgetExhausted):
+            # Потолок кончился посреди реплики — тот же отказ, что и до неё.
+            logger.warning("Суточный потолок вызовов модели исчерпан")
+            raise _budget_exhausted() from error
         if isinstance(error, RuntimeError):
             # Провайдер не ответил даже после ретраев — это внешний сбой, 502.
             logger.error("Провайдер недоступен: %s", error)
@@ -697,7 +807,7 @@ def _xlsx_response(menu: Menu, profile: dict[str, Any]) -> Response:
     )
 
 
-@app.get("/menu/{menu_id}.xlsx", tags=["разговор"])
+@app.get("/menu/{menu_id}.xlsx", tags=["разговор"], dependencies=[Depends(limit_calc)])
 def get_menu_xlsx(
     http: Request,
     menu_id: str = Path(description="Идентификатор меню из ответа /chat"),
@@ -723,7 +833,7 @@ def get_menu_xlsx(
     return _xlsx_response(Menu.model_validate_json(menu_json), profile)
 
 
-@app.post("/menu.xlsx", tags=["расчёт без LLM"])
+@app.post("/menu.xlsx", tags=["расчёт без LLM"], dependencies=[Depends(limit_menu)])
 def post_menu_xlsx(request: MenuRequest, catalog=Depends(get_catalog)) -> Response:
     """Собрать меню и сразу отдать книгой Excel, без обращения к модели."""
     try:

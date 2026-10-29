@@ -58,6 +58,24 @@ class Settings(BaseSettings):
     # по голому http://localhost браузер такую cookie не вернёт.
     session_cookie_secure: bool = Field(default=False, validation_alias="SESSION_COOKIE_SECURE")
 
+    # ── Ограничения (limits.py) ───────────────────────────────
+    # Реплика в чате — 4-7 платных вызовов модели. По сессии — чтобы один
+    # разговор не съел всё; по IP — потому что скрипт без cookie каждый раз
+    # получает НОВУЮ сессию, и держит его только лимит по адресу.
+    chat_per_minute_session: int = Field(default=6, validation_alias="CHAT_PER_MINUTE_SESSION")
+    chat_per_hour_session: int = Field(default=60, validation_alias="CHAT_PER_HOUR_SESSION")
+    chat_per_minute_ip: int = Field(default=20, validation_alias="CHAT_PER_MINUTE_IP")
+    chat_per_hour_ip: int = Field(default=200, validation_alias="CHAT_PER_HOUR_IP")
+    # Одновременных ответов по частям с одного адреса: каждый — поток процесса.
+    streams_per_ip: int = Field(default=3, validation_alias="STREAMS_PER_IP")
+    # Ручки без модели: /targets, /plan, /foods — дёшевы; /menu на месяц — 15 с
+    # процессора, поэтому у неё свой, строже.
+    calc_per_minute_ip: int = Field(default=60, validation_alias="CALC_PER_MINUTE_IP")
+    menu_per_minute_ip: int = Field(default=6, validation_alias="MENU_PER_MINUTE_IP")
+    # Потолок вызовов модели на ВЕСЬ сервис в сутки (UTC). ~5 вызовов на
+    # реплику — около 600 реплик; у gpt-4o-mini это порядка долларов в день.
+    llm_calls_per_day: int = Field(default=3000, validation_alias="LLM_CALLS_PER_DAY")
+
 
 @lru_cache
 def get_settings() -> Settings:

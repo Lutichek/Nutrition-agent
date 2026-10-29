@@ -1306,6 +1306,9 @@ class NutritionAgent:
         # см. EXTRACT_PROFILE_SCHEMA. False — прежний свободный JSON: для
         # провайдера без строгих схем и для замера «до/после».
         self.structured_extract = structured_extract
+        # Суточный потолок вызовов модели (limits.LLMBudget) — ставит сервис.
+        # В скриптах и прогонах метрик его нет: там тратит владелец сам.
+        self.budget: Any = None
         self.model = model
         self.retriever = retriever
         self.catalog = catalog if catalog is not None else load_catalog()
@@ -1375,6 +1378,11 @@ class NutritionAgent:
         started = time.perf_counter()
 
         for attempt in range(self.max_retries):
+            # Суточный потолок (limits.LLMBudget) — на КАЖДУЮ попытку, вне try:
+            # исчерпан — BudgetExhausted уходит наружу без повторов, как
+            # «кончились деньги». Повтор после сбоя тоже платный.
+            if self.budget is not None:
+                self.budget.charge()
             try:
                 if on_text is not None:
                     content, usage = self._stream(kwargs, on_text)
