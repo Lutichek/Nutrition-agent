@@ -20,8 +20,9 @@ from fastapi.testclient import TestClient
 import agent as agent_module
 import api
 from agent import NutritionAgent, for_reader_partial
-from api import SessionStore, app
+from api import app
 from chat_log import ChatLog
+from storage import MemoryStorage
 
 PROFILE = {
     "sex": "female", "age": 31, "height_cm": 168, "weight_kg": 74,
@@ -144,7 +145,7 @@ def client(catalog, fake_chunks, tmp_path):
     def make(script=QUESTION_SCRIPT, **kwargs):
         api._state.update(
             agent=make_agent(catalog, script, fake_chunks, **kwargs), catalog=catalog,
-            sessions=SessionStore(), menus=api.MenuStore(), chat_log=ChatLog(tmp_path),
+            storage=MemoryStorage(), chat_log=ChatLog(tmp_path),
         )
         return TestClient(app)
     yield make
@@ -183,8 +184,8 @@ class TestStreamEndpoint:
 
     def test_session_continues_and_journal_written(self, client, tmp_path):
         http = client()
-        first = sse(http.post("/chat/stream", json={"message": "Привет"}))[-1]["response"]
-        http.post("/chat/stream", json={"message": "Ещё", "session_id": first["session_id"]})
+        http.post("/chat/stream", json={"message": "Привет"})
+        http.post("/chat/stream", json={"message": "Ещё"})  # та же cookie
 
         records = [json.loads(line) for path in tmp_path.glob("chat-*.jsonl")
                    for line in path.read_text(encoding="utf-8").splitlines()]

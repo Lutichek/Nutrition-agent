@@ -32,13 +32,21 @@ services:
     # переживает пересоздание контейнера, остальная система остаётся
     # только на чтение. Файлы старше 30 дней сервис удаляет сам.
     # Забрать журналы: docker compose cp nutrition-agent:/app/logs ./logs
+    #
+    # Хранилище разговоров и меню (SQLite) — свой том: разговоры переживают
+    # рестарт и пересоздание контейнера. В нём профили с весом и диагнозами.
     volumes:
       - chat_logs:/app/logs
+      - agent_state:/app/state
     environment:
       CHAT_LOG_DIR: /app/logs
+      STATE_DB: /app/state/agent.sqlite3
+      # За обратным прокси с HTTPS включите — cookie сессии только по TLS:
+      # SESSION_COOKIE_SECURE: "true"
 
     security_opt:
       - no-new-privileges:true
 
 volumes:
   chat_logs:
+  agent_state:

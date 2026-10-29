@@ -18,8 +18,9 @@ from fastapi.testclient import TestClient
 import agent as agent_module
 import api
 from agent import NutritionAgent
-from api import SessionStore, app
+from api import app
 from chat_log import ChatLog, dialogues, main, replay_plan
+from storage import MemoryStorage
 
 FULL_PROFILE = {
     "sex": "female", "age": 31, "height_cm": 168, "weight_kg": 74,
@@ -41,8 +42,7 @@ def make_client(catalog, chunks, chat_log, llm=None):
         catalog=catalog,
     )
     api._state.update(
-        agent=agent, catalog=catalog, sessions=SessionStore(),
-        menus=api.MenuStore(), chat_log=chat_log,
+        agent=agent, catalog=catalog, storage=MemoryStorage(), chat_log=chat_log,
     )
     return TestClient(app, raise_server_exceptions=False)
 
@@ -92,8 +92,8 @@ class TestRecordContent:
 
     def test_turns_are_numbered_within_session(self, catalog, fake_chunks, tmp_path):
         client = make_client(catalog, fake_chunks, ChatLog(tmp_path))
-        first = client.post("/chat", json={"message": "Привет"}).json()
-        client.post("/chat", json={"message": "Ещё", "session_id": first["session_id"]})
+        client.post("/chat", json={"message": "Привет"})
+        client.post("/chat", json={"message": "Ещё"})  # та же cookie
 
         records = read_records(tmp_path)
         assert [r["turn"] for r in records] == [1, 2]

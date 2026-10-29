@@ -45,6 +45,19 @@ class Settings(BaseSettings):
     )
     gigachat_ssl_verify: bool = Field(default=False, validation_alias="GIGACHAT_SSL_VERIFY")
 
+    # ── Хранилище разговоров и меню (storage.py) ──────────────
+    # Путь к файлу SQLite или «memory». В контейнере — том /app/state:
+    # файловая система там только на чтение.
+    state_db: str = Field(default=str(PROJECT_ROOT / "state" / "agent.sqlite3"),
+                          validation_alias="STATE_DB")
+    # Сессия живёт столько дней с последней реплики — как журнал чата.
+    session_ttl_days: float = Field(default=30, validation_alias="SESSION_TTL_DAYS")
+    # Меню на скачивание — столько дней с момента сборки.
+    menu_ttl_days: float = Field(default=7, validation_alias="MENU_TTL_DAYS")
+    # Cookie сессии только по HTTPS. Включать за обратным прокси с TLS;
+    # по голому http://localhost браузер такую cookie не вернёт.
+    session_cookie_secure: bool = Field(default=False, validation_alias="SESSION_COOKIE_SECURE")
+
 
 @lru_cache
 def get_settings() -> Settings:

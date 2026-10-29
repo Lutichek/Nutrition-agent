@@ -315,7 +315,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let sessionId = null;
+// Разговор держит cookie httpOnly, которую ставит сервер: странице его
+// пропуск не виден и не нужен (кража через XSS исключена).
 
 const escape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const round = (n) => Math.round(n || 0);
@@ -678,7 +679,7 @@ async function send(text) {
     const response = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_id: sessionId }),
+      body: JSON.stringify({ message: text }),
     });
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
@@ -697,7 +698,6 @@ async function send(text) {
         node.scrollIntoView({ block: "end" });
       } else if (event.type === "done") {
         const data = event.response;
-        sessionId = data.session_id;
         // Итог заменяет показанное целиком: к объяснению плана код
         // дописывает стоимость и примечания, а сверху встаёт карточка.
         if (node) node.querySelector(".bubble").innerHTML = renderAnswer(data);
@@ -749,8 +749,8 @@ document.addEventListener("click", (event) => {
 });
 
 $("reset").addEventListener("click", async () => {
-  if (sessionId) await fetch(`/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
-  sessionId = null;
+  // Удаляет СВОЮ сессию по cookie: профиль, историю и собранные меню.
+  await fetch("/session", { method: "DELETE" }).catch(() => {});
   location.reload();
 });
 

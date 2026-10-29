@@ -20,7 +20,8 @@ from fastapi.testclient import TestClient
 
 import api
 from agent import NutritionAgent
-from api import SessionStore, app
+from api import SESSION_COOKIE, app
+from storage import MemoryStorage, SqliteStorage
 
 PROFILE = {
     "sex": "female", "age": 31, "height_cm": 168, "weight_kg": 74,
@@ -46,8 +47,7 @@ def client(catalog, fake_chunks):
 
     api._state["agent"] = agent
     api._state["catalog"] = catalog
-    api._state["sessions"] = SessionStore()
-    api._state["menus"] = api.MenuStore()
+    api._state["storage"] = MemoryStorage()
 
     yield TestClient(app)
 
@@ -149,7 +149,7 @@ class TestChatEndpoint:
     def test_returns_answer_and_sources(self, client):
         body = client.post("/chat", json={"message": "Сколько белка?"}).json()
         assert body["answer"]
-        assert body["session_id"]
+        assert "session_id" not in body, "пропуск — в cookie httpOnly, не в теле"
         assert len(body["sources"]) == 2
 
     def test_sources_carry_pmid(self, client):
@@ -167,26 +167,6 @@ class TestChatEndpoint:
         assert body["answer"] == "Белка нужно больше."
         assert len(body["sources"]) == 2
 
-    def test_session_is_reused(self, client):
-        first = client.post("/chat", json={"message": "Привет"}).json()
-        second = client.post(
-            "/chat", json={"message": "Ещё вопрос", "session_id": first["session_id"]}
-        ).json()
-        assert second["session_id"] == first["session_id"]
-
-    def test_sessions_are_isolated(self, client):
-        """Профиль одного пользователя не должен попасть другому."""
-        first = client.post("/chat", json={"message": "Привет"}).json()
-        second = client.post("/chat", json={"message": "Привет"}).json()
-        assert first["session_id"] != second["session_id"]
-
-    def test_unknown_session_does_not_crash(self, client):
-        """После перезапуска сервиса id у клиентов протухают — не 500."""
-        body = client.post(
-            "/chat", json={"message": "Привет", "session_id": "давно-протухший"}
-        ).json()
-        assert body["session_id"] == "давно-протухший"
-
     def test_empty_message_rejected(self, client):
         assert client.post("/chat", json={"message": ""}).status_code == 422
 
@@ -200,24 +180,106 @@ class TestChatEndpoint:
             max_retries=1,
         )
         api._state["catalog"] = catalog
-        api._state["sessions"] = SessionStore()
-        api._state["menus"] = api.MenuStore()
+        api._state["storage"] = MemoryStorage()
 
         response = TestClient(app).post("/chat", json={"message": "Привет"})
         assert response.status_code == 502
         api._state.clear()
 
 
-class TestSessionStore:
-    def test_delete_removes_session(self, client):
-        session_id = client.post("/chat", json={"message": "Привет"}).json()["session_id"]
-        assert client.delete(f"/sessions/{session_id}").status_code == 200
-        assert client.delete(f"/sessions/{session_id}").status_code == 404
+class TestSessions:
+    """Пропуск в разговор выдаёт сервер (ревью R2, R3).
 
-    def test_eviction_keeps_store_bounded(self):
-        """Иначе словарь сессий растёт до бесконечности."""
-        store = SessionStore(max_sessions=3)
-        ids = [store.get_or_create(None)[0] for _ in range(5)]
-        assert store.count() == 3
-        assert store.drop(ids[0]) is False   # самый старый вытеснен
-        assert store.drop(ids[-1]) is True   # самый свежий на месте
+    Раньше id присылал клиент, и неизвестный id становился id новой
+    сессии — его можно было навязать (тест прямо закреплял это:
+    «давно-протухший» принимался как есть). Разговоры жили в памяти
+    и пропадали при рестарте.
+    """
+
+    def _token(self, http: TestClient) -> str:
+        return http.cookies[SESSION_COOKIE]
+
+    def test_cookie_is_httponly_and_lax(self, client):
+        response = client.post("/chat", json={"message": "Привет"})
+        cookie = response.headers["set-cookie"].lower()
+        assert "httponly" in cookie and "samesite=lax" in cookie
+
+    def test_conversation_continues_by_cookie(self, client):
+        client.post("/chat", json={"message": "Привет"})
+        client.post("/chat", json={"message": "Ещё вопрос"})
+        storage = api._state["storage"]
+        assert storage.count_sessions() == 1
+        assert len(storage.load_session(self._token(client))["state"]["history"]) == 4
+
+    def test_sessions_are_isolated(self, client):
+        """Профиль одного пользователя не должен попасть другому."""
+        client.post("/chat", json={"message": "Привет"})
+        TestClient(app).post("/chat", json={"message": "Привет"})
+        assert api._state["storage"].count_sessions() == 2
+
+    def test_imposed_token_is_not_adopted(self, client):
+        """Неизвестный пропуск — новая сессия с НОВЫМ пропуском, не с этим."""
+        client.cookies.set(SESSION_COOKIE, "attacker-chosen-id")
+        response = client.post("/chat", json={"message": "Привет"})
+        assert response.status_code == 200
+        issued = response.cookies.get(SESSION_COOKIE)
+        assert issued and issued != "attacker-chosen-id"
+        assert api._state["storage"].load_session("attacker-chosen-id") is None
+
+    def test_body_session_id_rejected_loudly(self, client):
+        """Молча проигнорированное поле прежний клиент принял бы за рабочее."""
+        response = client.post("/chat", json={"message": "Привет", "session_id": "x"})
+        assert response.status_code == 400
+        assert "cookie" in response.json()["detail"]
+
+    def test_header_token_for_clients_without_cookies(self, client):
+        client.post("/chat", json={"message": "Привет"})
+        token = self._token(client)
+        TestClient(app).post("/chat", json={"message": "Ещё"},
+                             headers={api.SESSION_HEADER: token})
+        assert api._state["storage"].count_sessions() == 1
+
+    def _menu_for(self, http: TestClient, catalog) -> str:
+        """Меню во владении сессии этого клиента."""
+        from solver import build_menu
+        from targets import Profile, compute_targets
+
+        storage = api._state["storage"]
+        owner = storage.load_session(self._token(http))["public_id"]
+        menu = build_menu(catalog, compute_targets(Profile(**PROFILE)), days=1, seed=0)
+        return storage.put_menu(owner, menu.model_dump_json(), PROFILE)
+
+    def test_menu_only_for_its_owner(self, client, catalog):
+        """В книге — профиль с весом. Чужому отвечаем как несуществующему."""
+        client.post("/chat", json={"message": "Привет"})
+        menu_id = self._menu_for(client, catalog)
+
+        assert client.get(f"/menu/{menu_id}.xlsx").status_code == 200
+        stranger = TestClient(app)
+        stranger.post("/chat", json={"message": "Привет"})
+        assert stranger.get(f"/menu/{menu_id}.xlsx").status_code == 404
+        assert TestClient(app).get(f"/menu/{menu_id}.xlsx").status_code == 404
+
+    def test_delete_my_data(self, client, catalog):
+        client.post("/chat", json={"message": "Привет"})
+        menu_id = self._menu_for(client, catalog)
+
+        response = client.delete("/session")
+        assert response.status_code == 200 and response.json()["menus_deleted"] == 1
+        assert api._state["storage"].get_menu(menu_id) is None
+        assert client.delete("/session").status_code == 404
+
+    def test_no_delete_by_someone_elses_id(self, client):
+        """Старая ручка /sessions/{id} удаляла чужой разговор по id."""
+        assert client.delete("/sessions/любой-id").status_code in (404, 405)
+
+    def test_conversation_survives_restart(self, client, tmp_path):
+        path = tmp_path / "state.sqlite3"
+        api._state["storage"] = SqliteStorage(path)
+        client.post("/chat", json={"message": "Привет"})
+
+        api._state["storage"] = SqliteStorage(path)  # «рестарт»: новый процесс, тот же том
+        client.post("/chat", json={"message": "Ещё вопрос"})
+        storage = api._state["storage"]
+        assert storage.count_sessions() == 1
+        assert len(storage.load_session(self._token(client))["state"]["history"]) == 4

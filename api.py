@@ -32,11 +32,11 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path as FilePath
-from threading import Lock
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -52,11 +52,13 @@ from agent import (
     for_reader_partial,
 )
 from chat_log import ChatLog, turn_record
+from config import settings
 from export import menu_to_xlsx
 from foods import load_catalog
 from providers import get_clients
 from shopping import ShoppingList, build_shopping_list
 from solver import DayPlan, Menu, PlanNotFeasible, build_day, build_menu, check_plan
+from storage import open_storage
 from targets import CycledTargets, Profile, Targets, compute_targets, explain
 
 logging.basicConfig(
@@ -65,86 +67,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nutrition_agent.api")
 
-# Сколько разговоров держим в памяти. Хранилище намеренно простое: для
-# продакшена сюда встанет Redis с TTL, но для демонстрации и одного процесса
-# словаря достаточно, а лишняя зависимость только мешала бы запустить проект.
-MAX_SESSIONS = 1000
-
-# Меню тяжелее сессии, поэтому их держим меньше.
-MAX_MENUS = 200
-
-
 # ────────────────────────────────────────────────────────────
-# Хранилище сессий
+# Сессии
 # ────────────────────────────────────────────────────────────
+#
+# Пропуск в разговор выдаёт ТОЛЬКО сервер: 256 случайных бит в cookie
+# httpOnly (JavaScript страницы его не видит — кража через XSS исключена),
+# SameSite=Lax. Ревью (R2): раньше id присылал клиент, и неизвестный id
+# становился id новой сессии — его можно было навязать. Теперь неизвестный
+# или протухший пропуск — это новая сессия с НОВЫМ пропуском.
+#
+# Клиентам без браузера — тот же пропуск в заголовке X-Session-Token.
+# В журнал и к меню пишется не пропуск, а public_id: журнал не должен
+# хранить ключи от чужих разговоров.
+SESSION_COOKIE = "nutrition_session"
+SESSION_HEADER = "X-Session-Token"
 
 
-class SessionStore:
-    """Разговоры по идентификатору сессии.
+@dataclass
+class Session:
+    token: str
+    public_id: str
+    state: ConversationState
+    is_new: bool = False
+    consent: dict[str, Any] = field(default_factory=dict)
 
-    Под блокировкой, потому что FastAPI выполняет синхронные ручки
-    в пуле потоков — обращения к словарю идут из разных потоков.
-    """
-
-    def __init__(self, max_sessions: int = MAX_SESSIONS) -> None:
-        self._sessions: dict[str, ConversationState] = {}
-        self._lock = Lock()
-        self._max_sessions = max_sessions
-
-    def get_or_create(self, session_id: str | None) -> tuple[str, ConversationState]:
-        with self._lock:
-            if session_id and session_id in self._sessions:
-                return session_id, self._sessions[session_id]
-
-            # Клиент прислал неизвестный id — не падаем, а заводим новую сессию:
-            # после перезапуска сервиса у всех клиентов id «протухают».
-            new_id = session_id or str(uuid.uuid4())
-
-            if len(self._sessions) >= self._max_sessions:
-                # Простейшее вытеснение: словари в Python сохраняют порядок
-                # вставки, поэтому первый ключ — самый старый.
-                oldest = next(iter(self._sessions))
-                del self._sessions[oldest]
-                logger.info("Вытеснена старая сессия %s", oldest)
-
-            state = ConversationState()
-            self._sessions[new_id] = state
-            return new_id, state
-
-    def drop(self, session_id: str) -> bool:
-        with self._lock:
-            return self._sessions.pop(session_id, None) is not None
-
-    def count(self) -> int:
-        with self._lock:
-            return len(self._sessions)
+    def dump(self) -> dict[str, Any]:
+        return {"public_id": self.public_id, "state": self.state.model_dump(),
+                "consent": self.consent}
 
 
-class MenuStore:
-    """Меню, собранные в разговорах, — чтобы отдать их файлом.
+def _open_session(request: Request, storage: Any) -> Session:
+    """Сессия по пропуску из cookie или заголовка; нет такой — новая."""
+    token = request.cookies.get(SESSION_COOKIE) or request.headers.get(SESSION_HEADER)
+    data = storage.load_session(token) if token else None
+    if data is not None:
+        return Session(token=token, public_id=data["public_id"],
+                       state=ConversationState(**data["state"]),
+                       consent=data.get("consent") or {})
+    session = Session(token="", public_id=uuid.uuid4().hex, state=ConversationState(),
+                      is_new=True)
+    session.token = storage.create_session(session.dump())
+    return session
 
-    Хранится объект ``Menu``, а не готовый файл: собирать книгу Excel
-    для меню, которое никто не скачает, незачем. А пересобирать меню
-    заново на скачивании нельзя — это ещё 15 секунд подбора, и человек
-    получил бы не то меню, которое ему показали.
-    """
 
-    def __init__(self, max_menus: int = MAX_MENUS) -> None:
-        self._menus: dict[str, tuple[Menu, dict[str, Any]]] = {}
-        self._lock = Lock()
-        self._max_menus = max_menus
-
-    def put(self, menu: Menu, profile: dict[str, Any]) -> str:
-        menu_id = str(uuid.uuid4())
-        with self._lock:
-            if len(self._menus) >= self._max_menus:
-                del self._menus[next(iter(self._menus))]
-            self._menus[menu_id] = (menu, profile)
-        return menu_id
-
-    def get(self, menu_id: str) -> tuple[Menu, dict[str, Any]] | None:
-        with self._lock:
-            return self._menus.get(menu_id)
+def _set_session_cookie(response: Response, session: Session) -> None:
+    if session.is_new:
+        response.set_cookie(
+            SESSION_COOKIE, session.token,
+            max_age=int(settings.session_ttl_days * 24 * 3600),
+            httponly=True, samesite="lax", secure=settings.session_cookie_secure, path="/",
+        )
 
 
 # ────────────────────────────────────────────────────────────
@@ -154,8 +127,11 @@ class MenuStore:
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    # Только чтобы отклонить его ГРОМКО (400): молча игнорируемое поле
+    # прежние клиенты API приняли бы за работающее и теряли бы профиль
+    # на каждой реплике, не понимая почему.
     session_id: str | None = Field(
-        default=None, description="Идентификатор разговора. Не передан — начнётся новый."
+        default=None, description="Больше не принимается: разговор держит cookie сервера.",
     )
 
 
@@ -176,7 +152,8 @@ class SourceOut(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    # Пропуска в ответе нет: он в cookie httpOnly, и тело ответа, которое
+    # читает JavaScript страницы, не должно его раскрывать.
     answer: str
     sources: list[SourceOut] = Field(default_factory=list)
     profile: dict = Field(default_factory=dict)
@@ -284,8 +261,12 @@ async def lifespan(app: FastAPI):
     # пока classify решает маршрут (experiments/latency.py).
     _state["agent"] = build_agent(
         llm_client, model=model, embed_client=embed_client, speculate=True)
-    _state["sessions"] = SessionStore()
-    _state["menus"] = MenuStore()
+    # Сессии, меню и суточный счётчик — в постоянном хранилище: рестарт
+    # больше не стирает разговоры (storage.py). Недоступно — запуск падает.
+    _state["storage"] = open_storage(
+        settings.state_db, session_ttl_days=settings.session_ttl_days,
+        menu_ttl_days=settings.menu_ttl_days,
+    )
     _state["chat_log"] = ChatLog.from_env()
 
     chat_log = _state["chat_log"]
@@ -322,12 +303,8 @@ def get_agent() -> NutritionAgent:
     return agent
 
 
-def get_sessions() -> SessionStore:
-    return _state["sessions"]
-
-
-def get_menus() -> MenuStore:
-    return _state["menus"]
+def get_storage() -> Any:
+    return _state["storage"]
 
 
 def get_catalog():
@@ -369,7 +346,7 @@ def health(agent: NutritionAgent = Depends(get_agent)) -> HealthResponse:
         foods_in_catalog=len(agent.catalog),
         chunks_in_index=_index_size(agent),
         articles_in_corpus=len(agent.corpus_index),
-        active_sessions=get_sessions().count(),
+        active_sessions=get_storage().count_sessions(),
     )
 
 
@@ -470,30 +447,40 @@ def get_foods(
 # ────────────────────────────────────────────────────────────
 
 
+def _reject_client_session_id(request: ChatRequest) -> None:
+    if request.session_id is not None:
+        raise HTTPException(status_code=400, detail=(
+            "session_id больше не принимается: разговор держит cookie, которую "
+            f"ставит сервер (для клиентов без cookie — заголовок {SESSION_HEADER})."))
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["разговор"])
 def post_chat(
+    http: Request,
+    response: Response,
     request: ChatRequest = Body(...),
     agent: NutritionAgent = Depends(get_agent),
-    sessions: SessionStore = Depends(get_sessions),
-    menus: MenuStore = Depends(get_menus),
+    storage: Any = Depends(get_storage),
     chat_log: ChatLog = Depends(get_chat_log),
 ) -> ChatResponse:
     """Реплика в разговоре с агентом.
 
     Профиль накапливается между репликами: человек редко называет все
-    параметры сразу. Чтобы продолжить разговор, передавайте ``session_id``
-    из предыдущего ответа.
+    параметры сразу. Разговор держит cookie, которую ставит сервер на первой
+    реплике; клиенту без cookie — тот же пропуск в заголовке X-Session-Token.
     """
-    session_id, state = sessions.get_or_create(request.session_id)
-    return _run_turn(request, session_id, state, agent, menus, chat_log)
+    _reject_client_session_id(request)
+    session = _open_session(http, storage)
+    _set_session_cookie(response, session)
+    return _run_turn(request, session, agent, storage, chat_log)
 
 
 @app.post("/chat/stream", tags=["разговор"])
 def post_chat_stream(
+    http: Request,
     request: ChatRequest = Body(...),
     agent: NutritionAgent = Depends(get_agent),
-    sessions: SessionStore = Depends(get_sessions),
-    menus: MenuStore = Depends(get_menus),
+    storage: Any = Depends(get_storage),
     chat_log: ChatLog = Depends(get_chat_log),
 ) -> StreamingResponse:
     """То же, что ``/chat``, но ответ приходит по частям (Server-Sent Events).
@@ -513,12 +500,13 @@ def post_chat_stream(
     и всё это время человек смотрел на «думаю…». Первый текст теперь
     появляется, как только модель начала писать.
     """
-    session_id, state = sessions.get_or_create(request.session_id)
+    _reject_client_session_id(request)
+    session = _open_session(http, storage)
     events: queue.Queue[dict | None] = queue.Queue()
 
     def work() -> None:
         try:
-            response = _run_turn(request, session_id, state, agent, menus, chat_log,
+            response = _run_turn(request, session, agent, storage, chat_log,
                                  on_event=events.put)
             events.put({"type": "done", "response": response.model_dump(mode="json")})
         except HTTPException as error:
@@ -533,12 +521,14 @@ def post_chat_stream(
     # вкладку, генератор остановится, а реплика всё равно должна дойти
     # до конца и попасть в журнал и историю разговора.
     threading.Thread(target=work, daemon=True, name="chat-stream").start()
-    return StreamingResponse(
+    streaming = StreamingResponse(
         _sse(events), media_type="text/event-stream",
         # no-transform/X-Accel-Buffering: прокси (nginx) иначе копит поток
         # и отдаёт одним куском — стриминг молча перестаёт быть стримингом.
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
+    _set_session_cookie(streaming, session)
+    return streaming
 
 
 # Не чаще раза в 80 мс: модель шлёт куски по 1-3 токена, и перерисовка
@@ -576,14 +566,15 @@ def _sse(events: queue.Queue) -> Iterator[str]:
 
 def _run_turn(
     request: ChatRequest,
-    session_id: str,
-    state: ConversationState,
+    session: Session,
     agent: NutritionAgent,
-    menus: MenuStore,
+    storage: Any,
     chat_log: ChatLog,
     on_event: Callable[[dict], None] | None = None,
 ) -> ChatResponse:
     """Реплика целиком: ответ агента, журнал, меню на скачивание."""
+    state = session.state
+    session_id = session.public_id  # в журнал — не пропуск
     started = time.perf_counter()
     # Номер реплики в разговоре — до ответа: при сбое история не растёт.
     turn = len(state.history) // 2 + 1
@@ -608,6 +599,10 @@ def _run_turn(
             ) from error
         raise
 
+    # Сохранить сразу после ответа: агент дописал профиль и историю
+    # в state, но в постоянное хранилище сам ничего не пишет.
+    storage.save_session(session.token, session.dump())
+
     sources = _collect_sources(agent, answer)
     shown = for_reader(answer.answer)
     chat_log.write(turn_record(
@@ -618,11 +613,11 @@ def _run_turn(
 
     menu_url = None
     if answer.menu is not None:
-        menu_id = menus.put(answer.menu, state.profile)
+        menu_id = storage.put_menu(session.public_id, answer.menu.model_dump_json(),
+                                   state.profile)
         menu_url = f"/menu/{menu_id}.xlsx"
 
     return ChatResponse(
-        session_id=session_id,
         # Номера PMID вырезаются из текста: статьи человек видит в sources.
         answer=shown,
         sources=sources,
@@ -704,19 +699,28 @@ def _xlsx_response(menu: Menu, profile: dict[str, Any]) -> Response:
 
 @app.get("/menu/{menu_id}.xlsx", tags=["разговор"])
 def get_menu_xlsx(
+    http: Request,
     menu_id: str = Path(description="Идентификатор меню из ответа /chat"),
-    menus: MenuStore = Depends(get_menus),
+    storage: Any = Depends(get_storage),
 ) -> Response:
-    """Скачать меню, собранное в разговоре, книгой Excel."""
-    found = menus.get(menu_id)
-    if found is None:
-        # Меню живут в памяти и вытесняются — после перезапуска сервиса
-        # ссылка перестанет работать, и это нормальный, а не аварийный случай.
+    """Скачать меню, собранное в разговоре, книгой Excel — только своё.
+
+    Ссылка без пропуска своей сессии не работает: в книге — профиль
+    с весом и возрастом. Чужое меню отвечает тем же 404, что и
+    несуществующее, — не подсказывая, что такое меню есть.
+    """
+    token = http.cookies.get(SESSION_COOKIE) or http.headers.get(SESSION_HEADER)
+    owner = (storage.load_session(token) or {}).get("public_id") if token else None
+    found = storage.get_menu(menu_id)
+    if found is None or owner is None or found[0] != owner:
+        # Меню живут ограниченный срок (MENU_TTL_DAYS) — истёкшая ссылка
+        # это нормальный, а не аварийный случай.
         raise HTTPException(
             status_code=404,
             detail="Меню больше недоступно — попросите агента собрать его заново",
         )
-    return _xlsx_response(*found)
+    _, menu_json, profile = found
+    return _xlsx_response(Menu.model_validate_json(menu_json), profile)
 
 
 @app.post("/menu.xlsx", tags=["расчёт без LLM"])
@@ -736,15 +740,24 @@ def post_menu_xlsx(request: MenuRequest, catalog=Depends(get_catalog)) -> Respon
     return _xlsx_response(menu, request.profile.model_dump())
 
 
-@app.delete("/sessions/{session_id}", tags=["разговор"])
+@app.delete("/session", tags=["разговор"])
 def delete_session(
-    session_id: str = Path(description="Идентификатор разговора"),
-    sessions: SessionStore = Depends(get_sessions),
-) -> dict[str, str]:
-    """Забыть разговор: профиль и историю."""
-    if not sessions.drop(session_id):
-        raise HTTPException(status_code=404, detail="Такой сессии нет")
-    return {"status": "deleted", "session_id": session_id}
+    http: Request,
+    response: Response,
+    storage: Any = Depends(get_storage),
+) -> dict[str, Any]:
+    """Удалить мои данные: разговор, профиль и собранные меню.
+
+    Только СВОЮ сессию — по пропуску из cookie. Раньше была ручка
+    /sessions/{id}, и чужой разговор мог удалить любой, кто знает id.
+    """
+    token = http.cookies.get(SESSION_COOKIE) or http.headers.get(SESSION_HEADER)
+    data = storage.delete_session(token) if token else None
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    if data is None:
+        raise HTTPException(status_code=404, detail="Сессии нет — удалять нечего")
+    menus = storage.delete_menus(data["public_id"])
+    return {"status": "deleted", "menus_deleted": menus}
 
 
 # ────────────────────────────────────────────────────────────
