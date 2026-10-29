@@ -328,6 +328,32 @@ GLUTEN_FREE = r"\bgluten[-\s]*free\b"
 # вплоть до следовых количеств.
 TYPE_CATEGORIES = frozenset({"sweets", "flour", "fried"})
 
+# Названия диет и диагнозов. Попав в ПОЖЕЛАНИЯ, они всё равно значат
+# ограничение: «хочу халяль» не просит блюд со словом halal в названии.
+#
+# Наблюдалось: на «Только халяль» модель 9 прогонов из 9 клала "halal"
+# в include, и ни свинина, ни алкоголь не исключались — оборот «только X»
+# она читает как «хочу X». Продукты из ALIASES (fish, meat, egg, nut)
+# сюда не входят: «хочу рыбу» — законное пожелание.
+DIET_CATEGORIES = frozenset({"halal", "vegan", "vegetarian"})
+_RESTRICTION_PHRASE = re.compile(
+    r"free\b|^no\s|^without\s|allergy|intolerance|celiac|coeliac|\bdiet$"
+)
+
+
+def is_restriction_phrase(term: str) -> bool:
+    """Слово называет диету или диагноз, а не продукт.
+
+    >>> is_restriction_phrase("halal"), is_restriction_phrase("gluten-free")
+    (True, True)
+    >>> is_restriction_phrase("fish"), is_restriction_phrase("vegetarian lasagna")
+    (False, False)
+    """
+    word = term.strip().lower()
+    if word in DIET_CATEGORIES:
+        return True
+    return word in ALIASES and bool(_RESTRICTION_PHRASE.search(word))
+
 # Растительное «молоко», «масло», «сливки» — не молочное. При проверке
 # по составу слово «milk» находило «Nuts, coconut milk» в карри,
 # «butter» — «Peanut butter», «cream» — «Cream of wheat».

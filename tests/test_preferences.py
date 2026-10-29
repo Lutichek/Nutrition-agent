@@ -128,6 +128,52 @@ class TestNutrientsAreNotFoods:
         assert NutritionAgent._unmatched_note(stub, profile) == ""
 
 
+class TestDietInWishesIsARestriction:
+    """«Только халяль» — ограничение, даже если модель положила его в include.
+
+    Наблюдалось на живой модели: 9 прогонов из 9 (три варианта промпта
+    по три раза) "halal" уходило в include, exclude оставался пустым,
+    и свинина с алкоголем проходили в план. Пожелание "halal" при этом
+    ничего не находит — блюд с таким словом в справочнике нет.
+    """
+
+    def _agent(self, catalog, extracted: dict) -> NutritionAgent:
+        import json
+
+        from conftest import FakeLLMClient, FakeRetriever
+        return NutritionAgent(
+            client=FakeLLMClient(script={
+                "маршрутизатор": json.dumps({"intent": "plan", "red_flag": ""}),
+                "Извлеки параметры": json.dumps(extracted),
+                "Объясни человеку": "План готов.",
+            }),
+            model="fake", retriever=FakeRetriever([]), catalog=catalog,
+        )
+
+    def test_halal_moved_and_no_pork_in_plan(self, catalog: pd.DataFrame) -> None:
+        from restrictions import matches_terms
+
+        full = dict(sex="male", age=30, height_cm=180, weight_kg=80, activity="moderate",
+                    goal="maintain")
+        agent = self._agent(catalog, {**full, "include": ["halal"],
+                                      "include_ru": {"halal": "халяль"}})
+        answer = agent.run("Мне 30, мужчина, 180 см, 80 кг. Только халяль")
+
+        assert agent.profile["exclude"] == ["halal"]
+        assert not agent.profile.get("include")
+        assert "halal" not in agent.profile.get("include_ru", {})
+        names = pd.Series([item.name for item in answer.plan.items], dtype=object)
+        assert not matches_terms(names, ["pork", "alcohol"]).any(), list(names)
+
+    def test_food_wish_stays_a_wish(self, catalog: pd.DataFrame) -> None:
+        """Переносится диета, а не продукт: «хочу рыбу» — пожелание."""
+        agent = self._agent(catalog, {"include": ["fish", "gluten-free"], "exclude": "pork"})
+        agent.run("Хочу рыбу, без глютена, не ем свинину")
+
+        assert agent.profile["include"] == ["fish"]
+        assert agent.profile["exclude"] == ["pork", "gluten-free"], "строка не бьётся по буквам"
+
+
 class TestPreferencePenalty:
     """Штраф за нехватку любимых блюд."""
 

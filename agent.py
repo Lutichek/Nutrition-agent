@@ -69,7 +69,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from data_preporation import load_corpus_index
 from foods import load_catalog
-from restrictions import expand, matches_terms
+from restrictions import expand, is_restriction_phrase, matches_terms
 from shopping import build_shopping_list
 from solver import (
     DayPlan,
@@ -469,6 +469,9 @@ EXTRACT_PROFILE_PROMPT = """Извлеки параметры человека �
     яйца                           → "eggs"
     сахар, сладкие напитки         → "sugar"
     алкоголь                       → "alcohol"
+    халяль, только халяльное       → "halal"
+  Диета или диагноз, названные утвердительно («только халяль», «я веган»,
+  «у меня целиакия»), — это exclude, а не include.
   Отдельный продукт называй как есть: «не ем свинину» → ["pork"],
   «без грибов» → ["mushroom"].
   «Не ем свинину, сладости, мучное и аллергия на лактозу» →
@@ -1578,11 +1581,26 @@ class NutritionAgent:
         if budget:
             extracted["budget_rub_per_day"] = budget
 
+        # Диета, попавшая в пожелания, — это ограничение (is_restriction_phrase).
+        # Промпт об этом просит, но «Только халяль» модель 9 раз из 9 клала
+        # в include, и свинина с алкоголем оставались в каталоге. Перенос
+        # кодом — по той же причине, что разбор периода и бюджета: правило,
+        # которое модель нарушает, держится не промптом.
+        wanted = extracted.get("include")
+        diets = [t for t in wanted or [] if isinstance(t, str) and is_restriction_phrase(t)]
+        if diets:
+            extracted["include"] = [t for t in wanted if t not in diets]
+            excluded = extracted.get("exclude") or []
+            # Строку, а не список, модель тоже присылает — не разбить по буквам.
+            excluded = [excluded] if isinstance(excluded, str) else list(excluded)
+            extracted["exclude"] = [*excluded, *diets]
+
         # Русские пары пожеланий — вспомогательное поле, и ронять из-за него
         # весь расчёт нельзя: не словарь строк — просто отбрасываем.
         pairs = extracted.pop("include_ru", None)
         if isinstance(pairs, dict):
-            pairs = {str(k): v for k, v in pairs.items() if isinstance(v, str) and v.strip()}
+            pairs = {str(k): v for k, v in pairs.items()
+                     if isinstance(v, str) and v.strip() and k not in diets}
             if pairs:
                 extracted["include_ru"] = {**known.get("include_ru", {}), **pairs}
 
