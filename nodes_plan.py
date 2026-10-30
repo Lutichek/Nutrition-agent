@@ -121,6 +121,9 @@ _MENU_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="menu")
 # поставить «вид не назван — любой обычный» ПЕРВЫМ правилом, с примерами.
 GENERIC_FIRST = True
 
+_EATEN_VERB_RE = re.compile(r"^\s*(?:съел|съела|выпил|выпила|поел|поела|перекусил|перекусила)\s+",
+                            re.IGNORECASE)
+
 
 class PlanNodes:
     """Узлы ветки «рацион»."""
@@ -400,9 +403,13 @@ class PlanNodes:
     @staticmethod
     def _eaten_question(items: list[dict], need: list[int]) -> str | None:
         """Одно уточнение на всё, чего не хватает: приём пищи и количество напитков."""
-        unknown = [str(i.get("phrase_ru") or "?") for i in items
-                   if i.get("meal") not in _MEAL_SLOTS]
-        drinks = [str(items[n].get("phrase_ru") or "?") for n in need]
+        # Глагол из названия — прочь: живой прогон спрашивал «сколько выпили:
+        # выпил колу?», модель иногда кладёт его в phrase_ru.
+        def name(item: dict) -> str:
+            return _EATEN_VERB_RE.sub("", str(item.get("phrase_ru") or "")).strip() or "?"
+
+        unknown = [name(i) for i in items if i.get("meal") not in _MEAL_SLOTS]
+        drinks = [name(items[n]) for n in need]
         parts = []
         if unknown:
             parts.append(f"на какой приём пищи было: {', '.join(unknown)} — "

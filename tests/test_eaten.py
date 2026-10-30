@@ -351,6 +351,17 @@ class TestDrinkAmount:
         assert agent._own_state.last_plan == first.plan.model_dump(mode="json"), \
             "план не тронут, пока количество неизвестно"
 
+    def test_question_names_the_food_not_the_verb(self, catalog):
+        """Живой прогон: «сколько выпили: выпил колу?» — модель положила
+        глагол в phrase_ru."""
+        verbs = [{**PIZZA_UNKNOWN_MEAL, "phrase_ru": "съел 2 куска пиццы"},
+                 {**COLA_UNKNOWN_MEAL, "phrase_ru": "выпил колу"}]
+        agent = make_agent(catalog, verbs, [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        question = agent.run("съел 2 куска пиццы и выпил колу").answer
+        assert "было: 2 куска пиццы, колу" in question
+        assert "сколько выпили: колу?" in question
+
     @pytest.mark.parametrize(("reply", "ml"), [("330 мл", 330), ("стакан", 250),
                                                ("пол-литра", 500), ("выпил 2 стакана", 500)])
     def test_answer_finishes_the_recount(self, catalog, reply, ml):
