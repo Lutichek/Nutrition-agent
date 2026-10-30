@@ -30,6 +30,7 @@ from profile_rules import (
     _AGAIN_RE,
     _ALLERGY_RE,
     _EATEN_RE,
+    _MEAL_ORDER,
     _MEAL_SLOTS,
     _NUTRIENT_WORDS,
     _SWAP_RE,
@@ -58,6 +59,7 @@ from shopping import build_shopping_list
 from solver import (
     DAY_TEMPLATE,
     DayPlan,
+    MealItem,
     Menu,
     PlanNotFeasible,
     _filter_catalog,
@@ -489,12 +491,13 @@ class PlanNodes:
         items = [eaten_item(self.catalog, e["fdc_id"], e["grams"], DAY_TEMPLATE[slot][0])
                  for e, slot in zip(everything, slots, strict=True)]
         shown = items[len(everything) - len(state["eaten_new"]):]
+        kept = self._kept_before(state, profile, everything, covered)
         try:
             plan = rebuild_rest(
                 self.catalog, targets, items, covered, exclude=profile.exclude,
                 include=_with_russian_fallback(
                     _resolve_preferences(profile), profile, self.catalog),
-                budget=profile.budget_rub_per_day, seed=self.seed)
+                budget=profile.budget_rub_per_day, seed=self.seed, kept=kept)
         except PlanNotFeasible as error:
             # Съеденное всё равно запоминается: оно было, и для адаптивной
             # нормы важно, сколько человек на самом деле съел.
@@ -502,7 +505,38 @@ class PlanNodes:
                 f"Учёл съеденное. {error} На сегодня норма набрана — новых приёмов "
                 "пищи я не добавляю.")}
         return {"plan": plan, "checks": check_plan(plan), "eaten_all": everything,
-                "eaten_shown": shown, "menu": Menu(days=[plan], targets=dict(plan.targets))}
+                "eaten_shown": shown, "eaten_kept": list(kept.values()),
+                "menu": Menu(days=[plan], targets=dict(plan.targets))}
+
+    def _kept_before(self, state: AgentState, profile: Profile, everything: list[dict],
+                     covered: set[int]) -> dict[int, MealItem]:
+        """Блюда прежнего плана на приёмах пищи ДО съеденного — {слот: блюдо}.
+
+        Живой прогон: «на обед съел пиццу» пересобрал и завтрак — йогурт
+        сменился вафлей, хотя к обеду завтрак уже съеден. «До» — по
+        основным приёмам (завтрак → обед → ужин). Когда был перекус, не
+        знает никто, поэтому перекусы не оставляются и сами ничего не
+        оставляют. Блюдо, которое не проходит ограничений этой реплики,
+        тоже не оставляется: его соберут заново.
+        """
+        last = state.get("last_plan")
+        eaten_main = [_MEAL_ORDER.index(e["meal"]) for e in everything if e["meal"] in _MEAL_ORDER]
+        if not last or not eaten_main:
+            return {}
+        earlier = {i for meal in _MEAL_ORDER[:max(eaten_main)] for i in _MEAL_SLOTS[meal]}
+        earlier -= covered
+        if not earlier:
+            return {}
+        allowed = set(_filter_catalog(self.catalog, profile.exclude)["fdc_id"].astype(int))
+        kept: dict[int, MealItem] = {}
+        for item in DayPlan(**last).items:
+            if item.slot.endswith("(съедено)") or item.fdc_id not in allowed:
+                continue
+            index = next((i for i in sorted(earlier)
+                          if DAY_TEMPLATE[i][0] == item.slot and i not in kept), None)
+            if index is not None:
+                kept[index] = item
+        return kept
 
     def _try_swap(self, state: AgentState, profile: Profile) -> AgentState | None:
         """«Замени творог на что-нибудь» — заменить ОДНО блюдо последнего плана.
@@ -639,7 +673,8 @@ class PlanNodes:
             chunks, query = [], None
         elif state.get("eaten_shown"):
             # Съеденное — тоже шаблоном: числа дня только из солвера.
-            text = eaten_note(state["eaten_shown"], plan, state.get("checks") or {})
+            text = eaten_note(state["eaten_shown"], plan, state.get("checks") or {},
+                              state.get("eaten_kept") or [])
             chunks, query = [], None
         else:
             text, chunks, query = self._explain_with_model(state, plan, targets, profile, days)

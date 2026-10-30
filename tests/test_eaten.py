@@ -60,6 +60,26 @@ class TestSolver:
         b = rebuild_rest(catalog, targets, [pizza], {1, 2}, seed=4)
         assert [it.fdc_id for it in a.items] == [it.fdc_id for it in b.items]
 
+    def test_rest_counts_the_salt_already_eaten(self, catalog, targets):
+        """Остаток собирался под весь суточный предел натрия, как будто
+        съеденное соли не содержит: после 200 г блинов (~1000 мг натрия)
+        день проваливал проверку соли в 18 случаях из 18."""
+        pancakes = eaten_item(catalog, first_id(catalog, "Pancakes, plain"), 200, "Завтрак")
+        for seed in range(3):
+            plan = rebuild_rest(catalog, targets, [pancakes], {0}, seed=seed)
+            assert check_plan(plan)["sodium_within_limit"], f"seed {seed}"
+
+    def test_kept_meals_stay_as_they_were(self, catalog, targets):
+        """Завтрак, оставленный из прежнего плана, — тот же блюдом и граммами,
+        и его калории вычтены из остатка, а не собраны ещё раз."""
+        before = rebuild_rest(catalog, targets, [], set(), seed=1)
+        pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese"), 300, "Обед — основное")
+        plan = rebuild_rest(catalog, targets, [pizza], {1, 2}, seed=0,
+                            kept={0: before.items[0]})
+        assert plan.items[0] == before.items[0]
+        assert before.items[0].fdc_id not in [it.fdc_id for it in plan.items[2:]]
+        assert check_plan(plan)["kcal_in_range"]
+
     def test_too_little_left_is_said_with_numbers(self, catalog, targets):
         """Не натягивать ужин и перекусы на остаток в 50 ккал."""
         pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese"), 600, "Обед — основное")
@@ -125,10 +145,46 @@ class TestInConversation:
         agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
         assert "Не нашёл в справочнике" in agent.run("На обед съел пиццу").answer
 
-    def test_eaten_accumulates_within_the_day(self, catalog):
+    def test_meals_before_the_eaten_one_stay(self, catalog):
+        """Живой прогон: «на обед съел пиццу» пересобрал и завтрак — йогурт
+        сменился вафлей, хотя к обеду завтрак уже съеден. Приёмы пищи ДО
+        съеденного остаются как в плане, и ответ это называет."""
         agent = make_agent(catalog, [PIZZA], [1])
+        first = agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        answer = agent.run("На обед съел пиццу, 300 г")
+        assert answer.plan.items[0] == first.plan.items[0], "завтрак тот же"
+        assert "Завтрак — как в плане" in answer.answer
+
+    def test_after_dinner_lunch_stays_too(self, catalog):
+        agent = make_agent(catalog, [{**PIZZA, "meal": "dinner", "grams": 150}], [1])
+        first = agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        answer = agent.run("На ужин съел пиццу, 150 г")
+        assert answer.plan.items[:3] == first.plan.items[:3]
+        assert "Завтрак и обед — как в плане" in answer.answer
+
+    def test_snack_keeps_nothing(self, catalog):
+        """Когда был перекус — неизвестно: до него могло не быть и завтрака."""
+        agent = make_agent(catalog, [{**PIZZA, "meal": "snack", "grams": 100}], [1])
         agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
-        agent.run("На обед съел пиццу, 300 г")
+        answer = agent.run("Перекусил пиццей, 100 г")
+        assert "как в плане" not in answer.answer
+
+    def test_kept_dish_against_a_new_restriction_is_rebuilt(self, catalog):
+        """Оставить можно только то, что проходит ограничения этой реплики."""
+        agent = make_agent(catalog, [PIZZA], [1])
+        first = agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        breakfast = first.plan.items[0]
+        profile = PROFILE | {"exclude": [breakfast.name.split(",")[0].lower()]}
+        state = {"last_plan": first.plan.model_dump(mode="json")}
+        kept = agent._kept_before(state, Profile(**profile), [{"meal": "lunch"}], {1, 2})
+        assert 0 not in kept
+
+    def test_eaten_accumulates_within_the_day(self, catalog):
+        # 150 г, а не 300: с оставленным завтраком 300 г пиццы (1035 ккал)
+        # набирают почти всю норму, и честный ответ — «добавлять нечего».
+        agent = make_agent(catalog, [{**PIZZA, "grams": 150}], [1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("На обед съел пиццу, 150 г")
         agent.client.script["Человек рассказывает, что съел"] = json.dumps({"items": [
             {"phrase_ru": "банан", "query_en": "banana", "grams": 120, "count": None,
              "meal": "snack"}]})

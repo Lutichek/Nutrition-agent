@@ -499,7 +499,7 @@ def _totals(items: list[MealItem]) -> dict[str, float]:
     }
 
 
-def _is_feasible(totals: dict[str, float]) -> bool:
+def _is_feasible(totals: dict[str, float], sodium_limit: float = SODIUM_LIMIT_MG) -> bool:
     """Не нарушены ли жёсткие ограничения рациона.
 
     Натрий — единственная граница, которая в приёмке проверяется точно
@@ -507,8 +507,11 @@ def _is_feasible(totals: dict[str, float]) -> bool:
     оптимизатор охотно менял пару миллиграммов натрия на улучшение по белку
     и выдавал план на 2310 мг — нутрициологически неотличимый от 2295,
     но проверку не проходящий.
+
+    ``sodium_limit`` ниже обычного — у остатка дня после съеденного
+    (``rebuild_rest``): часть суточного предела уже израсходована.
     """
-    return totals.get("sodium_mg", 0.0) <= SODIUM_LIMIT_MG
+    return totals.get("sodium_mg", 0.0) <= sodium_limit
 
 
 def _slot_penalty(items: list[MealItem], template: list[tuple[str, str, float]],
@@ -657,7 +660,8 @@ def day_cost(items: list[MealItem], costs: dict[int, float] | None = None) -> fl
     return sum(costs[item.fdc_id] * item.grams for item in items)
 
 
-def _loss(totals: dict[str, float], targets: dict[str, float]) -> float:
+def _loss(totals: dict[str, float], targets: dict[str, float],
+          sodium_limit: float = SODIUM_LIMIT_MG) -> float:
     """Насколько план не попал в норму. Меньше — лучше, ноль — идеально.
 
     Считаем относительные отклонения, а не абсолютные: промах на 100 ккал
@@ -682,8 +686,8 @@ def _loss(totals: dict[str, float], targets: dict[str, float]) -> float:
     # Гигиена рациона: соль и добавленный сахар. Штраф за натрий намеренно
     # крупный — в FNDDS много ресторанной и консервированной еды, и без веса
     # солвер спокойно собирал день на 3500 мг натрия.
-    if totals.get("sodium_mg", 0.0) > SODIUM_LIMIT_MG:
-        loss += 3.0 * (totals["sodium_mg"] - SODIUM_LIMIT_MG) / SODIUM_LIMIT_MG
+    if totals.get("sodium_mg", 0.0) > sodium_limit:
+        loss += 3.0 * (totals["sodium_mg"] - sodium_limit) / SODIUM_LIMIT_MG
 
     sugar_kcal = totals.get("sugar_g", 0.0) * 4.0
     kcal = max(totals.get("kcal", 0.0), 1.0)
@@ -752,6 +756,7 @@ def _local_search(
     preferred: set[int] | None = None,
     budget: float | None = None,
     costs: dict[int, float] | None = None,
+    sodium_limit: float = SODIUM_LIMIT_MG,
 ) -> list[MealItem]:
     """Улучшать план по одной замене, пока невязка падает."""
     target_kcal = targets.get("kcal", 0.0)
@@ -760,11 +765,11 @@ def _local_search(
 
     best = list(items)
     best_totals = _totals(best)
-    best_loss = (_loss(best_totals, targets)
+    best_loss = (_loss(best_totals, targets, sodium_limit)
                  + _slot_penalty(best, template, target_kcal)
                  + _preference_penalty(best, preferred)
                  + _budget_penalty(best, budget, costs))
-    best_feasible = _is_feasible(best_totals)
+    best_feasible = _is_feasible(best_totals, sodium_limit)
 
     for _ in range(iterations):
         index = rng.randrange(len(best))
@@ -807,12 +812,12 @@ def _local_search(
                 trial[index] = item
                 trial_totals = _totals(trial)
                 trial_loss = (
-                    _loss(trial_totals, targets)
+                    _loss(trial_totals, targets, sodium_limit)
                     + _slot_penalty(trial, template, target_kcal)
                     + _preference_penalty(trial, preferred)
                     + _budget_penalty(trial, budget, costs)
                 )
-                trial_feasible = _is_feasible(trial_totals)
+                trial_feasible = _is_feasible(trial_totals, sodium_limit)
 
                 # Допустимое решение всегда лучше недопустимого, даже если
                 # у последнего невязка меньше. Внутри одной категории
@@ -856,6 +861,7 @@ def _build_day_once(
     include: list[str] | None = None,
     budget: float | None = None,
     avoid_ids: set[int] | None = None,
+    sodium_limit: float = SODIUM_LIMIT_MG,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -924,7 +930,7 @@ def _build_day_once(
     # 2. Локальный поиск.
     items = _local_search(items, template, candidates, target_values, rng,
                           iterations, tolerance=tolerance, preferred=preferred,
-                          budget=budget, costs=costs)
+                          budget=budget, costs=costs, sodium_limit=sodium_limit)
 
     totals = _totals(items)
     deviation = {
@@ -939,7 +945,7 @@ def _build_day_once(
         targets=target_values,
         deviation=deviation,
         budget=budget,
-        loss=round(_loss(totals, target_values)
+        loss=round(_loss(totals, target_values, sodium_limit)
                    + _slot_penalty(items, template, targets.kcal)
                    + _preference_penalty(items, preferred)
                    + _budget_penalty(items, budget, costs), 4),
@@ -957,6 +963,7 @@ def build_day(
     include: list[str] | None = None,
     budget: float | None = None,
     avoid_ids: set[int] | None = None,
+    sodium_limit: float = SODIUM_LIMIT_MG,
 ) -> DayPlan:
     """Собрать план на день под целевые КБЖУ.
 
@@ -976,11 +983,13 @@ def build_day(
         allow_exotic: разрешить дичь и субпродукты (по умолчанию нет).
         avoid_ids: блюда, которых в этот день быть не должно (окно
             разнообразия меню, см. ``build_menu``).
+        sodium_limit: предел натрия на ЭТИ слоты. Ниже суточного — у остатка
+            дня после съеденного (``rebuild_rest``).
     """
     args = (catalog, targets, exclude, iterations, allow_exotic, template,
-            include, budget, avoid_ids)
+            include, budget, avoid_ids, sodium_limit)
     plan = _build_day_seeded(*args, seed=seed)
-    if all(check_plan(plan).values()):
+    if all(_checks(plan, sodium_limit).values()):
         return plan
 
     # День не прошёл проверки — пересобрать с производными сидами и взять
@@ -994,11 +1003,19 @@ def build_day(
     best = plan
     for attempt in range(1, RETRY_SEEDS + 1):
         alternative = _build_day_seeded(*args, seed=_retry_seed(seed, attempt))
-        if _plan_rank(alternative, targets) < _plan_rank(best, targets):
+        if (_plan_rank(alternative, targets, sodium_limit)
+                < _plan_rank(best, targets, sodium_limit)):
             best = alternative
-        if all(check_plan(best).values()):
+        if all(_checks(best, sodium_limit).values()):
             break
     return best
+
+
+def _checks(plan: DayPlan, sodium_limit: float) -> dict[str, bool]:
+    """check_plan с пределом натрия этих слотов, а не всего дня."""
+    checks = check_plan(plan)
+    checks["sodium_within_limit"] = plan.totals.get("sodium_mg", 0.0) <= sodium_limit
+    return checks
 
 
 # Сколько раз пересобирать день, не прошедший проверки. Подобрано замером
@@ -1012,10 +1029,11 @@ def _retry_seed(seed: int, attempt: int) -> int:
     return seed * 1_009 + attempt * 7_919 + 100_003
 
 
-def _plan_rank(plan: DayPlan, targets: Targets) -> tuple[int, float]:
+def _plan_rank(plan: DayPlan, targets: Targets,
+               sodium_limit: float = SODIUM_LIMIT_MG) -> tuple[int, float]:
     """Чем меньше, тем лучше: сначала число непройденных проверок, потом
     отклонение по калориям."""
-    failed = sum(not passed for passed in check_plan(plan).values())
+    failed = sum(not passed for passed in _checks(plan, sodium_limit).values())
     return failed, abs(plan.totals["kcal"] - targets.kcal) / targets.kcal
 
 
@@ -1029,12 +1047,13 @@ def _build_day_seeded(
     include: list[str] | None,
     budget: float | None,
     avoid_ids: set[int] | None,
+    sodium_limit: float,
     seed: int,
 ) -> DayPlan:
     """Одна попытка build_day: строгий проход, при неудаче — ослабленный."""
     plan = _build_day_once(catalog, targets, exclude, seed, iterations,
                            allow_exotic, template, SLOT_TOLERANCE, include, budget,
-                           avoid_ids)
+                           avoid_ids, sodium_limit)
 
     if check_plan(plan)["kcal_in_range"]:
         # Через эту ветку тоже надо проверить бюджет против нормы: калории
@@ -1043,11 +1062,11 @@ def _build_day_seeded(
         # 92 г против 112 — и план уехал человеку).
         return _nutrition_wins_over_budget(plan, catalog, targets, exclude, seed,
                                            iterations, allow_exotic, template, include,
-                                           avoid_ids)
+                                           avoid_ids, sodium_limit)
 
     relaxed = _build_day_once(catalog, targets, exclude, seed, iterations,
                               allow_exotic, template, SLOT_TOLERANCE_RELAXED,
-                              include, budget, avoid_ids)
+                              include, budget, avoid_ids, sodium_limit)
 
     # Возвращаем ослабленный только если он и правда лучше: иначе человек
     # получил бы менее сбалансированный день без выигрыша по калориям.
@@ -1057,7 +1076,7 @@ def _build_day_seeded(
 
     return _nutrition_wins_over_budget(best, catalog, targets, exclude, seed,
                                        iterations, allow_exotic, template, include,
-                                       avoid_ids)
+                                       avoid_ids, sodium_limit)
 
 
 def _nutrition_wins_over_budget(
@@ -1071,6 +1090,7 @@ def _nutrition_wins_over_budget(
     template: list[tuple[str, str, float]] | None,
     include: list[str] | None,
     avoid_ids: set[int] | None = None,
+    sodium_limit: float = SODIUM_LIMIT_MG,
 ) -> DayPlan:
     """Если ради бюджета сломалась норма — вернуть план без бюджета.
 
@@ -1100,11 +1120,11 @@ def _nutrition_wins_over_budget(
     # Тот же день без денежного ограничения.
     unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
                                 allow_exotic, template, SLOT_TOLERANCE, include, None,
-                                avoid_ids)
+                                avoid_ids, sodium_limit)
     if not check_plan(unlimited)["kcal_in_range"]:
         unlimited = _build_day_once(catalog, targets, exclude, seed, iterations,
                                     allow_exotic, template, SLOT_TOLERANCE_RELAXED,
-                                    include, None, avoid_ids)
+                                    include, None, avoid_ids, sodium_limit)
 
     # Бюджет сохраняем в плане: он не выполнен, но назван — и агент
     # обязан сказать об этом, а не промолчать.
@@ -1138,10 +1158,14 @@ def rebuild_rest(
     include: list[str] | None = None,
     budget: float | None = None,
     seed: int = 0,
+    kept: dict[int, MealItem] | None = None,
 ) -> DayPlan:
     """День, где съеденное зафиксировано, а остальные слоты собраны под остаток.
 
-    ``covered`` — какие слоты DAY_TEMPLATE уже закрыты съеденным. Оставшиеся
+    ``covered`` — какие слоты DAY_TEMPLATE уже закрыты съеденным. ``kept`` —
+    блюда прежнего плана, которые остаются как были ({слот: блюдо}): приёмы
+    пищи ДО съеденного уже позади, и пересобирать завтрак, когда человек
+    рассказывает про обед, — менять то, что уже съедено. Оставшиеся слоты
     собираются обычным ``build_day``: под остаток нормы, с долями слотов,
     пересчитанными на этот остаток. Проверки — по всему дню: план обязан
     быть честным про весь день, а не про его хвост.
@@ -1150,24 +1174,31 @@ def rebuild_rest(
     оставшиеся приёмы пищи на крохи или выходить за норму нельзя, человек
     должен услышать это прямо.
     """
+    kept = {i: item for i, item in (kept or {}).items() if i not in covered}
+    fixed = [*eaten, *kept.values()]
     full = targets.as_dict()
-    eaten_totals = _totals(eaten)
+    fixed_totals = _totals(fixed)
     rest = [(slot, role, share) for i, (slot, role, share) in enumerate(DAY_TEMPLATE)
-            if i not in covered]
+            if i not in covered and i not in kept]
 
     if rest:
-        residual = {k: max(0.0, v - eaten_totals.get(k, 0.0)) for k, v in full.items()}
+        residual = {k: max(0.0, v - fixed_totals.get(k, 0.0)) for k, v in full.items()}
         if residual["kcal"] < MIN_REST_KCAL:
             raise PlanNotFeasible(
-                f"Съедено уже {eaten_totals['kcal']:.0f} ккал из {full['kcal']:.0f}: "
+                f"За день уже набрано {fixed_totals['kcal']:.0f} ккал из {full['kcal']:.0f}: "
                 f"на оставшиеся приёмы пищи остаётся {residual['kcal']:.0f} ккал — "
                 "собирать из этого ещё приёмы пищи значит выйти за норму.")
         total_share = sum(share for *_, share in rest)
         template = [(slot, role, share / total_share) for slot, role, share in rest]
         rest_targets = targets.model_copy(update=residual)
+        # Натрий съеденного тоже уже в дне. Без этого остаток собирался под
+        # весь суточный предел, и после 200 г блинов (1000 мг натрия) день
+        # проваливал проверку соли в 18 случаях из 18.
+        sodium_left = max(0.0, SODIUM_LIMIT_MG - fixed_totals.get("sodium_mg", 0.0))
         rest_plan = build_day(catalog, rest_targets, exclude=exclude, seed=seed,
                               template=template, include=include, budget=budget,
-                              avoid_ids={item.fdc_id for item in eaten})
+                              avoid_ids={item.fdc_id for item in fixed},
+                              sodium_limit=sodium_left)
         rest_items = iter(rest_plan.items)
     else:
         rest_items = iter(())
@@ -1181,7 +1212,10 @@ def rebuild_rest(
         by_slot.setdefault(index, []).append(item)
     items: list[MealItem] = []
     for i in range(len(DAY_TEMPLATE)):
-        items += by_slot.get(i, []) if i in covered else [next(rest_items)]
+        if i in covered:
+            items += by_slot.get(i, [])
+        else:
+            items.append(kept[i] if i in kept else next(rest_items))
     return _assemble(items, full, budget, template=None)
 
 

@@ -148,6 +148,8 @@ def _eaten_turn_filter(extracted: dict, question: str, about_eaten: bool | None 
 # Приём пищи → какие слоты DAY_TEMPLATE он закрывает. Обед и ужин — оба
 # слота (основное и гарнир): «на обед съел пиццу» — это весь обед.
 _MEAL_SLOTS = {"breakfast": [0], "lunch": [1, 2], "dinner": [3, 4], "snack": [5, 6]}
+# Порядок основных приёмов пищи за день. Перекуса тут нет: когда он был, неизвестно.
+_MEAL_ORDER = ("breakfast", "lunch", "dinner")
 
 
 # Ответ на «на какой приём пищи было?». Живой прогон: «на обед» после
@@ -184,14 +186,20 @@ CHECK_RU = {
 }
 
 
-def eaten_note(new: list[MealItem], plan: DayPlan, checks: dict[str, bool]) -> str:
+def eaten_note(new: list[MealItem], plan: DayPlan, checks: dict[str, bool],
+               kept: list[MealItem] = ()) -> str:
     """Ответ на «съел не по плану» — шаблон кода, числа только из солвера."""
     eaten = "; ".join(f"{it.title} — {it.grams:.0f} г, {it.kcal:.0f} ккал" for it in new)
     # Сопоставление со справочником — работа модели, и она ошибается
     # («сметана» → «картофель со сметаной» на живом прогоне). Поэтому
     # человек видит, ЧТО учтено и сколько граммов, и может поправить.
+    # Приёмы пищи до съеденного остались как в плане — сказать, какие:
+    # иначе непонятно, почему завтрак не сменился вместе с остальным.
+    meals = list(dict.fromkeys(it.slot.split(" — ")[0].lower() for it in kept))
+    before = (f"{' и '.join(meals).capitalize()} — как в плане: "
+              f"{'он уже позади' if len(meals) == 1 else 'они уже позади'}. " if meals else "")
     text = (f"Учёл съеденное: {eaten}. Если я понял не так — напишите, что именно "
-            f"было и сколько, и пересчитаю.\n\nПересобрал остаток дня под оставшуюся "
+            f"было и сколько, и пересчитаю.\n\n{before}Пересобрал остаток дня под оставшуюся "
             f"норму: итого за день {plan.totals['kcal']:.0f} ккал из "
             f"{plan.targets['kcal']:.0f}.")
     failed = [CHECK_RU.get(name, name) for name, ok in checks.items() if not ok]

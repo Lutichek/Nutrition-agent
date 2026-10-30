@@ -140,6 +140,7 @@ class AgentState(TypedDict, total=False):
     eaten_before: list[dict]  # съеденное сегодня в ПРОШЛЫХ репликах (вход)
     eaten_all: list[dict]  # всё съеденное за сегодня — только если был пересчёт (выход)
     eaten_shown: list      # MealItem съеденного из этой реплики — для ответа
+    eaten_kept: list       # MealItem прежнего плана, оставленные как были (приёмы до съеденного)
     eaten_pending: dict    # съеденное, ждущее ответа «какой приём пищи» (вход)
     eaten_pending_new: dict  # то же, если эта реплика задала уточнение (выход)
     weighins: dict         # дата → вес, кг (вход)
