@@ -759,7 +759,12 @@ class PlanNodes:
                               state.get("eaten_kept") or [])
             chunks, query = [], None
         else:
-            text, chunks, query = self._explain_with_model(state, plan, targets, profile, days)
+            # Норма ПОКАЗАННОГО дня, а не средняя за неделю: живой прогон —
+            # текст называл 2720 ккал, карточка рядом 2992 (тренировочный
+            # день). Замер experiments/explain_norm.py: со средней текст спорил
+            # с карточкой в 9 ответах из 24, с нормой дня — ни в одном.
+            shown = state.get("plan_targets") or targets
+            text, chunks, query = self._explain_with_model(state, plan, shown, profile, days)
 
         # Дни со второго собирались, пока модель писала объяснение.
         # Не собрались — ответ тот же, что раньше давал make_plan: объяснение

@@ -844,6 +844,29 @@ class TestQuestionInPlanBranchIsAnswered:
         assert "Сколько белка нужно при похудении?" in explain[0]
 
 
+class TestExplainSeesTheShownDayNorm:
+    """Живой прогон: текст назвал 2720 ккал — среднюю за неделю норму, а
+    карточка рядом показывала 2992 — тренировочный день, который в ней
+    собран. Расчёт в промпте объяснения — по норме ПОКАЗАННОГО дня."""
+
+    def test_training_day_norm_goes_to_the_model(self, catalog):
+        from targets import Profile, compute_targets
+        profile = {"sex": "male", "age": 35, "height_cm": 180, "weight_kg": 80,
+                   "activity": "moderate", "goal": "maintain"}
+        agent = make_agent(catalog, script={
+            "маршрутизатор": classify_as("plan"),
+            "Извлеки параметры": json.dumps(profile),
+            "Объясни человеку": "План готов.",
+        })
+        answer = agent.run("Составь план питания")
+        mean = compute_targets(Profile(**profile)).kcal
+        shown = answer.plan.targets["kcal"]
+        assert round(shown) != round(mean), "у тренирующегося дни разведены"
+        prompt = next(p for p in agent.client.calls if "Объясни человеку" in p)
+        assert f"Норма на день: {shown:.0f} ккал" in prompt
+        assert f"Норма на день: {mean:.0f} ккал" not in prompt
+
+
 class TestPersonalNormsInQuestionBranch:
     """Ветка вопросов знает расчёт нормы, если профиль собран.
 
