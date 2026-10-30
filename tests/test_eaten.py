@@ -80,6 +80,31 @@ class TestSolver:
         assert before.items[0].fdc_id not in [it.fdc_id for it in plan.items[2:]]
         assert check_plan(plan)["kcal_in_range"]
 
+    def test_rest_budget_counts_what_was_eaten(self, catalog):
+        """Живой прогон: остаток собран под все 400 ₽, хотя завтрак и
+        съеденное уже стоили 188, — день вышел в 653 ₽. Остатку достаётся
+        бюджет за вычетом съеденного; норма при этом важнее бюджета."""
+        profile = Profile(sex="male", age=35, height_cm=180, weight_kg=80,
+                          activity="moderate", goal="maintain", budget_rub_per_day=400)
+        day_targets = compute_targets(profile)
+        before = rebuild_rest(catalog, day_targets, [], set(), seed=4, budget=400)
+        pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese, stuffed crust"), 296,
+                           "Обед — основное")
+        plan = rebuild_rest(catalog, day_targets, [pizza], {1, 2}, seed=4, budget=400,
+                            kept={0: before.items[0]})
+        assert plan.within_budget, f"{plan.cost:.0f} ₽ из 400"
+        assert all(check_plan(plan).values())
+
+    def test_overspend_after_eaten_does_not_blame_restrictions(self, catalog, targets):
+        """Живой прогон: после «съел пиццу» агент советовал «убрать
+        ограничения» человеку, у которого их не было."""
+        pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese"), 300, "Обед — основное")
+        plan = rebuild_rest(catalog, targets, [pizza], {1, 2}, seed=0, budget=30)
+        assert plan.cost is not None and not plan.within_budget
+        note = NutritionAgent._budget_note(plan, 1, after_eaten=True)
+        assert "ограничения" not in note and "съеденное" in note
+        assert "убрать ограничения" in NutritionAgent._budget_note(plan, 1)
+
     def test_too_little_left_is_said_with_numbers(self, catalog, targets):
         """Не натягивать ужин и перекусы на остаток в 50 ккал."""
         pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese"), 600, "Обед — основное")
@@ -270,8 +295,117 @@ class TestInConversation:
         assert first["name"] == "Soup, NFS"
         assert agent._generic_first(found, {"query_en": "pizza"}) == found, "нет «Pizza, NFS»"
 
+    def test_new_food_is_not_an_answer(self):
+        """«Выпил стакан» — ответ на «сколько выпили?», «съел ещё торт» —
+        новая реплика о съеденном: в ней названо что-то кроме количества."""
+        from profile_rules import pending_answer
+        pending = {"items": [{"meal": "unknown"}], "need_amount": [0]}
+        assert pending_answer("выпил стакан", pending) == {"amounts": [{"ml": 250.0}]}
+        assert pending_answer("на обед, стакан", pending) == {
+            "meal": "lunch", "amounts": [{"ml": 250.0}]}
+        assert pending_answer("съел ещё торт", pending) is None
+        assert pending_answer("мне 35 лет", pending) is None, "не 35 мл"
+
     def test_without_a_plan_it_is_a_normal_turn(self, catalog):
         """«Съел» без показанного плана пересчитывать нечего."""
         agent = make_agent(catalog, [PIZZA], [1])
         agent.run("Мне 31, женщина, 168 см, 74 кг. На обед съел пиццу")
         assert not any("Человек рассказывает, что съел" in c for c in agent.client.calls)
+
+
+SMALL_PIZZA = {**PIZZA, "grams": 150}  # с завтраком 300 г пиццы — почти вся норма
+# Как отдаёт живая модель: «выпил колу» — count 1, unit "cup", хотя
+# количество не названо.
+COLA = {"phrase_ru": "колу", "query_en": "cola", "grams": None, "count": 1, "unit": "cup",
+        "meal": "lunch"}
+COLA_UNKNOWN_MEAL = {**COLA, "meal": "unknown"}
+PIZZA_UNKNOWN_MEAL = {**SMALL_PIZZA, "meal": "unknown"}
+
+
+class TestDrinkAmount:
+    """Живой прогон: «выпил колу» без количества — 512 г, «1 medium drink»
+    из таблицы порций USDA, почти 220 ккал наугад. У калорийного напитка
+    без количества агент спрашивает, сколько выпито, а ответ разбирает код."""
+
+    @staticmethod
+    def cola_grams(answer) -> float:
+        return next(it.grams for it in answer.plan.items
+                    if it.slot.endswith("(съедено)") and "cola" in it.name.lower())
+
+    def test_amount_is_asked_not_guessed(self, catalog):
+        agent = make_agent(catalog, [SMALL_PIZZA, COLA], [1, 1])
+        first = agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        answer = agent.run("На обед съел пиццу, 150 г, и выпил колу")
+        assert "сколько выпили: колу" in answer.answer
+        assert agent._own_state.last_plan == first.plan.model_dump(mode="json"), \
+            "план не тронут, пока количество неизвестно"
+
+    @pytest.mark.parametrize(("reply", "ml"), [("330 мл", 330), ("стакан", 250),
+                                               ("пол-литра", 500), ("выпил 2 стакана", 500)])
+    def test_answer_finishes_the_recount(self, catalog, reply, ml):
+        from portions import grams_per_ml
+        agent = make_agent(catalog, [SMALL_PIZZA, COLA], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("На обед съел пиццу, 150 г, и выпил колу")
+        answer = agent.run(reply)
+        assert answer.answer.startswith("Учёл съеденное")
+        cola = next(it for it in answer.plan.items if "cola" in it.name.lower())
+        assert cola.grams == pytest.approx(ml * grams_per_ml(cola.fdc_id))
+        assert sum("Человек рассказывает, что съел" in c for c in agent.client.calls) == 1
+        assert sum("Сопоставь съеденное" in c for c in agent.client.calls) == 1, \
+            "на ответ модель второй раз не зовут"
+
+    def test_grams_are_taken_as_they_are(self, catalog):
+        agent = make_agent(catalog, [SMALL_PIZZA, COLA], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("На обед съел пиццу, 150 г, и выпил колу")
+        assert self.cola_grams(agent.run("200 г")) == pytest.approx(200)
+
+    def test_meal_and_amount_in_one_question(self, catalog):
+        agent = make_agent(catalog, [PIZZA_UNKNOWN_MEAL, COLA_UNKNOWN_MEAL], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        question = agent.run("Съел пиццу, 150 г, и выпил колу").answer
+        assert "на какой приём пищи" in question and "сколько выпили" in question
+        answer = agent.run("на обед, банку")
+        assert answer.answer.startswith("Учёл съеденное")
+        assert all(it.slot.startswith("Обед") for it in answer.plan.items
+                   if it.slot.endswith("(съедено)"))
+
+    def test_half_an_answer_asks_for_the_rest(self, catalog):
+        agent = make_agent(catalog, [PIZZA_UNKNOWN_MEAL, COLA_UNKNOWN_MEAL], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("Съел пиццу, 150 г, и выпил колу")
+        again = agent.run("на обед").answer
+        assert "сколько выпили" in again and "на какой приём пищи" not in again
+        assert agent.run("330 мл").answer.startswith("Учёл съеденное")
+
+    def test_dont_remember_takes_the_usda_typical_amount(self, catalog):
+        from portions import unspecified_grams
+        agent = make_agent(catalog, [SMALL_PIZZA, COLA], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        agent.run("На обед съел пиццу, 150 г, и выпил колу")
+        answer = agent.run("не помню")
+        cola = next(it for it in answer.plan.items if "cola" in it.name.lower())
+        assert cola.grams == pytest.approx(unspecified_grams(cola.fdc_id, 0))
+        assert cola.grams < 512, "не «средний напиток» фастфуда"
+
+    @pytest.mark.parametrize(("phrase", "ml"), [("стакан колы", 250), ("банка колы", 330),
+                                                ("литр колы", 1000)])
+    def test_amount_said_with_the_drink_is_not_asked(self, catalog, phrase, ml):
+        """Количество — из слов человека: модель на «литр сока» отдавала
+        count 1000, unit cup, а «стакан колы» становился «средним
+        напитком» — 512 г (строки «cup» у газировки в таблице USDA нет)."""
+        from portions import grams_per_ml
+        said = {**COLA, "phrase_ru": phrase, "count": 1000 if "литр" in phrase else 1}
+        agent = make_agent(catalog, [SMALL_PIZZA, said], [1, 1])
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть")
+        answer = agent.run(f"На обед съел пиццу, 150 г, и выпил {phrase}")
+        assert answer.answer.startswith("Учёл съеденное")
+        assert self.cola_grams(answer) == pytest.approx(ml * grams_per_ml(2710541), rel=0.01)
+
+    def test_food_and_light_drinks_are_not_asked(self):
+        from portions import is_drink
+        assert is_drink("Soft drinks", 42)
+        assert not is_drink("Diet soft drinks", 1), "диетическая — 0 ккал"
+        assert not is_drink("Tea", 2) and not is_drink("Tap water", 0)
+        assert not is_drink("Pizza", 270), "у еды работает таблица порций USDA"

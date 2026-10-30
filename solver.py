@@ -1195,28 +1195,59 @@ def rebuild_rest(
         # весь суточный предел, и после 200 г блинов (1000 мг натрия) день
         # проваливал проверку соли в 18 случаях из 18.
         sodium_left = max(0.0, SODIUM_LIMIT_MG - fixed_totals.get("sodium_mg", 0.0))
-        rest_plan = build_day(catalog, rest_targets, exclude=exclude, seed=seed,
-                              template=template, include=include, budget=budget,
-                              avoid_ids={item.fdc_id for item in fixed},
-                              sodium_limit=sodium_left)
-        rest_items = iter(rest_plan.items)
-    else:
-        rest_items = iter(())
+        # С бюджетом то же: живой прогон — остаток собран под все 400 ₽,
+        # хотя завтрак и съеденное уже стоили 188, и день вышел в 653 ₽.
+        # Цены съеденного нет — бюджет остатка не угадываем, он прежний.
+        fixed_cost = day_cost(fixed) if budget else None
+        rest_budget = budget if fixed_cost is None else max(0.0, budget - fixed_cost)
 
-    # Позиции — в порядке дня: съеденное на месте своих слотов.
+        def build_rest(money: float | None) -> list[MealItem]:
+            return build_day(catalog, rest_targets, exclude=exclude, seed=seed,
+                             template=template, include=include, budget=money,
+                             avoid_ids={item.fdc_id for item in fixed},
+                             sodium_limit=sodium_left).items
+
+        rest_items = build_rest(rest_budget)
+        plan = _assemble(_in_day_order(eaten, kept, covered, rest_items), full, budget, None)
+        # Норма побеждает бюджет — по ВСЕМ проверкам дня. Под урезанный
+        # остаток бюджета солвер брал дешёвое солёное и жирное, а проверка
+        # _nutrition_wins_over_budget смотрит только калории и белок.
+        # Замер (30 дней: пицца на обед, бюджет 250-600 ₽):
+        #
+        #     остаток бюджета        в бюджете   все проверки
+        #     весь бюджет (было)       11/30        13/30
+        #     за вычетом съеденного    16/30        11/30
+        #     то же + норма важнее     14/30        14/30
+        if budget and not all(check_plan(plan).values()):
+            free = _assemble(_in_day_order(eaten, kept, covered, build_rest(None)),
+                             full, budget, None)
+            if _failed(free) < _failed(plan):
+                plan = free
+        return plan
+    return _assemble(_in_day_order(eaten, kept, covered, []), full, budget, None)
+
+
+def _failed(plan: DayPlan) -> int:
+    return sum(not passed for passed in check_plan(plan).values())
+
+
+def _in_day_order(eaten: list[MealItem], kept: dict[int, MealItem], covered: set[int],
+                  rest: list[MealItem]) -> list[MealItem]:
+    """Позиции в порядке дня: съеденное — на месте своих слотов."""
     by_slot: dict[int, list[MealItem]] = {}
     for item in eaten:
         base = item.slot.removesuffix(" (съедено)")
         index = next((i for i, (slot, *_) in enumerate(DAY_TEMPLATE)
                       if slot == base and i in covered), min(covered, default=0))
         by_slot.setdefault(index, []).append(item)
+    rest_items = iter(rest)
     items: list[MealItem] = []
     for i in range(len(DAY_TEMPLATE)):
         if i in covered:
             items += by_slot.get(i, [])
         else:
             items.append(kept[i] if i in kept else next(rest_items))
-    return _assemble(items, full, budget, template=None)
+    return items
 
 
 # ────────────────────────────────────────────────────────────

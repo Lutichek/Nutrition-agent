@@ -54,6 +54,62 @@ UNIT_ALIASES = {
 # Не единицы вовсе: «1 surface inch» — это квадратный дюйм пиццы.
 NOT_UNITS = ("surface inch", "cubic inch", UNSPECIFIED.lower())
 
+# ── Напитки: количество спрашивается, а не угадывается ────────────────
+#
+# Живой прогон: «выпил колу» без количества — 512 г, «1 medium drink» из
+# таблицы порций. Средний стакан фастфуда — не то, что человек имел
+# в виду, а ошибка в 200 ккал на сладком напитке — уже заметная часть дня.
+# Поэтому у калорийного напитка без количества агент СПРАШИВАЕТ, сколько
+# выпито. Напиток — по разделу справочника, а не по слову модели.
+DRINK_CATEGORIES = frozenset({
+    "Apple juice", "Citrus juice", "Other fruit juice", "Vegetable juice", "Fruit drinks",
+    "Soft drinks", "Diet soft drinks", "Sport and energy drinks",
+    "Diet sport and energy drinks", "Other diet drinks", "Coffee", "Tea",
+    "Bottled water", "Tap water", "Enhanced water", "Flavored or carbonated water",
+    "Flavored milk, lowfat", "Flavored milk, nonfat", "Flavored milk, reduced fat",
+    "Flavored milk, whole", "Milk, lowfat", "Milk, nonfat", "Milk, reduced fat",
+    "Milk, whole", "Plant-based milk", "Milk shakes and other dairy drinks",
+    "Smoothies and grain drinks", "Nutritional beverages",
+})
+# Ниже этого спрашивать незачем: вода, чёрный чай и кофе, диетическая
+# газировка — 0-4 ккал на 100 г, даже литр — меньше 40 ккал. Кола 42,
+# сок 45, молоко 43-69.
+DRINK_ASK_KCAL_100G = 10.0
+
+# Объём посуды, которую называют в ответ на «сколько выпили?». Стакан —
+# 250 мл, мера русских рецептов (USDA «cup» — 240 мл, почти то же);
+# банка газировки — 0,33 л, бутылка — 0,5 л: самые частые объёмы.
+VESSEL_ML = {"стакан": 250.0, "чашк": 250.0, "кружк": 300.0, "банк": 330.0,
+             "бутылк": 500.0}
+ML_PER_FL_OZ = 29.5735
+
+
+def is_drink(category: str | None, kcal_per_100g: float | None) -> bool:
+    """Напиток, количество которого стоит спросить."""
+    return (category in DRINK_CATEGORIES
+            and float(kcal_per_100g or 0.0) >= DRINK_ASK_KCAL_100G)
+
+
+def grams_per_ml(fdc_id: int) -> float:
+    """Плотность напитка по таблице USDA: граммы жидкой унции / 29.57 мл.
+
+    Кола — 31 г на унцию, 1.05 г/мл; без строки «fl oz» — как у воды.
+    «with ice» не берём: там часть объёма занимает лёд.
+    """
+    for description, weight in unit_portions().get(int(fdc_id), []):
+        lowered = description.lower()
+        if lowered.startswith("1 fl oz") and "with ice" not in lowered:
+            return weight / ML_PER_FL_OZ
+    return 1.0
+
+
+def unspecified_grams(fdc_id: int, catalog_portion_g: float) -> float:
+    """«Не помню сколько» — типичная порция USDA («Quantity not specified»)."""
+    for description, weight in unit_portions().get(int(fdc_id), []):
+        if description == UNSPECIFIED:
+            return weight
+    return catalog_portion_g
+
 
 def build(catalog_ids: set[int]) -> pd.DataFrame:
     """Строки таблицы порций для блюд каталога: fdc_id, описание, граммы."""

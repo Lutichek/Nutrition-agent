@@ -75,7 +75,7 @@ from llm_io import _LLM_CALLS, parse_json_response
 from nodes_plan import PlanNodes
 from nodes_question import QuestionNodes
 from profile_rules import _NUTRIENT_WORDS as _NUTRIENT_WORDS
-from profile_rules import _WEIGHT_RE, _today_utc, meal_from_answer
+from profile_rules import _WEIGHT_RE, _today_utc, pending_answer
 from profile_rules import REQUIRED_PROFILE_FIELDS as REQUIRED_PROFILE_FIELDS
 from profile_rules import _category_fix as _category_fix
 from profile_rules import _from_structured as _from_structured
@@ -620,9 +620,9 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
         вопросов из 80 в тестовом прогоне — просто потому, что в вопросе
         упоминалась болезнь. Это не осторожность, а бесполезность.
         """
-        # «На обед» в ответ на «на какой приём пищи было?» — по одной
+        # «На обед» или «стакан» в ответ на уточнение о съеденном — по одной
         # реплике модель не поймёт, что это про рацион. Решает код.
-        resumes_eaten = meal_from_answer(state["question"], state.get("eaten_pending"))
+        resumes_eaten = pending_answer(state["question"], state.get("eaten_pending"))
         if resumes_eaten and not state.get("red_flag"):
             return "extract_profile"
 

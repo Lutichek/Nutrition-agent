@@ -25,7 +25,7 @@ import food_search
 from adaptive import adapted_tdee
 from agent_state import AgentState
 from llm_io import parse_json_response
-from portions import eaten_grams
+from portions import eaten_grams, grams_per_ml, is_drink, unspecified_grams
 from profile_rules import (
     _AGAIN_RE,
     _ALLERGY_RE,
@@ -43,8 +43,9 @@ from profile_rules import (
     _swap_index,
     _with_russian_fallback,
     allergy_note,
+    drink_amount,
     eaten_note,
-    meal_from_answer,
+    pending_answer,
     swap_note,
 )
 from prompts import (
@@ -134,7 +135,7 @@ class PlanNodes:
         raw = self._ask(state, "extract_profile", self._extract_prompt(state))
         extracted = _eaten_turn_filter(
             _from_structured(parse_json_response(raw)), state["question"],
-            about_eaten=meal_from_answer(state["question"], state.get("eaten_pending")) is not None)
+            about_eaten=pending_answer(state["question"], state.get("eaten_pending")) is not None)
 
         # days — это параметр запроса, а не свойство человека, поэтому
         # в профиль он не кладётся: иначе Profile не прошёл бы валидацию.
@@ -232,11 +233,11 @@ class PlanNodes:
         if state.get("missing"):
             return "ask_profile"
         # «Съел не по плану» имеет смысл, только когда план уже был.
-        # «На обед» — ответ на уточнение о съеденном, а не просьба о плане.
+        # «На обед», «стакан» — ответ на уточнение о съеденном, а не просьба о плане.
         question = state["question"]
         if state.get("last_plan") and (
                 _EATEN_RE.search(question)
-                or meal_from_answer(question, state.get("eaten_pending"))):
+                or pending_answer(question, state.get("eaten_pending"))):
             return "match_eaten"
         return "make_plan"
 
@@ -305,50 +306,131 @@ class PlanNodes:
         """Сопоставить съеденное с каталогом. Модель выписывает и выбирает;
         ищет кандидатов и считает граммы код."""
         pending = state.get("eaten_pending")
-        meal = meal_from_answer(state["question"], pending)
-        if meal:
-            # Ответ на уточнение: позиции уже выписаны в прошлой реплике,
-            # модель второй раз не спрашиваем — подставляем приём пищи.
-            items = [{**i, "meal": i.get("meal") if i.get("meal") in _MEAL_SLOTS else meal}
-                     for i in pending["items"]]
+        reply = pending_answer(state["question"], pending)
+        if reply is not None:
+            # Ответ на уточнение: позиции выписаны и сопоставлены в прошлой
+            # реплике, модель второй раз не спрашиваем — дописываем ответ.
+            items = [dict(i) for i in pending["items"]]
+            picked = pending.get("picked")
+            need = list(pending.get("need_amount") or [])
+            if reply.get("meal"):
+                for item in items:
+                    if item.get("meal") not in _MEAL_SLOTS:
+                        item["meal"] = reply["meal"]
+            need = self._apply_amounts(items, need, reply)
         else:
             raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True)
             items = [i for i in parse_json_response(raw).get("items") or [] if isinstance(i, dict)]
+            picked, need = None, []
         if not items:
             return {"answer": "Не понял, что именно съедено. Напишите, например: "
                               "«на обед съел пиццу, 300 г»."}
-        unknown = [str(i.get("phrase_ru") or "?") for i in items
-                   if i.get("meal") not in _MEAL_SLOTS]
-        if unknown:
-            return {"answer": (f"Уточните, на какой приём пищи было: {', '.join(unknown)} — "
-                               "завтрак, обед, ужин или перекус? Тогда пересчитаю остаток дня."),
-                    "eaten_pending_new": {"items": items}}
 
+        if picked is None:
+            # Сопоставляем ДО уточнений: напиток ли это, знает только каталог,
+            # а на ответ «стакан» модель второй раз уже не зовётся.
+            picked, missing = self._pick_eaten(items)
+            if missing:
+                return {"answer": (f"Не нашёл в справочнике: {', '.join(missing)}. Назовите "
+                                   "проще (например, «пицца с сыром») — и пересчитаю остаток дня.")}
+            need = [n for n, (item, record) in enumerate(zip(items, picked, strict=True))
+                    if self._needs_amount(item, record)]
+
+        question = self._eaten_question(items, need)
+        if question:
+            return {"answer": question,
+                    "eaten_pending_new": {"items": items, "picked": picked, "need_amount": need}}
+        return {"eaten_new": [
+            {"fdc_id": record["fdc_id"], "grams": self._eaten_grams(item, record),
+             "meal": item["meal"]}
+            for item, record in zip(items, picked, strict=True)]}
+
+    def _pick_eaten(self, items: list[dict]) -> tuple[list[dict], list[str]]:
+        """Блюдо каталога для каждой позиции: кандидатов ищет код, выбирает модель."""
         candidates = [self._eaten_candidates(item) for item in items]
         blocks = "\n\n".join(
             f"Позиция {n}: «{item.get('phrase_ru')}»\n" + "\n".join(
                 f"  {k}. {c['name']} ({c.get('name_ru') or ''})" for k, c in enumerate(found, 1))
             for n, (item, found) in enumerate(zip(items, candidates, strict=True), 1))
-        picked = parse_json_response(self._complete(
+        choices = parse_json_response(self._complete(
             EATEN_PICK_PROMPT.format(blocks=blocks), json_mode=True)).get("choices") or []
-
-        eaten, missing = [], []
+        picked, missing = [], []
         for n, (item, found) in enumerate(zip(items, candidates, strict=True)):
-            choice = picked[n] if n < len(picked) else 0
+            choice = choices[n] if n < len(choices) else 0
             if not isinstance(choice, int) or not 1 <= choice <= len(found):
                 missing.append(str(item.get("phrase_ru") or "?"))
                 continue
             record = found[choice - 1]
-            # Граммы — по словам человека и таблице порций USDA (portions.py),
-            # не справочная порция каталога: та — «1 cup» или целая пицца.
-            grams = eaten_grams(int(record["fdc_id"]), item.get("grams"), item.get("count"),
-                                float(record["portion_g"]), unit=item.get("unit"))
-            eaten.append({"fdc_id": int(record["fdc_id"]), "grams": float(grams),
-                          "meal": item["meal"]})
-        if missing:
-            return {"answer": (f"Не нашёл в справочнике: {', '.join(missing)}. Назовите проще "
-                               "(например, «пицца с сыром») — и пересчитаю остаток дня.")}
-        return {"eaten_new": eaten}
+            # Только числа JSON: выбранное ждёт ответа в сохранённом состоянии.
+            picked.append({"fdc_id": int(record["fdc_id"]),
+                           "portion_g": float(record["portion_g"])})
+        return picked, missing
+
+    def _needs_amount(self, item: dict, record: dict) -> bool:
+        """Калорийный напиток, о количестве которого человек не сказал ни слова."""
+        return (self._is_drink(record) and drink_amount(item) is None
+                and not item.get("ml") and not item.get("unspecified"))
+
+    def _is_drink(self, record: dict) -> bool:
+        row = self.catalog.loc[self.catalog["fdc_id"] == record["fdc_id"]]
+        return not row.empty and is_drink(row.iloc[0].get("category"), row.iloc[0].get("kcal"))
+
+    @staticmethod
+    def _apply_amounts(items: list[dict], need: list[int], reply: dict) -> list[int]:
+        """Дописать названные количества; вернуть, у каких напитков их всё ещё нет.
+
+        Количеств столько же, сколько напитков, — по порядку; одно на
+        несколько — каждому («по стакану»); иначе не угадываем и спросим снова.
+        """
+        if not need:
+            return need
+        if reply.get("unspecified"):
+            for n in need:
+                items[n]["unspecified"] = True
+            return []
+        amounts = reply.get("amounts") or []
+        if len(amounts) == 1:
+            amounts = amounts * len(need)
+        if len(amounts) != len(need):
+            return need
+        for n, amount in zip(need, amounts, strict=True):
+            items[n].update(amount)
+        return []
+
+    @staticmethod
+    def _eaten_question(items: list[dict], need: list[int]) -> str | None:
+        """Одно уточнение на всё, чего не хватает: приём пищи и количество напитков."""
+        unknown = [str(i.get("phrase_ru") or "?") for i in items
+                   if i.get("meal") not in _MEAL_SLOTS]
+        drinks = [str(items[n].get("phrase_ru") or "?") for n in need]
+        parts = []
+        if unknown:
+            parts.append(f"на какой приём пищи было: {', '.join(unknown)} — "
+                         "завтрак, обед, ужин или перекус?")
+        if drinks:
+            parts.append(f"сколько выпили: {', '.join(drinks)}? Подойдут миллилитры, "
+                         "стаканы или граммы — например, «330 мл» или «стакан».")
+        if not parts:
+            return None
+        return "Уточните, " + " И ".join(parts) + " Тогда пересчитаю остаток дня."
+
+    def _eaten_grams(self, item: dict, record: dict) -> float:
+        """Граммы съеденного — по словам человека и таблице порций USDA.
+
+        Не справочная порция каталога: та — «1 cup» или целая пицца.
+        Объём напитка — через его плотность из той же таблицы.
+        """
+        fdc_id, portion_g = int(record["fdc_id"]), float(record["portion_g"])
+        if item.get("unspecified"):
+            return unspecified_grams(fdc_id, portion_g)
+        if not item.get("ml") and not item.get("grams") and self._is_drink(record):
+            # Количество напитка — из слов человека (drink_amount): «стакан
+            # колы» без этого становился «средним напитком» — 512 г.
+            item = {**item, **(drink_amount(item) or {})}
+        if item.get("ml"):
+            return float(item["ml"]) * grams_per_ml(fdc_id)
+        return float(eaten_grams(fdc_id, item.get("grams"), item.get("count"), portion_g,
+                                 unit=item.get("unit")))
 
     def _node_ask_profile(self, state: AgentState) -> AgentState:
         """Спросить недостающие параметры."""
@@ -692,7 +774,7 @@ class PlanNodes:
 
         # Бюджет — раньше общей стоимости: человек спрашивал «уложился ли»,
         # а не «сколько вышло». Сумма идёт следом как обоснование.
-        budget = self._budget_note(plan, days)
+        budget = self._budget_note(plan, days, after_eaten=bool(state.get("eaten_shown")))
         if budget:
             text += "\n\n" + budget
 
@@ -723,7 +805,7 @@ class PlanNodes:
                 "menu": menu, "menu_rest": None}
 
     @staticmethod
-    def _budget_note(plan: DayPlan, days: int) -> str:
+    def _budget_note(plan: DayPlan, days: int, after_eaten: bool = False) -> str:
         """Уложились ли в названный бюджет — прямым текстом.
 
         Молчать нельзя. Человек назвал сумму, и если рацион в неё не влез,
@@ -757,10 +839,16 @@ class PlanNodes:
                 f"({over / budget:.0%}).")
 
         # Называем причину, а не только факт: при такой норме дешевле
-        # уже не собрать из того, что есть в справочнике.
-        text += (" Это минимум, который получился при вашей норме калорий "
-                 "и ограничениях. Снизить можно, если убрать ограничения "
-                 "или пересмотреть цель по весу.")
+        # уже не собрать из того, что есть в справочнике. После «съел» причина
+        # другая: живой прогон советовал «убрать ограничения» человеку,
+        # у которого их не было, — сумму подняло съеденное.
+        if after_eaten:
+            text += (" В сумме уже съеденное и приёмы пищи до него; остаток дня "
+                     "я собрал так, чтобы день уложился в норму, — она важнее бюджета.")
+        else:
+            text += (" Это минимум, который получился при вашей норме калорий "
+                     "и ограничениях. Снизить можно, если убрать ограничения "
+                     "или пересмотреть цель по весу.")
 
         if days > 1:
             text += f" За {days} {day_word(days)} выйдет около {plan.cost * days:.0f} ₽."

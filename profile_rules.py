@@ -17,6 +17,7 @@ from typing import Any
 
 import pandas as pd
 
+from portions import VESSEL_ML
 from prompts import ALLERGY_NOTE
 from restrictions import expand, matches_terms
 from solver import DayPlan, MealItem, preferred_ids
@@ -161,17 +162,137 @@ _MEAL_ANSWER = (("завтрак", "breakfast"), ("обед", "lunch"), ("ужи
                 ("перекус", "snack"), ("полдник", "snack"))
 
 
-def meal_from_answer(question: str, pending: dict | None) -> str | None:
-    """Приём пищи из ответа на уточнение — или None, если это не ответ.
+# Ответ на «сколько выпили?» — тоже код. Модель здесь не нужна: единиц
+# немного, а число из ответа модель могла бы и «поправить».
+_NUM = r"(\d+(?:[.,]\d+)?)"
+_ML_RE = re.compile(_NUM + r"\s*(?:мл\b|миллилитр)", re.IGNORECASE)
+_L_RE = re.compile(_NUM + r"\s*(?:л\b|литр)", re.IGNORECASE)
+_G_RE = re.compile(_NUM + r"\s*(?:г\b|гр\b|грамм)", re.IGNORECASE)
+_HALF_LITRE_RE = re.compile(r"\bпол[- ]?литр", re.IGNORECASE)
+_LITRE_WORD_RE = re.compile(r"(?:\b(один|одну|два|две|три|полтора|полторы)\s+)?\bлитр",
+                            re.IGNORECASE)
+_COUNT_WORDS = {"один": 1, "одну": 1, "одна": 1, "два": 2, "две": 2, "три": 3,
+                "четыре": 4, "пять": 5, "полтора": 1.5, "полторы": 1.5, "пол": 0.5}
+_VESSEL_RE = re.compile(
+    r"(?:(\d+(?:[.,]\d+)?|один|одну|одна|два|две|три|четыре|пять|полтора|полторы)\s*)?"
+    r"(пол)?[- ]?(стакан|чашк|кружк|банк|бутылк)", re.IGNORECASE)
+_BARE_RE = re.compile(r"^\D*" + _NUM + r"\D*$")
+_UNSPECIFIED_RE = re.compile(r"не\s+(?:помню|знаю|считал|мерил)|не\s+уверен|обычн", re.IGNORECASE)
 
-    Новая реплика о съеденном («съел ещё и торт») — не ответ: её разбирают
-    заново, а ждавшее уточнения забывается.
+
+def _number(text: str) -> float:
+    return float(text.replace(",", "."))
+
+
+def amounts_from_answer(text: str) -> list[dict]:
+    """Количества из ответа по порядку: [{"ml": 330}] или [{"grams": 200}].
+
+    Миллилитры, литры, граммы, посуда («стакан», «2 стакана», «полстакана»,
+    «банку»), «пол-литра» и голое число от 30 («330» — это миллилитры:
+    стаканов столько не пьют).
     """
-    if not pending or _EATEN_RE.search(question):
+    found: list[tuple[int, dict]] = []
+    taken: list[tuple[int, int]] = []
+
+    def add(m: re.Match, amount: dict) -> None:
+        # Совпадения не перекрываются: «пол-литра» — не ещё и «литр».
+        if not any(m.start() < end and start < m.end() for start, end in taken):
+            taken.append(m.span())
+            found.append((m.start(), amount))
+
+    for pattern, unit, factor in ((_ML_RE, "ml", 1.0), (_L_RE, "ml", 1000.0),
+                                  (_G_RE, "grams", 1.0)):
+        for m in pattern.finditer(text):
+            add(m, {unit: _number(m.group(1)) * factor})
+    for m in _HALF_LITRE_RE.finditer(text):
+        add(m, {"ml": 500.0})
+    for m in _LITRE_WORD_RE.finditer(text):
+        add(m, {"ml": 1000.0 * _COUNT_WORDS.get((m.group(1) or "один").lower(), 1.0)})
+    for m in _VESSEL_RE.finditer(text):
+        # «бутылку 0,5 л» — объём назван прямо сразу за посудой и её не удваивает.
+        if any(start >= m.end() and re.fullmatch(r"[а-яё]*\s*", text[m.end():start], re.I)
+               for start, _ in taken):
+            continue
+        count_text = (m.group(1) or "").lower()
+        count = (_COUNT_WORDS[count_text] if count_text in _COUNT_WORDS
+                 else _number(count_text) if count_text else 1.0)
+        if m.group(2):
+            count *= 0.5
+        volume = next(v for stem, v in VESSEL_ML.items() if m.group(3).lower().startswith(stem))
+        add(m, {"ml": count * volume})
+    # Голое число — только когда в реплике больше ничего нет: «мне 35 лет»
+    # — не 35 мл.
+    if (not found and (bare := _BARE_RE.match(text.strip()))
+            and _number(bare.group(1)) >= 30 and not _names_food(text)):
+        found.append((0, {"ml": _number(bare.group(1))}))
+    return [amount for _, amount in sorted(found, key=lambda pair: pair[0])
+            if next(iter(amount.values())) > 0]
+
+
+def drink_amount(item: dict) -> dict | None:
+    """Сколько выпито — по словам человека, а не по полям модели; None — не сказано.
+
+    Модель количество напитка выдумывает: на живых фразах «выпил колу» и
+    «выпил сок» она отдавала count=1, unit="cup", «банку колы» — тоже cup,
+    «330 мл» — count=330, «литр сока» — count=1000 стаканов. Доверяя её
+    полям, агент спросил бы про количество в 1 случае из 10 и угадал бы
+    в 3; по словам из phrase_ru — 10 из 10. Из полей модели берутся
+    только названные граммы и миллилитры.
+    """
+    amounts = amounts_from_answer(str(item.get("phrase_ru") or ""))
+    if len(amounts) == 1:
+        return amounts[0]
+    if isinstance(item.get("grams"), (int, float)) and item["grams"] > 0:
+        return {"grams": float(item["grams"])}
+    if item.get("unit") == "ml" and isinstance(item.get("count"), (int, float)) \
+            and item["count"] > 0:
+        return {"ml": float(item["count"])}
+    return None
+
+
+# Слова, из которых состоит ответ на уточнение. Осталось что-то сверх них
+# («съел ещё торт») — это новая реплика о съеденном, а не ответ.
+_ANSWER_STEMS = ("завтрак", "обед", "ужин", "перекус", "полдник", "стакан", "чашк", "кружк",
+                 "банк", "бутыл", "литр", "миллилитр", "грамм", "выпил", "съел", "поел",
+                 "пил", "примерн", "около", "наверн", "кажется", "помню", "знаю", "обычн",
+                 "полтор", "одн", "один", "дв", "три", "четыр", "пят", "целую", "целый",
+                 "где", "чуть", "меньше", "больше", "это", "был", "уверен", "считал",
+                 "мерил", "поллитр")
+_ANSWER_WORDS = {"на", "в", "во", "и", "а", "ну", "да", "то", "не", "пол", "мл", "л", "г",
+                 "гр", "с", "за", "уже", "тоже", "как", "раз"}
+
+
+def _names_food(text: str) -> bool:
+    words = re.findall(r"[а-яёa-z]+", text.lower())
+    return any(w not in _ANSWER_WORDS and not w.startswith(_ANSWER_STEMS) for w in words)
+
+
+def pending_answer(question: str, pending: dict | None) -> dict | None:
+    """Ответ на уточнение о съеденном — или None, если это не ответ.
+
+    {"meal": "lunch"} — назван приём пищи, которого ждали; {"amounts":
+    [...]} — количества напитков; {"unspecified": True} — «не помню».
+    Новая реплика о съеденном («съел ещё и торт») — не ответ: её разбирают
+    заново, а ждавшее уточнения забывается. Признак — в ней названо
+    что-то, кроме приёма пищи и количества: «выпил стакан» — ответ.
+    """
+    if not pending:
         return None
-    lowered = question.lower()
-    found = [meal for word, meal in _MEAL_ANSWER if word in lowered]
-    return found[0] if len(set(found)) == 1 else None
+    if _EATEN_RE.search(question) and _names_food(question):
+        return None
+    answer: dict = {}
+    if any(i.get("meal") not in _MEAL_SLOTS for i in pending.get("items") or []):
+        lowered = question.lower()
+        meals = {meal for word, meal in _MEAL_ANSWER if word in lowered}
+        if len(meals) == 1:
+            answer["meal"] = meals.pop()
+    if pending.get("need_amount"):
+        amounts = amounts_from_answer(question)
+        if amounts:
+            answer["amounts"] = amounts
+        elif _UNSPECIFIED_RE.search(question):
+            answer["unspecified"] = True
+    return answer or None
 
 
 CHECK_RU = {
