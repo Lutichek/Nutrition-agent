@@ -779,7 +779,10 @@ class PlanNodes:
 
         # Бюджет — раньше общей стоимости: человек спрашивал «уложился ли»,
         # а не «сколько вышло». Сумма идёт следом как обоснование.
-        budget = self._budget_note(plan, days, after_eaten=bool(state.get("eaten_shown")))
+        # После «съел» в карточке ОДИН сегодняшний день: живой прогон писал
+        # «за 7 дней выйдет около 2910 ₽», умножая на неделю пересобранный день.
+        after_eaten = bool(state.get("eaten_shown"))
+        budget = self._budget_note(plan, 1 if after_eaten else days, after_eaten=after_eaten)
         if budget:
             text += "\n\n" + budget
 

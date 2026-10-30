@@ -105,6 +105,17 @@ class TestSolver:
         assert "ограничения" not in note and "съеденное" in note
         assert "убрать ограничения" in NutritionAgent._budget_note(plan, 1)
 
+    def test_overspend_after_eaten_is_not_multiplied_by_the_week(self, catalog):
+        """Живой прогон: после «съел» на меню недели агент писал «за 7 дней
+        выйдет около 2910 ₽», умножая на неделю один пересобранный день."""
+        agent = make_agent(catalog, [{**PIZZA, "grams": 150}], [1])
+        agent.client.script["Извлеки параметры"] = json.dumps(
+            {**PROFILE, "budget_rub_per_day": 30, "days": 7})
+        agent.run("Мне 31, женщина, 168 см, 74 кг, хочу похудеть. Меню на неделю, 30 ₽ в день")
+        answer = agent.run("На обед съел пиццу, 150 г")
+        assert "перерасход" in answer.answer
+        assert "За 7 дней" not in answer.answer
+
     def test_too_little_left_is_said_with_numbers(self, catalog, targets):
         """Не натягивать ужин и перекусы на остаток в 50 ккал."""
         pizza = eaten_item(catalog, first_id(catalog, "Pizza, cheese"), 600, "Обед — основное")
