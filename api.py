@@ -58,6 +58,7 @@ from export import menu_to_xlsx
 from foods import load_catalog
 from limits import BudgetExhausted, Limits, LLMBudget, RateLimiter, seconds_to_utc_midnight
 from providers import get_clients
+from security_headers import SecurityHeaders
 from shopping import ShoppingList, build_shopping_list
 from solver import (
     DayPlan,
@@ -1050,6 +1051,11 @@ def delete_session(
 # маршруты в порядке регистрации, а mount на "/" совпадает с чем угодно.
 # Объяви его выше — и все ручки API, описанные ниже, перестали бы работать.
 STATIC_DIR = FilePath(__file__).parent / "static"
+
+# Заголовки безопасности и CSP — на все ответы, и API, и страницы
+# (security_headers.py). Обёртка, а не маршрут: порядок mount не трогает.
+app.add_middleware(SecurityHeaders, static_dir=STATIC_DIR,
+                   https=settings.session_cookie_secure)
 
 if STATIC_DIR.is_dir():
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
