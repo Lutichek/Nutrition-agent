@@ -21,7 +21,7 @@ from portions import VESSEL_ML
 from prompts import ALLERGY_NOTE
 from restrictions import expand, matches_terms
 from solver import DayPlan, MealItem, preferred_ids
-from targets import Profile
+from targets import ADULT_AGE, Profile
 
 # ── Аллергия: не то же, что «не ем» (ревью R5) ─────────────────────────
 #
@@ -96,6 +96,15 @@ def swap_note(old: MealItem, plan: DayPlan, before: DayPlan) -> str:
              f"{plan.targets['kcal']:.0f} — все проверки нормы пройдены. "
              "Если и это не подходит — скажите «замени ещё раз».")
     return text
+
+
+# ── Младше 18 — отказ (targets.ADULT_AGE) ──────────────────────────────
+def _is_minor(age: Any) -> bool:
+    """Названный возраст младше 18. Не число — не решаем, это дело схемы."""
+    try:
+        return float(age) < ADULT_AGE
+    except (TypeError, ValueError):
+        return False
 
 
 # ── «Съел не по плану — пересчитай день» (этап 2) ──────────────────────

@@ -38,7 +38,7 @@ from pathlib import Path as FilePath
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -69,7 +69,7 @@ from solver import (
     swap_item,
 )
 from storage import open_storage
-from targets import CycledTargets, Profile, Targets, compute_targets, explain
+from targets import CycledTargets, Profile, Targets, UnderageRefused, compute_targets, explain
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -342,6 +342,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(UnderageRefused)
+def _underage(_: Request, error: UnderageRefused) -> JSONResponse:
+    """Младше 18 — отказ во всех ручках расчёта (targets.ADULT_AGE).
+
+    Одним обработчиком, а не проверкой в каждой ручке: /targets, /plan,
+    /plan/swap, /menu, /menu.xlsx считают норму через compute_targets,
+    и новая ручка, забывшая про возраст, всё равно упрётся в отказ.
+    403, а не 422: ввод верный, отказ — решение сервиса.
+    """
+    return JSONResponse(status_code=403, content={"detail": str(error)})
 
 
 def get_agent() -> NutritionAgent:

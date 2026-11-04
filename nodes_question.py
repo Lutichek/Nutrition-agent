@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from agent_state import AgentState
 from llm_io import parse_json_response
-from profile_rules import REQUIRED_PROFILE_FIELDS
+from profile_rules import REQUIRED_PROFILE_FIELDS, _is_minor
 from prompts import (
     ANSWER_PROMPTS,
     CANNOT_ANSWER_TEMPLATE,
@@ -114,6 +114,10 @@ class QuestionNodes:
         # Неполный профиль — не считаем: у Profile есть умолчания (активность),
         # и норма по ним была бы домыслом, а не расчётом.
         if not raw_profile or any(f not in raw_profile for f in REQUIRED_PROFILE_FIELDS):
+            return ""
+        # Младше 18 личную норму не считаем и здесь (targets.ADULT_AGE):
+        # общий вопрос ответ получит, персонального расчёта — нет.
+        if _is_minor(raw_profile.get("age")):
             return ""
         try:
             profile = Profile(**raw_profile)

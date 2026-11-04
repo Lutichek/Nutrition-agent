@@ -38,6 +38,7 @@ from profile_rules import (
     REQUIRED_PROFILE_FIELDS,
     _eaten_turn_filter,
     _from_structured,
+    _is_minor,
     _merge_allergies,
     _resolve_preferences,
     _swap_index,
@@ -79,6 +80,7 @@ from targets import (
     ACTIVITY_FACTORS,
     ACTIVITY_LABELS,
     GOAL_LABELS,
+    MINOR_REFUSAL,
     Profile,
     Targets,
     compute_targets,
@@ -207,6 +209,11 @@ class PlanNodes:
         # нельзя — только «удалить мои данные»; аллерген в тарелке дороже.
         for field, value in extracted.items():
             if value in (None, "", []):
+                continue
+            # Возраст младше 18, однажды названный, репликой до взрослого не
+            # поднимается — иначе отказ снимается словами «ой, мне 25».
+            # Ошибся человек — «удалить мои данные», как и с исключениями.
+            if field == "age" and _is_minor(known.get("age")) and not _is_minor(value):
                 continue
             if field == "exclude":
                 value = [value] if isinstance(value, str) else list(value)
@@ -463,6 +470,12 @@ class PlanNodes:
         Здесь нет ни одного обращения к модели — и это принципиально.
         """
         raw_profile = dict(state.get("profile") or {})
+
+        # Младше 18 — отказ ДО разбора профиля: схема пускает от 14 лет,
+        # и 12-летний иначе услышал бы «не получилось разобрать возраст,
+        # уточните» — то есть подсказку назвать другой. Шаблон, не модель.
+        if _is_minor(raw_profile.get("age")):
+            return {"profile": raw_profile, "answer": MINOR_REFUSAL}
 
         try:
             profile = Profile(**raw_profile)
