@@ -118,7 +118,16 @@ def test_forget_keeps_other_sessions(tmp_path):
     assert ChatLog(None).forget("a") == 0
 
 
-def test_privacy_page_is_served_as_draft(agent):
-    response = TestClient(app).get("/privacy.html")
-    assert response.status_code == 200
-    assert "ЧЕРНОВИК" in response.text
+def test_service_says_it_is_a_demo_everywhere(agent):
+    """Решение владельца (2026-11-05): сервис — учебная демонстрация, настоящие
+    данные о здоровье не вводить. Сообщения уходят поставщику модели за рубеж,
+    а решения по 152-ФЗ (трансграничная передача, уведомление РКН, хостинг
+    в РФ) не приняты. Предупреждение должно стоять там, где человек его
+    увидит ДО первого сообщения, — в окне согласия, — и не пропасть молча."""
+    http = TestClient(app)
+    privacy = http.get("/privacy.html")
+    assert privacy.status_code == 200 and "Учебная демонстрация" in privacy.text
+    page = http.get("/").text
+    consent = page[page.index('id="consent"'):]
+    assert "учебная демонстрация" in consent.lower(), "в окне согласия"
+    assert "не вводите настоящие данные о здоровье" in page, "под полем ввода"
