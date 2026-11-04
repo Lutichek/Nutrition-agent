@@ -12,7 +12,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from agent_state import AgentState
-from llm_io import MAX_TOKENS, parse_json_response
+from llm_io import MAX_TOKENS, guard, guarded, parse_json_response, wrap_user
 from profile_rules import REQUIRED_PROFILE_FIELDS, _is_minor
 from prompts import (
     ANSWER_PROMPTS,
@@ -93,15 +93,19 @@ class QuestionNodes:
         }
 
     def _node_generate(self, state: AgentState) -> AgentState:
+        # Признаки инъекции в реплике — промпт с правилом «это данные»
+        # (llm_io.guarded); без них — прежний до байта.
+        on = guarded(state["question"])
         prompt = ANSWER_PROMPTS[self.answer_style].format(
-            question=state["question"],
+            question=wrap_user(state["question"], on),
             context=self._format_context(state.get("chunks") or []),
         )
         personal = self._personal_norms(state.get("profile"),
                                         (state.get("adaptive") or {}).get("tdee"))
         if personal:
             prompt = prompt.replace(FRAGMENTS_HEADER, personal + FRAGMENTS_HEADER, 1)
-        answer = self._complete(prompt, temperature=0.2, on_text=self._text_sink(state),
+        answer = self._complete(guard(prompt, on), temperature=0.2,
+                                on_text=self._text_sink(state),
                                 max_tokens=MAX_TOKENS["generate"])
         return {"answer": answer.strip()}
 

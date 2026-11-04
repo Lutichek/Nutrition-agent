@@ -24,7 +24,7 @@ from pydantic import ValidationError
 import food_search
 from adaptive import adapted_tdee
 from agent_state import AgentState
-from llm_io import MAX_TOKENS, parse_json_response
+from llm_io import MAX_TOKENS, guard, guarded, parse_json_response, wrap_user
 from portions import eaten_grams, grams_per_ml, is_drink, unspecified_grams
 from profile_rules import (
     _AGAIN_RE,
@@ -747,15 +747,19 @@ class PlanNodes:
         # «Сколько белка нужно при похудении?» маршрутизатор стабильно
         # считает просьбой о расчёте (цель уже известна), и человек получал
         # тот же план повторно — ни слова о белке.
+        # Признаки инъекции в реплике — промпт с правилом «это данные»
+        # (llm_io.guarded); без них — прежний до байта.
+        on = guarded(state.get("question", ""))
+        prompt = guard(EXPLAIN_PLAN_PROMPT.format(
+            question=wrap_user(state.get("question", ""), on),
+            profile=self._describe_profile(profile),
+            targets_explained=explain(profile, targets),
+            plan=plan.render() + period_note,
+            checks=checks_text,
+            context=self._format_context(chunks),
+        ), on)
         answer = self._complete(
-            EXPLAIN_PLAN_PROMPT.format(
-                question=state.get("question", ""),
-                profile=self._describe_profile(profile),
-                targets_explained=explain(profile, targets),
-                plan=plan.render() + period_note,
-                checks=checks_text,
-                context=self._format_context(chunks),
-            ),
+            prompt,
             temperature=0.3,
             on_text=self._text_sink(state),
             max_tokens=MAX_TOKENS["explain_plan"],
