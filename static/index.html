@@ -276,10 +276,6 @@
   }
   .send:disabled { opacity: .4; cursor: default; }
   .hint { text-align: center; font-size: 11.5px; color: var(--muted); margin-top: 9px; }
-  /* Учебная демонстрация: настоящих данных о здоровье не вводить
-     (решение владельца по 152-ФЗ, см. privacy.html). */
-  .consent-box .demo-note { border-left: 3px solid var(--fat); background: var(--user);
-    color: var(--ink); padding: 8px 10px; border-radius: 6px; }
   .hint a { color: var(--muted); }
 
   /* ── Согласие ───────────────────────────────────────────── */
@@ -347,8 +343,7 @@
       <textarea id="q" rows="1" placeholder="Напишите сообщение…" autocomplete="off"></textarea>
       <button class="send" id="send" title="Отправить">↑</button>
     </form>
-    <div class="hint"><b>Учебная демонстрация: не вводите настоящие данные о здоровье.</b>
-      Справочный расчёт. При заболеваниях рацион подбирает врач.
+    <div class="hint">Справочный расчёт. При заболеваниях рацион подбирает врач.
       <a href="/privacy.html" target="_blank">Как обрабатываются данные</a></div>
   </div>
 </div>
@@ -356,9 +351,6 @@
 <div class="consent" id="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
   <form class="consent-box" id="consent-form">
     <h2 id="consent-title">Перед началом</h2>
-    <p class="demo-note"><b>Это учебная демонстрация.</b> Не вводите настоящие
-       сведения о своём здоровье — придумайте рост, вес, возраст и диагнозы.
-       Текст сообщений уходит поставщику языковой модели за рубеж.</p>
     <p>Чтобы посчитать норму и рацион, нужны ваши рост, вес, возраст и, если
        вы о них расскажете, сведения о здоровье. Это особая категория
        персональных данных, поэтому сначала — согласие.</p>
