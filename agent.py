@@ -71,7 +71,7 @@ from agent_state import AgentState, Chunk, ConversationState, RAGAgentAnswer
 from data_preparation import load_corpus_index
 from foods import load_catalog
 from graph import AgentGraph
-from llm_io import _LLM_CALLS, parse_json_response
+from llm_io import _LLM_CALLS, DEFAULT_MAX_TOKENS, MAX_TOKENS, TRUNCATED_NOTE, parse_json_response
 from nodes_plan import PlanNodes
 from nodes_question import QuestionNodes
 from profile_rules import _NUTRIENT_WORDS as _NUTRIENT_WORDS
@@ -331,8 +331,11 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
         json_mode: bool = False,
         on_text: Callable[[str], None] | None = None,
         schema: dict[str, Any] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> str:
         """Один вызов модели с повторами при сетевых сбоях.
+
+        ``max_tokens`` — потолок длины ответа шага (llm_io.MAX_TOKENS).
 
         Ретраи здесь обязательны: у графа до семи обращений к модели на реплику,
         и без повторов один случайный таймаут провайдера ронял бы весь ответ.
@@ -346,6 +349,7 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
+            "max_tokens": max_tokens,
         }
         if schema is not None:
             kwargs["response_format"] = {"type": "json_schema", "json_schema": schema}
@@ -369,6 +373,14 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                     response = self.client.chat.completions.create(**kwargs)
                     content = response.choices[0].message.content or ""
                     usage = getattr(response, "usage", None)
+                spent = (usage.get("completion_tokens") if isinstance(usage, dict)
+                         else getattr(usage, "completion_tokens", None))
+                truncated = isinstance(spent, int) and spent >= max_tokens
+                # Обрезанный текст человеку — с пояснением: оборванная на
+                # полуслове фраза читается как поломка. JSON не трогаем —
+                # приписка сломала бы разбор.
+                if truncated and not json_mode and schema is None:
+                    content = content.rstrip() + TRUNCATED_NOTE
                 if calls is not None:
                     call = {
                         "response": content[:TRACE_RESPONSE_CHARS],
@@ -384,6 +396,8 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                                  else getattr(usage, field, None))
                         if isinstance(value, int):
                             call[field] = value
+                    if truncated:
+                        call["truncated"] = True
                     calls.append(call)
                 return content
             except Exception as error:
@@ -467,10 +481,11 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
         Одно место, а не два: разойдись они — ответ наперёд был бы получен
         в другом режиме и всё равно подставился бы (сверяется только промпт).
         """
+        options: dict[str, Any] = {"max_tokens": MAX_TOKENS.get(name, DEFAULT_MAX_TOKENS)}
         if name == "extract_profile":
-            return ({"schema": EXTRACT_PROFILE_SCHEMA} if self.structured_extract
-                    else {"json_mode": True})
-        return {}
+            options.update({"schema": EXTRACT_PROFILE_SCHEMA} if self.structured_extract
+                           else {"json_mode": True})
+        return options
 
     def _call_in_background(self, prompt: str, options: dict[str, Any]):
         """Вызов модели в потоке пула. Возвращает (ответ, вызовы, ошибка).
@@ -589,6 +604,7 @@ class NutritionAgent(PlanNodes, QuestionNodes, AgentGraph):
                 history=self._format_history(state.get("history")),
             ),
             json_mode=True,
+            max_tokens=MAX_TOKENS["classify"],
         )
         parsed = parse_json_response(raw)
 

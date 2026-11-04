@@ -24,7 +24,7 @@ from pydantic import ValidationError
 import food_search
 from adaptive import adapted_tdee
 from agent_state import AgentState
-from llm_io import parse_json_response
+from llm_io import MAX_TOKENS, parse_json_response
 from portions import eaten_grams, grams_per_ml, is_drink, unspecified_grams
 from profile_rules import (
     _AGAIN_RE,
@@ -329,7 +329,8 @@ class PlanNodes:
                         item["meal"] = reply["meal"]
             need = self._apply_amounts(items, need, reply)
         else:
-            raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True)
+            raw = self._complete(EATEN_PROMPT.format(question=state["question"]), json_mode=True,
+                                 max_tokens=MAX_TOKENS["eaten"])
             items = [i for i in parse_json_response(raw).get("items") or [] if isinstance(i, dict)]
             picked, need = None, []
         if not items:
@@ -363,7 +364,8 @@ class PlanNodes:
                 f"  {k}. {c['name']} ({c.get('name_ru') or ''})" for k, c in enumerate(found, 1))
             for n, (item, found) in enumerate(zip(items, candidates, strict=True), 1))
         choices = parse_json_response(self._complete(
-            EATEN_PICK_PROMPT.format(blocks=blocks), json_mode=True)).get("choices") or []
+            EATEN_PICK_PROMPT.format(blocks=blocks), json_mode=True,
+            max_tokens=MAX_TOKENS["eaten_pick"])).get("choices") or []
         picked, missing = [], []
         for n, (item, found) in enumerate(zip(items, candidates, strict=True)):
             choice = choices[n] if n < len(choices) else 0
@@ -461,6 +463,7 @@ class PlanNodes:
             ),
             temperature=0.3,
             on_text=self._text_sink(state),
+            max_tokens=MAX_TOKENS["ask_profile"],
         )
         return {"answer": answer.strip()}
 
@@ -755,6 +758,7 @@ class PlanNodes:
             ),
             temperature=0.3,
             on_text=self._text_sink(state),
+            max_tokens=MAX_TOKENS["explain_plan"],
         )
 
         return answer.strip(), chunks, query

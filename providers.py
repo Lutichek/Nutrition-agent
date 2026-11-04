@@ -56,6 +56,10 @@ DEFAULT_GIGACHAT_MODEL = "GigaChat-2"
 # дешевле, чем ждать. Ответ модели ждётся сколько нужно, как и раньше.
 KEEPALIVE_SECONDS = 300.0
 CONNECT_TIMEOUT_SECONDS = 2.0
+# Ожидание ответа. Было 600 с: при трёх повторах зависший вызов держал
+# обработчик до получаса. Ответ ограничен потолком токенов (llm_io.MAX_TOKENS,
+# не больше 1500), и такой у gpt-4o-mini приходит за десятки секунд.
+READ_TIMEOUT_SECONDS = 120.0
 
 
 def get_polza_client() -> OpenAI:
@@ -68,7 +72,7 @@ def get_polza_client() -> OpenAI:
     return OpenAI(
         base_url=POLZA_BASE_URL,
         api_key=settings.polza_ai_api_key,
-        timeout=httpx.Timeout(600.0, connect=CONNECT_TIMEOUT_SECONDS),
+        timeout=httpx.Timeout(READ_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS),
         http_client=DefaultHttpxClient(limits=httpx.Limits(
             max_connections=100,
             max_keepalive_connections=20,
