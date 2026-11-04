@@ -24,11 +24,18 @@
 
 Нет файла — ``available()`` ложно, и агент ищет по словам, как раньше:
 так работают тесты с заглушкой провайдера и запуск без ключа.
+
+Рядом с векторами пересборка пишет ОТПЕЧАТОК каталога, по которому они
+собраны (DIGEST_PATH, одна строка) — он в git. Без него проверка «векторы
+не отстали от каталога» на чистой машине CI пропускалась: самих векторов
+там нет, а шаг «ничего не пропущено» на пропуск падал.
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
@@ -37,6 +44,13 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 VECTORS_PATH = ROOT / "lance_db" / "catalog_names.npz"
+DIGEST_PATH = ROOT / "data" / "processed" / "catalog_names.sha256"
+
+
+def ids_digest(ids: Iterable) -> str:
+    """Отпечаток набора блюд: от порядка не зависит."""
+    joined = ",".join(str(i) for i in sorted(int(i) for i in ids))
+    return hashlib.sha256(joined.encode()).hexdigest()
 
 
 def name_texts(catalog: pd.DataFrame) -> list[str]:
@@ -50,6 +64,7 @@ def build(catalog: pd.DataFrame, embedder) -> None:
     # float16: вдвое меньше файл, а для выбора дюжины кандидатов точности хватает.
     np.savez_compressed(VECTORS_PATH, ids=catalog["fdc_id"].astype(np.int64).to_numpy(),
                         vectors=vectors.astype(np.float16))
+    DIGEST_PATH.write_text(ids_digest(catalog["fdc_id"]) + "\n", encoding="utf-8")
 
 
 @lru_cache(maxsize=1)

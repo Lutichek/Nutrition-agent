@@ -55,12 +55,18 @@ def test_without_artifact_falls_back_to_catalog_portion(monkeypatch):
 def test_name_vectors_match_the_catalog(catalog):
     """Пересобрали каталог, а векторы названий — нет: новые блюда молча
     никогда не найдутся, удалённые — найдутся и упадут. Как и для разметки
-    каталога (test_shipped_catalog_matches_the_rule), расхождение — провал."""
+    каталога (test_shipped_catalog_matches_the_rule), расхождение — провал.
+
+    Сверяется отпечаток в git — он есть и на чистой машине CI. Раньше тест
+    без файла векторов пропускался, а шаг CI «ничего не пропущено» на
+    пропуск падал: сами векторы (13.5 МБ) в git не идут, едут в образ.
+    """
     import food_search
 
-    if not food_search.available():
-        pytest.skip("векторы названий не собраны: python food_search.py --rebuild")
-    ids, vectors = food_search._load()
-    assert sorted(int(i) for i in ids) == sorted(catalog["fdc_id"].astype(int)), \
-        "выполните python food_search.py --rebuild"
-    assert len(ids) == len(vectors)
+    rebuild = "выполните python food_search.py --rebuild"
+    digest = food_search.DIGEST_PATH.read_text(encoding="utf-8").strip()
+    assert digest == food_search.ids_digest(catalog["fdc_id"]), rebuild
+    if food_search.available():
+        ids, vectors = food_search._load()
+        assert food_search.ids_digest(ids) == digest, rebuild
+        assert len(ids) == len(vectors)
