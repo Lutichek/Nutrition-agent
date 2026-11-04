@@ -369,7 +369,11 @@ const $ = (id) => document.getElementById(id);
 // Разговор держит cookie httpOnly, которую ставит сервер: странице его
 // пропуск не виден и не нужен (кража через XSS исключена).
 
-const escape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// Кавычки — тоже: escape стоит и внутри атрибутов (title="…"), и без них
+// название с кавычкой закрывало атрибут — путь к XSS (OWASP LLM05).
+// String(): число (год статьи) раньше роняло .replace.
+const escape = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const round = (n) => Math.round(n || 0);
 
 async function api(path, options = {}) {
@@ -543,7 +547,7 @@ function renderPlanFoot(sources) {
   if (!sources || !sources.length) return `<div class="plan-foot">${base}</div>`;
 
   const links = sources.slice(0, 3).map((s) =>
-    `<a href="https://pubmed.ncbi.nlm.nih.gov/${s.pmid}/" target="_blank"
+    `<a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(s.pmid)}/" target="_blank"
         rel="noopener" title="${escape(s.title || "")}">${escape(
           (s.title || "источник").split(/[.:]/)[0].slice(0, 58))}</a>`).join(" · ");
   return `<div class="plan-foot">${base}<br>Обоснование норм: ${links}</div>`;
@@ -636,8 +640,8 @@ function renderSources(sources) {
       <div class="source-title">${escape(s.title || "Без названия")}</div>
       <div class="source-where">
         ${escape(s.journal || "")}${s.year ? ", " + escape(s.year) : ""} ·
-        <a href="https://pubmed.ncbi.nlm.nih.gov/${s.pmid}/"
-           target="_blank" rel="noopener">PMID ${s.pmid}</a>
+        <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(s.pmid)}/"
+           target="_blank" rel="noopener">PMID ${escape(s.pmid)}</a>
       </div>
       ${s.quote ? `<div class="source-quote">${escape(s.quote)}</div>` : ""}
     </div>`).join("");
@@ -670,7 +674,7 @@ function renderChecked(data) {
 function renderDownload(data) {
   if (!data.menu_url || data.menu_days <= 1) return "";
   return `<div class="actions">
-    <a class="dl" href="${data.menu_url}" download>
+    <a class="dl" href="${escape(data.menu_url)}" download>
       Скачать меню на ${data.menu_days} ${dayWord(data.menu_days)} — Excel
     </a></div>`;
 }
