@@ -13,6 +13,9 @@ _research/*
 # на него, поэтому без него оба ведут в пустоту.
 !_research/EVOLUTION.md
 !_research/README.md
+# Журнал разбит по темам: EVOLUTION.md — оглавление и хронология,
+# сами шаги — в evolution/. Без этой строки темы молча не попали бы в git.
+!_research/evolution/
 
 # ── Данные и индекс ───────────────────────────────────────────
 # Скачиваются и собираются локально: data_sources.py, foods.py, build_index.py
