@@ -24,11 +24,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # Только чтение: тестам писать в репозиторий незачем, и украденный
+    # из шага токен ничего не изменит (OWASP LLM03, цепочка поставки).
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v4
+      # Действия закреплены по SHA, а не по тегу: тег в чужом репозитории
+      # можно переписать, и в CI молча поедет другой код. Обновляет Dependabot.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Поставить uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
           enable-cache: true
 
@@ -37,17 +44,26 @@ jobs:
         # а не в проде на других версиях библиотек.
         run: uv sync --frozen --extra dev
 
+      - name: Известные уязвимости в зависимостях
+        # Проверяется ровно то, что в uv.lock, — и то, что уедет в образ.
+        # Первый прогон нашёл 6 уязвимостей (urllib3, certifi, langgraph-sdk).
+        run: |
+          uv export --frozen --extra dev --no-emit-project --no-hashes -q > /tmp/requirements.txt
+          uvx pip-audit==2.10.1 -r /tmp/requirements.txt --disable-pip --no-deps
+
       - name: Линтер
         run: uv run ruff check .
 
-      - name: Тесты
-        run: uv run pytest -q
-
-      - name: Проверить, что ничего не пропущено
+      - name: Тесты, и ни одного пропуска
         # Зелёная галочка не должна означать «половина тестов скипнулась».
         # Такое уже было: без каталога в репозитории проходили 143 теста
         # из 318, а остальные молча пропускались.
+        #
+        # Один прогон, а не два (тесты, затем отдельно «нет ли пропусков»):
+        # набор идёт ~4 минуты, и двойной прогон подбирался к лимиту в 15.
+        # pipefail обязателен: без него tee скрыл бы упавшие тесты.
         run: |
+          set -o pipefail
           uv run pytest -q --no-header -rs 2>&1 | tee /tmp/out.txt
           if grep -q "skipped" /tmp/out.txt; then
             echo "::error::Часть тестов пропущена — проверьте, все ли артефакты на месте"
