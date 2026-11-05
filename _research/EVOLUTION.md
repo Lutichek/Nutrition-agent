@@ -97,7 +97,7 @@
 | 58 | Потолок длины ответа модели (OWASP LLM10) | [SECURITY](evolution/SECURITY.md) |
 | 59 | Цепочка поставки | [SECURITY](evolution/SECURITY.md) |
 | 60 | Инъекции в промпт (OWASP LLM01, LLM07) | [SECURITY](evolution/SECURITY.md) |
-
+| 61 | Качество ответов текущей реализации глазами судьи другого семейства | [RAG](evolution/RAG.md) |
 Разделы без номера:
 
 | Раздел | Журнал |
