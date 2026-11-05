@@ -75,6 +75,7 @@ from measurement import (
     METRIC_COLUMNS,
     QUERIES_PATH,
     RESEARCH_DIR,
+    cached_queries,
     paired_bootstrap,
 )
 from providers import get_clients
@@ -273,7 +274,7 @@ def main() -> None:
         sizes = [pair for pair in SIZES if pair[0] in wanted]
 
     dataset = pd.read_excel(DATASET_PATH)
-    queries = pd.read_json(QUERIES_PATH, typ="series").tolist()
+    queries = cached_queries(dataset["question"].astype(str).tolist())
     _client, _model, embed_client = get_clients("polza")
     embedder = Embedder(embed_client)
 

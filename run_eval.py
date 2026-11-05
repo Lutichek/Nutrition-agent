@@ -15,6 +15,11 @@
     python run_eval.py --hybrid        # добавить BM25 + RRF (отклонённый вариант)
     python run_eval.py --no-relevancy  # без насыщенной relevancy (дешевле)
 
+    # Уровень качества — независимая оценка: судья llama, эталоны gemini,
+    # разметка llama, файлы *_independent (шаги 61, 63):
+    python run_eval.py --independent
+    python run_eval.py --independent --metrics   # по сохранённым ответам
+
     # Судья другого семейства, свои файлы, поиск по независимой разметке:
     python run_eval.py --judge=meta-llama/llama-3.3-70b-instruct --tag=llama --independent-qrels
     python run_eval.py --refusals --judge=meta-llama/llama-3.3-70b-instruct --tag=llama
@@ -86,6 +91,26 @@ METRICS_RERANK_PATH = DATASET_DIR / "metrics_rerank.csv"
 METRICS_HYBRID_PATH = DATASET_DIR / "metrics_hybrid.csv"
 REFUSALS_PATH = DATASET_DIR / "refusals.csv"
 INDEPENDENT_QRELS_PATH = DATASET_DIR / "qrels_llama.csv"
+
+# Независимая оценка (--independent): ни судья, ни эталон, ни разметка
+# не из семейства генератора (gpt-4o-mini). Судья-генератор завышал
+# correctness на 0.13, эталон модели генератора — ещё на 0.04 (шаги 61, 63).
+INDEPENDENT_JUDGE = "meta-llama/llama-3.3-70b-instruct"
+INDEPENDENT_REFERENCES_PATH = DATASET_DIR / "references_gemini.csv"
+
+
+def _independent_references(dataset: pd.DataFrame) -> pd.Series:
+    """Эталоны gemini-2.5-flash по тем же фрагментам, в порядке датасета."""
+    if not INDEPENDENT_REFERENCES_PATH.exists():
+        raise FileNotFoundError(f"Нет {INDEPENDENT_REFERENCES_PATH.name}. "
+                                "Выполните: python -m experiments.reference_family")
+    saved = pd.read_csv(INDEPENDENT_REFERENCES_PATH, dtype={"id": str})
+    by_id = dict(zip(saved["id"], saved["reference_answer"], strict=True))
+    references = dataset["id"].astype(str).map(by_id)
+    if references.isna().any():
+        raise ValueError(f"В {INDEPENDENT_REFERENCES_PATH.name} нет эталонов для "
+                         f"{int(references.isna().sum())} вопросов датасета — пересоберите")
+    return references
 
 
 def _flag_value(name: str) -> str | None:
@@ -360,6 +385,11 @@ def main() -> None:
     flags = set(sys.argv[1:])
     judge_model = _flag_value("judge")
     tag = _flag_value("tag")
+    independent = "--independent" in flags
+    if independent:
+        judge_model = judge_model or INDEPENDENT_JUDGE
+        tag = tag or "independent"
+        flags.add("--independent-qrels")
     if judge_model and not tag:
         # Метрики другим судьёй в базовом файле нельзя: их сравнят с прежними
         # как равные, а единица измерения уже другая.
@@ -378,6 +408,10 @@ def main() -> None:
 
     dataset = pd.read_excel(DATASET_PATH)
     print(f"Датасет: {len(dataset)} вопросов, {dataset['document'].nunique()} статей")
+    if independent:
+        dataset = dataset.assign(reference_answer=_independent_references(dataset))
+        print(f"Независимая оценка: судья {judge_model}, эталоны "
+              f"{INDEPENDENT_REFERENCES_PATH.name}, разметка {INDEPENDENT_QRELS_PATH.name}")
 
     # Прогон с реранкингом пишется в свой файл и свою таблицу метрик,
     # чтобы базовый прогон остался на месте для сравнения.

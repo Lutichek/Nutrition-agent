@@ -158,7 +158,19 @@ def report_significance(
 # ────────────────────────────────────────────────────────────
 
 
-def load_queries_en(questions: list[str], client: Any, model: str) -> list[str]:
+def cached_queries(questions: list[str], path: Path | None = None) -> list[str]:
+    """Переводы из кэша без обращения к модели — для детерминированных
+    замеров. Кэш не для этих вопросов — ошибка, а не чужие запросы."""
+    path = path or QUERIES_PATH
+    cached = json.loads(path.read_text(encoding="utf-8"))
+    if not (isinstance(cached, dict) and cached.get("questions") == list(questions)):
+        raise ValueError(f"{path.name} — переводы других вопросов. Пересоберите: "
+                         "python build_qrels.py --pool-only")
+    return cached["queries"]
+
+
+def load_queries_en(questions: list[str], client: Any, model: str,
+                    path: Path | None = None) -> list[str]:
     """Английские переводы вопросов тем же промптом, что и в агенте.
 
     Кэшируется на диск: перевод не зависит от конфигурации поиска, а платить
@@ -169,14 +181,21 @@ def load_queries_en(questions: list[str], client: Any, model: str) -> list[str]:
     в один файл. Пока промпты совпадали, расхождения не было видно;
     разойдись они — пул собрался бы одними запросами, а замеры шли бы
     другими, и заметить это было бы нечем.
+
+    Кэш хранит и сами вопросы и отдаётся, только если они совпали. Раньше
+    сверялось одно число: 210 НОВЫХ вопросов получили бы переводы 210
+    старых, и пул молча собрался бы по чужим запросам. ``path`` — свой кэш
+    для другого набора вопросов, чтобы не затирать общий.
     """
     from agent import REWRITE_PROMPT
 
-    if QUERIES_PATH.exists():
-        cached = json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
-        if len(cached) == len(questions):
-            print(f"Переводы взяты из кэша: {QUERIES_PATH.name}")
-            return cached
+    path = path or QUERIES_PATH
+    if path.exists():
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("questions") == list(questions):
+            print(f"Переводы взяты из кэша: {path.name}")
+            return cached["queries"]
+        print(f"Кэш {path.name} — для других вопросов; перевожу заново")
 
     print(f"Перевожу {len(questions)} вопросов на английский...")
 
@@ -195,7 +214,8 @@ def load_queries_en(questions: list[str], client: Any, model: str) -> list[str]:
     with ThreadPoolExecutor(max_workers=6) as pool:
         translated = list(pool.map(work, questions))
 
-    QUERIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    QUERIES_PATH.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Сохранено → {QUERIES_PATH.name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"questions": list(questions), "queries": translated},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Сохранено → {path.name}")
     return translated

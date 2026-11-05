@@ -248,3 +248,70 @@ class TestOtherJudgeNeverOverwritesBaseFiles:
                             lambda *a, **k: pytest.fail("агент не должен запускаться"))
         run_eval.main()
         assert "--tag" in capsys.readouterr().out
+
+
+class TestQueryCacheBelongsToItsQuestions:
+    """Кэш переводов сверял только КОЛИЧЕСТВО вопросов: 210 новых вопросов
+    (замер авторов вопросов, шаг 64) получили бы переводы 210 старых, и пул
+    молча собрался бы по чужим запросам."""
+
+    def test_other_questions_are_translated_not_taken_from_cache(self, tmp_path):
+        from conftest import FakeLLMClient
+
+        from measurement import cached_queries, load_queries_en
+
+        path = tmp_path / "queries.json"
+        client = FakeLLMClient(default="english query")
+        assert load_queries_en(["вопрос А"], client, "fake", path=path) == ["english query"]
+        calls = len(client.calls)
+        load_queries_en(["вопрос А"], client, "fake", path=path)
+        assert len(client.calls) == calls, "те же вопросы — из кэша"
+        load_queries_en(["вопрос Б"], client, "fake", path=path)
+        assert len(client.calls) == calls + 1, "другие вопросы того же числа — заново"
+        with pytest.raises(ValueError):
+            cached_queries(["вопрос В"], path=path)
+
+
+class TestIndependentModeSwitchesEveryLink:
+    """--independent: ни судья, ни эталон, ни разметка — не модель генератора.
+    Судья-генератор завышал correctness на 0.13, его эталон — ещё на 0.04
+    (шаги 61, 63); режим, забывший одно звено, вернул бы завышение молча."""
+
+    def test_judge_references_and_qrels_are_independent(self, monkeypatch, tmp_path):
+        import run_eval
+
+        dataset = pd.DataFrame({"id": ["a", "b"], "question": ["q1", "q2"],
+                                "document": [1, 2], "reference_answer": ["mini", "mini"]})
+        references = tmp_path / "references_gemini.csv"
+        pd.DataFrame({"id": ["a", "b"], "reference_answer": ["gem-a", "gem-b"]}).to_csv(
+            references, index=False)
+        seen: dict = {}
+        monkeypatch.setattr(run_eval, "INDEPENDENT_REFERENCES_PATH", references)
+        monkeypatch.setattr(run_eval, "DATASET_PATH", tmp_path / "dataset.xlsx")
+        (tmp_path / "dataset.xlsx").write_bytes(b"")
+        monkeypatch.setattr(run_eval.pd, "read_excel", lambda _: dataset)
+        monkeypatch.setattr(run_eval, "load_answers", lambda path: seen.setdefault("answers", path) and [])
+        monkeypatch.setattr(run_eval, "QRELS_PATH", tmp_path / "qrels.csv")
+        (tmp_path / "qrels.csv").write_text("x")
+        monkeypatch.setattr(run_eval, "INDEPENDENT_QRELS_PATH", tmp_path / "qrels_llama.csv")
+        (tmp_path / "qrels_llama.csv").write_text("x")
+        monkeypatch.setattr(run_eval, "load_qrels", lambda path=None: seen.setdefault("qrels", path) and {})
+        monkeypatch.setattr(run_eval, "get_clients", lambda _: (None, "openai/gpt-4o-mini", None))
+        monkeypatch.setattr(run_eval, "evaluate", lambda **kw: pd.DataFrame({"id": ["a", "b"]}))
+
+        def fake_answers(scored, data, client, model, **_):
+            seen["judge"], seen["refs"] = model, list(data["reference_answer"])
+            return pd.DataFrame({"id": ["a", "b"], "correctness": [1.0, 1.0],
+                                 "relevancy": [1.0, 1.0], "correctness_reason": ["", ""]})
+
+        monkeypatch.setattr(run_eval, "evaluate_answers", fake_answers)
+        monkeypatch.setattr(run_eval, "report", lambda _m: None)
+        monkeypatch.setattr(run_eval, "METRICS_PATH", tmp_path / "metrics.csv")
+        monkeypatch.setattr("sys.argv", ["run_eval.py", "--independent", "--metrics"])
+        run_eval.main()
+
+        assert seen["judge"] == run_eval.INDEPENDENT_JUDGE
+        assert seen["refs"] == ["gem-a", "gem-b"], "эталоны gemini, не модели генератора"
+        assert seen["qrels"].name == "qrels_llama.csv"
+        assert "independent" in seen["answers"].name
+        assert (tmp_path / "metrics_independent.csv").exists(), "базовый metrics.csv не тронут"

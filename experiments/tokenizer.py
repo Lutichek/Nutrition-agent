@@ -58,7 +58,14 @@ from embedder import Embedder
 from evaluation import evaluate
 from lance_db import open_table
 from make_eval_dataset import DATASET_PATH
-from measurement import CANDIDATE_K, METRIC_COLUMNS, QUERIES_PATH, RESEARCH_DIR, paired_bootstrap
+from measurement import (
+    CANDIDATE_K,
+    METRIC_COLUMNS,
+    QUERIES_PATH,
+    RESEARCH_DIR,
+    cached_queries,
+    paired_bootstrap,
+)
 from providers import get_clients
 from retriever import STOPWORDS, Retriever
 
@@ -222,7 +229,7 @@ def main() -> None:
         return
 
     dataset = pd.read_excel(DATASET_PATH)
-    queries = pd.read_json(QUERIES_PATH, typ="series").tolist()
+    queries = cached_queries(dataset["question"].astype(str).tolist())
     _client, _model, embed_client = get_clients("polza")
 
     table = open_table("lance_db/vectorstore", "chunks")
