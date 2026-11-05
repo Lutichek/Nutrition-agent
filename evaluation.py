@@ -202,11 +202,45 @@ def _ndcg_at_k(
 _RAGAS_AVAILABLE: bool | None = None
 
 
+def _ragas_compat() -> None:
+    """Заглушка Vertex AI для импорта RAGAS — только если её нет.
+
+    ragas 0.4.3 (последняя) жёстко импортирует
+    ``langchain_community.chat_models.vertexai.ChatVertexAI``, а в
+    langchain-community 0.4 этого модуля уже нет. В зафиксированном
+    окружении RAGAS не импортировался вовсе, и faithfulness не считалась
+    (NaN и предупреждение — подмены не было, но и метрики тоже).
+
+    Класс нужен RAGAS только в одной проверке ``isinstance`` («умеет ли
+    модель выдавать n вариантов»). У нас судья — ChatOpenAI, и с заглушкой
+    ответ на эту проверку тот же, что с настоящим классом. Сравнивалось
+    с откатом langchain-community до 0.3.31: тот тоже работает, но
+    понижает сворачиваемый авторами пакет и тянет три зависимости.
+    """
+    import importlib
+    import sys
+    import types
+
+    try:
+        importlib.import_module("langchain_community.chat_models.vertexai")
+    except ModuleNotFoundError:
+        stub = types.ModuleType("langchain_community.chat_models.vertexai")
+
+        class ChatVertexAI:  # noqa: D401 — заглушка, экземпляров не бывает
+            """Заглушка: в этом окружении Vertex AI не используется."""
+
+        stub.ChatVertexAI = ChatVertexAI
+        sys.modules[stub.__name__] = stub
+    except ImportError:
+        pass
+
+
 def _check_ragas() -> bool:
     """Проверить доступность RAGAS."""
     global _RAGAS_AVAILABLE
     if _RAGAS_AVAILABLE is not None:
         return _RAGAS_AVAILABLE
+    _ragas_compat()
     try:
         from langchain_openai import ChatOpenAI as _C  # noqa: F401
         from ragas.llms import LangchainLLMWrapper as _W  # noqa: F401
@@ -483,7 +517,8 @@ def evaluate(
         if not _check_ragas():
             print(
                 "⚠️ RAGAS недоступен — faithfulness НЕ посчитана.\n"
-                "   Установите: uv sync --extra dev. Подменять её другой метрикой нельзя:\n"
+                "   Установите: uv sync --extra dev --extra eval. Подменять её другой\n"
+                "   метрикой нельзя:\n"
                 "   цифры двух методов не сравнимы между собой."
             )
         else:

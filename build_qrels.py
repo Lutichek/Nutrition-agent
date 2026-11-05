@@ -178,13 +178,18 @@ def judge_pool(pool: pd.DataFrame, client, model, max_workers: int = 6) -> pd.Da
     return pd.DataFrame(results)
 
 
-def load_qrels() -> dict[str, set[int]]:
-    """Прочитать разметку: id вопроса → множество релевантных chunk_id."""
-    if not QRELS_PATH.exists():
+def load_qrels(path: Path | None = None) -> dict[str, set[int]]:
+    """Прочитать разметку: id вопроса → множество релевантных chunk_id.
+
+    ``path`` — другая разметка того же пула, например независимая
+    (``qrels_llama.csv``, experiments/qrels_bias.py).
+    """
+    path = path or QRELS_PATH
+    if not path.exists():
         raise FileNotFoundError(
-            f"Нет разметки {QRELS_PATH.name}. Выполните: python build_qrels.py"
+            f"Нет разметки {path.name}. Выполните: python build_qrels.py"
         )
-    frame = pd.read_csv(QRELS_PATH)
+    frame = pd.read_csv(path)
     relevant = frame[frame["relevant"] == 1]
     return {
         str(row_id): set(group["chunk_id"].astype(int))

@@ -211,3 +211,40 @@ class TestRefusalJudgeFailure:
         judge = frame["refused_judge"]
         merged = judge.where(judge.notna(), frame["refused_markers"]).astype(bool)
         assert list(merged) == [True, True, False]
+
+
+class TestRagasImportsInTheLockedEnvironment:
+    """ragas 0.4.3 импортирует ``langchain_community.chat_models.vertexai``,
+    которого в langchain-community 0.4 уже нет. В зафиксированном окружении
+    RAGAS не импортировался вовсе, и faithfulness не считалась ни в одном
+    прогоне — NaN и предупреждение. Заглушка закрывает ровно этот модуль."""
+
+    def test_missing_vertex_module_is_stubbed(self):
+        import sys
+
+        from evaluation import _ragas_compat
+
+        _ragas_compat()
+        stub = sys.modules.get("langchain_community.chat_models.vertexai")
+        assert stub is not None and hasattr(stub, "ChatVertexAI")
+
+
+class TestOtherJudgeNeverOverwritesBaseFiles:
+    """Метрики другим судьёй — другая единица измерения: записанные в базовый
+    metrics.csv, их сравнили бы с прежними как равные."""
+
+    def test_tagged_run_writes_its_own_files(self):
+        from run_eval import ANSWERS_PATH, REFUSALS_PATH, _tagged
+
+        assert _tagged(ANSWERS_PATH, "llama").name == "agent_answers_llama.json"
+        assert _tagged(REFUSALS_PATH, "llama").name == "refusals_llama.csv"
+        assert _tagged(ANSWERS_PATH, None) == ANSWERS_PATH
+
+    def test_judge_without_tag_is_refused(self, monkeypatch, capsys):
+        import run_eval
+
+        monkeypatch.setattr("sys.argv", ["run_eval.py", "--judge=meta-llama/x"])
+        monkeypatch.setattr(run_eval, "run_agent_on_dataset",
+                            lambda *a, **k: pytest.fail("агент не должен запускаться"))
+        run_eval.main()
+        assert "--tag" in capsys.readouterr().out

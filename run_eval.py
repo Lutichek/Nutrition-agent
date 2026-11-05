@@ -15,6 +15,17 @@
     python run_eval.py --hybrid        # добавить BM25 + RRF (отклонённый вариант)
     python run_eval.py --no-relevancy  # без насыщенной relevancy (дешевле)
 
+    # Судья другого семейства, свои файлы, поиск по независимой разметке:
+    python run_eval.py --judge=meta-llama/llama-3.3-70b-instruct --tag=llama --independent-qrels
+    python run_eval.py --refusals --judge=meta-llama/llama-3.3-70b-instruct --tag=llama
+
+``--judge`` — модель-судья для faithfulness, correctness, relevancy и отказов.
+По умолчанию судья — та же модель, что генератор, и она завышает correctness
+на 12–19 пунктов (evolution/RAG.md, «Смещение судьи»). ``--tag`` пишет
+ответы и метрики в свои файлы (``agent_answers_<tag>.json`` и т. п.):
+без него свежий прогон затёр бы базовые, на которых держатся другие замеры.
+``--independent-qrels`` — метрики поиска по разметке ``qrels_llama.csv``.
+
 Что меряется:
 
 * **Retrieval** (Precision@K, Recall@K, F1, MRR, MAP, NDCG) — нашёл ли ретривер
@@ -74,6 +85,18 @@ METRICS_PATH = DATASET_DIR / "metrics.csv"
 METRICS_RERANK_PATH = DATASET_DIR / "metrics_rerank.csv"
 METRICS_HYBRID_PATH = DATASET_DIR / "metrics_hybrid.csv"
 REFUSALS_PATH = DATASET_DIR / "refusals.csv"
+INDEPENDENT_QRELS_PATH = DATASET_DIR / "qrels_llama.csv"
+
+
+def _flag_value(name: str) -> str | None:
+    """Значение флага вида ``--name=value`` или None."""
+    prefix = f"--{name}="
+    return next((arg[len(prefix):] for arg in sys.argv[1:] if arg.startswith(prefix)), None)
+
+
+def _tagged(path: Path, tag: str | None) -> Path:
+    """Свой файл для помеченного прогона: базовые не затираются."""
+    return path.with_name(f"{path.stem}_{tag}{path.suffix}") if tag else path
 
 # Формулировки, по которым видно, что агент отказался отвечать.
 #
@@ -198,7 +221,8 @@ def looks_like_refusal(answer: str) -> bool:
     return any(marker in lowered for marker in REFUSAL_MARKERS)
 
 
-def evaluate_refusals(use_judge: bool = True) -> pd.DataFrame:
+def evaluate_refusals(use_judge: bool = True, judge_model: str | None = None,
+                      tag: str | None = None) -> pd.DataFrame:
     """На вопросах без ответа в корпусе агент обязан отказаться.
 
     Args:
@@ -236,7 +260,7 @@ def evaluate_refusals(use_judge: bool = True) -> pd.DataFrame:
 
     if use_judge:
         judged = judge_refusals(answers, dataset.assign(id=dataset["id"].astype(str)),
-                                llm_client, model)
+                                llm_client, judge_model or model)
         frame = frame.merge(
             judged[["id", "refused", "reason"]].rename(columns={"refused": "refused_judge"}),
             on="id",
@@ -251,7 +275,8 @@ def evaluate_refusals(use_judge: bool = True) -> pd.DataFrame:
 
     # Ответы сохраняем целиком: если промпт судьи придётся править (а его
     # пришлось), пересудить можно по этому файлу, не гоняя агента заново.
-    frame.to_csv(REFUSALS_PATH, index=False, encoding="utf-8")
+    refusals_path = _tagged(REFUSALS_PATH, tag)
+    frame.to_csv(refusals_path, index=False, encoding="utf-8")
 
     subtle = frame[frame["subtle"]] if "subtle" in frame.columns else frame
 
@@ -263,7 +288,7 @@ def evaluate_refusals(use_judge: bool = True) -> pd.DataFrame:
         # значит один из двух способов меряет не то, что нужно.
         disagreement = (frame["refused"] != frame["refused_markers"]).mean()
         print(f"  судья разошёлся с маркерами на: {disagreement:.1%} вопросов")
-    print(f"Подробности → {REFUSALS_PATH}")
+    print(f"Подробности → {refusals_path}")
     return frame
 
 
@@ -333,9 +358,18 @@ def report(metrics: pd.DataFrame) -> None:
 
 def main() -> None:
     flags = set(sys.argv[1:])
+    judge_model = _flag_value("judge")
+    tag = _flag_value("tag")
+    if judge_model and not tag:
+        # Метрики другим судьёй в базовом файле нельзя: их сравнят с прежними
+        # как равные, а единица измерения уже другая.
+        print("С --judge нужен --tag: метрики другого судьи — в свои файлы.")
+        return
+    if judge_model:
+        print(f"Судья: {judge_model}")
 
     if "--refusals" in flags:
-        evaluate_refusals()
+        evaluate_refusals(judge_model=judge_model, tag=tag)
         return
 
     if not DATASET_PATH.exists():
@@ -349,10 +383,10 @@ def main() -> None:
     # чтобы базовый прогон остался на месте для сравнения.
     rerank = "--rerank" in flags
     hybrid = "--hybrid" in flags
-    answers_path = (ANSWERS_HYBRID_PATH if hybrid
-                    else ANSWERS_RERANK_PATH if rerank else ANSWERS_PATH)
-    metrics_path = (METRICS_HYBRID_PATH if hybrid
-                    else METRICS_RERANK_PATH if rerank else METRICS_PATH)
+    answers_path = _tagged(ANSWERS_HYBRID_PATH if hybrid
+                           else ANSWERS_RERANK_PATH if rerank else ANSWERS_PATH, tag)
+    metrics_path = _tagged(METRICS_HYBRID_PATH if hybrid
+                           else METRICS_RERANK_PATH if rerank else METRICS_PATH, tag)
     if rerank:
         print("Конфигурация: плотный поиск + LLM-реранкинг")
     if hybrid:
@@ -368,6 +402,7 @@ def main() -> None:
         print(f"Ответы сохранены → {answers_path}")
 
     llm_client, model, _ = get_clients("polza")
+    model = judge_model or model
     retrieval_only = "--retrieval" in flags
 
     # Для метрик берём копию ответов без служебных предложений — см. BOILERPLATE.
@@ -380,9 +415,11 @@ def main() -> None:
     # Множественный эталон, если разметка пула собрана. Без неё метрики
     # считаются по одному эталонному чанку и занижают полноту — см. EVOLUTION.md.
     qrels = None
-    if QRELS_PATH.exists() and "--single-gt" not in flags:
-        qrels = load_qrels()
-        print(f"Разметка пула: {len(qrels)} вопросов с множественным эталоном")
+    qrels_path = INDEPENDENT_QRELS_PATH if "--independent-qrels" in flags else QRELS_PATH
+    if qrels_path.exists() and "--single-gt" not in flags:
+        qrels = load_qrels(qrels_path)
+        print(f"Разметка пула ({qrels_path.name}): {len(qrels)} вопросов "
+              "с множественным эталоном")
     else:
         print("Разметки пула нет — метрики по одному эталонному чанку")
 
