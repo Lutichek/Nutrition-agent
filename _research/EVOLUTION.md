@@ -99,6 +99,7 @@
 | 60 | Инъекции в промпт (OWASP LLM01, LLM07) | [SECURITY](evolution/SECURITY.md) |
 | 61 | Качество ответов текущей реализации глазами судьи другого семейства | [RAG](evolution/RAG.md) |
 | 62 | Уязвимости в инструментах замеров | [SECURITY](evolution/SECURITY.md) |
+| 63 | Эталон, написанный моделью генератора, тоже завышает correctness | [RAG](evolution/RAG.md) |
 Разделы без номера:
 
 | Раздел | Журнал |
