@@ -45,11 +45,20 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Известные уязвимости в зависимостях
-        # Проверяется ровно то, что в uv.lock, — и то, что уедет в образ.
-        # Первый прогон нашёл 6 уязвимостей (urllib3, certifi, langgraph-sdk).
+        # Проверяется ровно то, что в uv.lock: и то, что уедет в образ, и
+        # инструменты замеров (группа eval). Без eval проверка не видела
+        # ~60 уязвимостей в aiohttp, filelock, multidict и pillow.
+        #
+        # Исключены две, для которых исправлений нет и которые у нас
+        # недостижимы:
+        #   PYSEC-2026-3046 — ragas, разбор картинок по файлу и ссылке
+        #     (мультимодальные промпты); мы считаем только текстовую Faithfulness;
+        #   PYSEC-2026-2447 — diskcache, pickle в каталоге кэша; кэш ragas
+        #     не включается.
         run: |
-          uv export --frozen --extra dev --no-emit-project --no-hashes -q > /tmp/requirements.txt
-          uvx pip-audit==2.10.1 -r /tmp/requirements.txt --disable-pip --no-deps
+          uv export --frozen --extra dev --extra eval --no-emit-project --no-hashes -q > /tmp/requirements.txt
+          uvx pip-audit==2.10.1 -r /tmp/requirements.txt --disable-pip --no-deps \
+            --ignore-vuln PYSEC-2026-3046 --ignore-vuln PYSEC-2026-2447
 
       - name: Линтер
         run: uv run ruff check .

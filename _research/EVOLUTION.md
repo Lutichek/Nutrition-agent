@@ -98,6 +98,7 @@
 | 59 | Цепочка поставки | [SECURITY](evolution/SECURITY.md) |
 | 60 | Инъекции в промпт (OWASP LLM01, LLM07) | [SECURITY](evolution/SECURITY.md) |
 | 61 | Качество ответов текущей реализации глазами судьи другого семейства | [RAG](evolution/RAG.md) |
+| 62 | Уязвимости в инструментах замеров | [SECURITY](evolution/SECURITY.md) |
 Разделы без номера:
 
 | Раздел | Журнал |
