@@ -35,6 +35,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from agent import Chunk, RAGAgentAnswer
+from prompts import OFF_TOPIC_ANSWER
 
 logger = logging.getLogger(__name__)
 
@@ -343,32 +344,34 @@ def _parse_ground_truth_chunks(value: Any) -> list[str]:
     return []
 
 
-def _zero_row(row_id: str, question: str) -> dict:
-    """Строка для вопроса, на котором поиск ничего не дал.
+def _unretrieved_row(row_id: str, question: str) -> dict:
+    """Строка для вопроса, до поиска по которому агент не дошёл.
 
-    Метрики поиска здесь честные нули: искали и не нашли.
+    Пустой контекст в ответе значит одно: поиск не запускался. Отказ grade
+    фрагменты НЕ стирает (``cannot_answer`` их оставляет), а поиск по
+    непустому индексу всегда возвращает k штук. Во всех шести сохранённых
+    прогонах каждый ответ без контекста — дословный отказ маршрутизатора
+    («помогаю только с питанием»).
 
-    А вот faithfulness — NaN, а не ноль. Она проверяет, подтверждается ли
-    каждое утверждение ответа найденным контекстом. Нет контекста — нечего
-    проверять: агент отказался отвечать, утверждений нет. Ноль здесь читался
-    бы как «выдумал», хотя агент сделал ровно то, что должен.
+    Поэтому NaN, а не ноль, — у ВСЕХ метрик строки (шаг 66). Раньше метрики
+    поиска здесь были нулями «искали и не нашли», и верный отказ на вопрос
+    про теломеры занижал precision поиска, которого не было: у вопросов
+    deepseek 13 таких из 210 (шаг 65). Отказы маршрутизатора меряет своя
+    метрика — отказов, а не поиска.
 
-    Замер на сохранённом прогоне: пять таких вопросов из 210 занижали
-    faithfulness с 0.941 до 0.919 — два пункта за счёт подсчёта,
-    а не за счёт агента.
+    Faithfulness — NaN по той же причине: нет контекста, нечего проверять.
+    Пять таких вопросов из 210 занижали её с 0.941 до 0.919.
     """
     return {
         "id": row_id,
         "question": question,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1": 0.0,
-        "mrr": 0.0,
-        "map": 0.0,
-        "ndcg": 0.0,
+        "precision": np.nan,
+        "recall": np.nan,
+        "f1": np.nan,
+        "mrr": np.nan,
+        "map": np.nan,
+        "ndcg": np.nan,
         "faithfulness": np.nan,
-        # Потолок недостижим по другой причине: выдачи не было вовсе,
-        # поэтому и делить нечего. См. _recall_ceiling.
         "recall_ceiling": np.nan,
     }
 
@@ -443,6 +446,9 @@ def evaluate(
             answer_map[str(ans.dataset_row_id)] = ans
 
     rows: list[dict] = []
+    no_answer = 0
+    router_refused = 0
+    no_search_other = 0
 
     # Для batch-вычисления faithfulness
     faith_indices: list[int] = []
@@ -459,9 +465,15 @@ def evaluate(
 
         ans = answer_map.get(row_id)
 
-        # Нет ответа или нет чанков → нули
+        # Нет ответа или поиск не запускался → не измерено (см. _unretrieved_row)
         if ans is None or not ans.retrieved_chunks:
-            rows.append(_zero_row(row_id, question))
+            if ans is None:
+                no_answer += 1
+            elif ans.answer == OFF_TOPIC_ANSWER:
+                router_refused += 1
+            else:
+                no_search_other += 1
+            rows.append(_unretrieved_row(row_id, question))
             continue
 
         # Вектор релевантности
@@ -534,6 +546,19 @@ def evaluate(
                 print(f"⚠️ Faithfulness не посчитана: {exc}")
 
     df_result = pd.DataFrame(rows)
+
+    # Причины печатаются раздельно: отказ маршрутизатора — его верная работа,
+    # а ответ без контекста по ДРУГОЙ причине (вопрос ушёл в план, сломался
+    # поиск) или пропавший ответ — повод разбираться.
+    unretrieved = no_answer + router_refused + no_search_other
+    if unretrieved:
+        print(
+            f"Метрики поиска не измерены у {unretrieved} из {len(df_result)}: "
+            f"отказ маршрутизатора {router_refused}, без поиска по другой причине "
+            f"{no_search_other}, нет ответа {no_answer}; исключены из средних"
+        )
+        if no_search_other or no_answer:
+            print("⚠️ Вопросы без поиска не из-за отказа маршрутизатора — проверьте прогон")
 
     # NaN НЕ заполняется нулями — это принципиально.
     #

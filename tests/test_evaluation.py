@@ -23,8 +23,9 @@ import pandas as pd
 import pytest
 
 from agent import Chunk, RAGAgentAnswer
-from evaluation import _ndcg_at_k, _recall_ceiling, _zero_row, evaluate
+from evaluation import _ndcg_at_k, _recall_ceiling, _unretrieved_row, evaluate
 from evaluation_answers import evaluate_refusals
+from prompts import OFF_TOPIC_ANSWER
 
 
 class FailingClient:
@@ -59,22 +60,51 @@ def make_answer(row_id: str, chunks: int = 1) -> RAGAgentAnswer:
 
 
 class TestMissingContextIsNotZero:
-    """Нет контекста — faithfulness не определена, а не равна нулю.
+    """Нет контекста — поиск не запускался: метрики не определены, а не нули.
 
-    Наблюдалось: пять вопросов из 210, где узел grade забраковал все
-    найденные фрагменты. Агент честно отказался отвечать — проверять
-    нечего, утверждений нет. Ноль читался как «выдумал».
+    Наблюдалось: пять вопросов из 210 без контекста — все пять отказы
+    маршрутизатора (grade фрагменты не стирает). Ноль faithfulness читался
+    как «выдумал», а ноль поиска — как промах поиска, которого не было:
+    у вопросов deepseek 13 верных отказов из 210 (шаги 65–66).
     """
 
-    def test_zero_row_leaves_faithfulness_unmeasured(self):
-        row = _zero_row("1", "вопрос")
+    def test_unretrieved_row_leaves_faithfulness_unmeasured(self):
+        row = _unretrieved_row("1", "вопрос")
         assert np.isnan(row["faithfulness"])
 
-    def test_retrieval_metrics_are_honest_zeros(self):
-        """Метрики поиска при пустой выдаче — именно нули: искали и не нашли."""
-        row = _zero_row("1", "вопрос")
+    def test_retrieval_metrics_are_unmeasured_not_zero(self):
+        """Поиска не было — нет и оценки поиска."""
+        row = _unretrieved_row("1", "вопрос")
         for metric in ("precision", "recall", "f1", "mrr", "map", "ndcg"):
-            assert row[metric] == 0.0
+            assert np.isnan(row[metric])
+
+    def test_router_refusal_does_not_lower_retrieval_mean(self):
+        """Верный отказ на вопрос вне области не тянет вниз precision поиска."""
+        dataset = make_dataset(["a", "b"])
+        answers = [
+            make_answer("a", chunks=1),
+            RAGAgentAnswer(dataset_row_id="b", answer=OFF_TOPIC_ANSWER, retrieved_chunks=None),
+        ]
+        frame = evaluate(answers, dataset, client=None, compute_faithfulness=False,
+                         qrels={"a": {0}, "b": {7}})
+
+        assert frame["precision"].mean() == 1.0
+        assert int(frame["precision"].isna().sum()) == 1
+
+    def test_reason_of_missing_search_is_printed(self, capsys):
+        """Отказ маршрутизатора и пропавший ответ — разные причины, и обе видны."""
+        dataset = make_dataset(["a", "b", "c"])
+        answers = [
+            make_answer("a", chunks=1),
+            RAGAgentAnswer(dataset_row_id="b", answer=OFF_TOPIC_ANSWER, retrieved_chunks=None),
+        ]
+        evaluate(answers, dataset, client=None, compute_faithfulness=False)
+
+        out = capsys.readouterr().out
+        assert "не измерены у 2 из 3" in out
+        assert "отказ маршрутизатора 1" in out
+        assert "нет ответа 1" in out
+        assert "проверьте прогон" in out
 
     def test_answer_without_chunks_is_excluded_from_mean(self):
         dataset = make_dataset(["a", "b"])
@@ -125,7 +155,7 @@ class TestRecallCeiling:
 
     def test_empty_retrieval_leaves_ceiling_unmeasured(self):
         """Выдачи не было — делить нечего, это NaN, а не ноль."""
-        assert np.isnan(_zero_row("1", "вопрос")["recall_ceiling"])
+        assert np.isnan(_unretrieved_row("1", "вопрос")["recall_ceiling"])
 
 
 class TestNdcgNormalisation:
