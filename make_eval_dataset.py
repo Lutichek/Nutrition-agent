@@ -22,6 +22,8 @@
     question      — вопрос на русском
     relevant_text    — эталонный фрагмент (ground truth для поиска)
     document         — doc_id статьи-источника
+    chunk_id         — текущий номер чанка с этим фрагментом (пусто — его
+                       нет в индексе); прежний номер — в ``chunk_id_old``
     reference_answer — эталонный ответ по этому фрагменту (для correctness)
 
 Запуск::
@@ -30,6 +32,7 @@
     python make_eval_dataset.py --n 40
     python make_eval_dataset.py --references   # дописать эталоны в готовый датасет
     python make_eval_dataset.py --negative     # вопросы без ответа в корпусе
+    python make_eval_dataset.py --resync-chunk-ids   # после перенарезки корпуса
 """
 
 from __future__ import annotations
@@ -249,8 +252,64 @@ def generate_negative(n: int = 60, batches: int = 3) -> pd.DataFrame:
     )
 
 
+def source_ids(text: str, corpus: pd.DataFrame) -> set[int]:
+    """Текущие чанки, в которых лежит текст исходного фрагмента.
+
+    Сверка по кускам текста (120 символов через каждые 200), а не по номеру
+    и не по статье: доказательство — сам текст. Берутся чанки с наибольшим
+    числом совпавших кусков; ни одного совпадения — пустое множество.
+
+    На 210 вопросах дала то же, что общий объём символов и Жаккар по словам
+    внутри статьи (210/210, шаг 67), и, в отличие от них, не опирается
+    на столбец ``document``.
+    """
+    text = text.strip()
+    probes = [text[i:i + 120] for i in range(0, max(1, len(text) - 120), 200)]
+    hits = corpus["text"].map(lambda t: sum(p in t for p in probes))
+    best = hits.max()
+    return set(corpus.loc[hits == best, "chunk_id"].astype(int)) if best > 0 else set()
+
+
+def resync_chunk_ids(dataset: pd.DataFrame, corpus: pd.DataFrame) -> pd.DataFrame:
+    """Пересчитать ``chunk_id`` датасета по тексту фрагмента для текущего индекса.
+
+    Наблюдалось (шаг 65): корпус перенарезали после сборки датасета, и номер
+    устарел у 80 строк из 210 — разбор по номеру показал «исходный фрагмент
+    не находится ни одним поиском» у 40% вопросов. Номер, которого нет,
+    — пусто (``<NA>``), а не старый номер: статьи могло не остаться
+    в корпусе. Неоднозначное совпадение — тоже пусто.
+
+    Прежний номер сохраняется в ``chunk_id_old`` только при первом запуске:
+    повторный не затирает исходное значение.
+    """
+    result = dataset.copy()
+    if "chunk_id_old" not in result.columns:
+        result["chunk_id_old"] = result["chunk_id"]
+
+    found: list[int | None] = []
+    for raw in result["relevant_text"]:
+        chunks = json.loads(raw)
+        ids = source_ids(chunks[0], corpus) if chunks else set()
+        found.append(next(iter(ids)) if len(ids) == 1 else None)
+    result["chunk_id"] = pd.array(found, dtype="Int64")
+
+    changed = int((result["chunk_id"] != result["chunk_id_old"]).fillna(True).sum())
+    missing = int(result["chunk_id"].isna().sum())
+    print(f"chunk_id: изменён у {changed} из {len(result)}, "
+          f"не найден в индексе у {missing}")
+    return result
+
+
 def main() -> None:
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    if "--resync-chunk-ids" in sys.argv:
+        frame = pd.read_excel(DATASET_PATH)
+        corpus = read_all(open_table(str(HERE / "lance_db" / "vectorstore"), "chunks"))
+        frame = resync_chunk_ids(frame, corpus)
+        frame.to_excel(DATASET_PATH, index=False)
+        print(f"Сохранено → {DATASET_PATH}")
+        return
 
     if "--negative" in sys.argv:
         frame = generate_negative()

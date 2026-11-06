@@ -20,8 +20,10 @@ rewrite, температура 0), поиск без модели. Сравне
 штрафуется ни за что (покрытие пула, CLAUDE.md).
 
 ⚠️ ``chunk_id`` в датасете устарел у 80 строк из 210: номера сдвинулись
-при перенарезке корпуса, а текст лежит в другом чанке. Исходный фрагмент
-ищется здесь ПО ТЕКСТУ (``source_ids``). Метрики оценки этот столбец
+при перенарезке корпуса, а текст лежит в другом чанке (с шага 67 столбец
+пересчитывается ``make_eval_dataset.py --resync-chunk-ids``). Исходный
+фрагмент ищется здесь ПО ТЕКСТУ (``make_eval_dataset.source_ids``), чтобы
+замер не зависел от того, пересчитан ли столбец. Метрики оценки его
 не читают — они идут по разметке пула.
 
     python -m experiments.narrow_retrieval
@@ -48,7 +50,7 @@ from experiments.question_family import QRELS_PATH as QRELS_B_PATH  # noqa: E402
 from experiments.question_family import QUERIES_PATH as QUERIES_B_PATH  # noqa: E402
 from experiments.question_family import QUESTIONS_PATH as QUESTIONS_B_PATH  # noqa: E402
 from lance_db import open_table  # noqa: E402
-from make_eval_dataset import DATASET_PATH  # noqa: E402
+from make_eval_dataset import DATASET_PATH, source_ids  # noqa: E402
 from measurement import CANDIDATE_K, RESEARCH_DIR, cached_queries, paired_bootstrap  # noqa: E402
 from providers import get_clients  # noqa: E402
 from retriever import Retriever, reciprocal_rank_fusion  # noqa: E402
@@ -60,19 +62,6 @@ RESULTS_PATH = RESEARCH_DIR / "experiments_narrow_retrieval.csv"
 # Вес второго голоса при слиянии. 0.5 — как у взвешенного BM25 в сетке
 # experiments/bm25_weight.py: равный голос там тянул выдачу вниз.
 SECOND_WEIGHT = 0.5
-
-
-def source_ids(text: str, corpus: pd.DataFrame) -> set[int]:
-    """Текущие чанки, в которых лежит текст исходного фрагмента.
-
-    Сверка по нескольким кускам текста, а не по номеру: номер устарел.
-    Берутся чанки с наибольшим числом совпавших кусков.
-    """
-    text = text.strip()
-    probes = [text[i:i + 120] for i in range(0, max(1, len(text) - 120), 200)]
-    hits = corpus["text"].map(lambda t: sum(p in t for p in probes))
-    best = hits.max()
-    return set(corpus.loc[hits == best, "chunk_id"].astype(int)) if best > 0 else set()
 
 
 def configs(ret: Retriever, query_en: str, question_ru: str) -> dict[str, list[int]]:
